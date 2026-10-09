@@ -18,6 +18,8 @@
 ## 지휘 방식 (fleet)
 - **장부**: `~/.local/state/omonyang/fleet.sqlite` — 냥이(창/봇), 작업(스킬·모델·완료 조건·증거·이력), 대장 heartbeat.
 - **확인 전송**: 창이 비었는지 본 뒤 모델 전환 → 지시 입력 → 실제로 "Working"이 뜨는지 확인. 압축 실패로 지시가 사라지면 `PROMPT_LOST`.
+- **의존 작업**: `dispatch ... --after <KEY>`는 선행 작업이 `verified-done`이고 대상 창이 idle일 때만 자동 전송한다.
+- **주장 대조**: Cursor 승인과 `PR READY head=...`는 읽기 전용 Slack/GitHub 근거와 대조하며, 테스트 개수 주장은 검증 근거로 취급하지 않는다.
 - **기계 완료**: `--done 'pr:owner/repo#N;url:http://..=200;cmd:<shell>'` 전부 통과해야 `verified-done`. 냥이의 "완료" 줄은 `done-claimed`일 뿐.
 - **감시**: `fleet watch 30` — 상태 변화·완료/막힘 줄·PR READY·가재 recovery_hold/suppressed를 `FLEET_*` 이벤트로. 30초마다 `captain-heartbeat.json` 갱신.
 - **대장·부대장**: heartbeat 30분 끊김 또는 대장 한도 소진 → 나희가 같은 장부로 대행 (`fleet/VICE-CAPTAIN.md`).
