@@ -1,0 +1,13 @@
+TASK-MIGRATE-CRM (배정: 오모냥) — CRM(core5)을 jm-omachy로 *지금 바로* 이전. Mail·JARVIS가 CRM을 기다리니 최우선.
+원본 운영: core5-api app-45918e8b(~/.local/share/core5/app-45918e8b, drop-in 90-crm-release.conf), core5-web, core5-review-ui, core5-tailscale-proxy, docker 컨테이너 core5-crm-pilot-pg, env ~/.config/core5/{app.env,crm/*}, 포트 loopback 4312/4314/4316. 이전 메모: CRM Issue47 comments 6064552247, 6075031987.
+1. 대상: docker(또는 원본과 같은 PG 메이저 버전의 컨테이너) 준비(sudo), node v22.23.2(nvm 경로 동일 권장)·pnpm, app 디렉터리 rsync, env·키 rsync -a, user unit·drop-in 복사.
+2. 원본 core5 서비스 정지 → pg_dump(-Fc) → 대상 PG 복원 → 행수 대조(주요 테이블) → 대상 기동 → readiness 200, Mail 읽기·후보쓰기·JARVIS 읽기 계정 각 1회 확인.
+3. 원본 core5-* stop+disable, PG 컨테이너 stop(볼륨 보존).
+4. 운영 Mail(아직 원본)과 JARVIS가 CRM에 붙는 주소가 127.0.0.1이라면, Mail냥·가재가 대상으로 옮겨오면 그대로 맞음 — 따로 바꾸지 마.
+
+이전 공통(재민 C0C6HJM0BV5:1791530401/1791530512/1791530636: 이전 최우선, 최대한 빨리, 병렬):
+- 대상 서버: ssh jm-omachy (jm 계정, 100.87.253.57, Arch/Omarchy, sudo -n 가능 ~10/10 00:06, linger on). 원본: 이 서버 jm-acloud(sudo -n 가능 ~10/10 04:20).
+- 원본 쓰기 정지 → 최종 백업 → 대상 기동 → health·건수/해시 1회 → 원본 서비스 stop+disable(파일은 보존). 동시 writer 0. 전환 전 실패면 원본 그대로.
+- 비밀 파일은 rsync -a로 파일째(0600·소유자 유지), 값 출력 금지. 키 교체·새 발급 금지.
+- 다른 냥이 서비스 손대지 말 것: Price=오모냥(완료), SB+JARVIS=가재, CRM=CRM냥, Mail=Mail냥, 운영도구=JARVIS보조냥.
+- 결과 줄: <KEY>_DONE <서비스·버전·health·해시 한 줄> / <KEY>_BLOCKED reason=.

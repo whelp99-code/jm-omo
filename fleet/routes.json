@@ -1,0 +1,76 @@
+{
+  "source": "owner DM 1791525898.324979 (plan/design = Astra or Fable) + 10/3 preferences (impl Grok 4.7 fast / Sol 6.1, review Astra 6, money/auth Opus/Astra) + owner 1791530636.151739 (simple = Sonnet/Haiku/Codex simple)",
+  "captain": {
+    "provider": "anthropic",
+    "model": "claude-opus-5-5",
+    "thinking": "high",
+    "fixed": true
+  },
+  "models": {
+    "plan": {
+      "provider": "chatgpt-subscription",
+      "model": "gpt-6-astra",
+      "thinking": "high",
+      "alt": {
+        "provider": "anthropic-subscription",
+        "model": "claude-fable-5-1",
+        "thinking": "high"
+      }
+    },
+    "impl": {
+      "provider": "chatgpt-subscription",
+      "model": "gpt-6.1-sol",
+      "thinking": "high",
+      "alt": {
+        "provider": "cursor-cli-oauth",
+        "model": "grok-4.7-high-fast",
+        "thinking": "high"
+      }
+    },
+    "review": {
+      "provider": "chatgpt-subscription",
+      "model": "gpt-6-astra",
+      "thinking": "high",
+      "alt": {
+        "provider": "anthropic-subscription",
+        "model": "claude-fable-5-1",
+        "thinking": "high"
+      }
+    },
+    "secure": {
+      "provider": "chatgpt-subscription",
+      "model": "gpt-6-astra",
+      "thinking": "xhigh",
+      "alt": {
+        "provider": "anthropic-subscription",
+        "model": "claude-opus-5-5",
+        "thinking": "high"
+      }
+    },
+    "quick": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5-5",
+      "thinking": "medium",
+      "alt": {
+        "provider": "chatgpt-subscription",
+        "model": "gpt-5.3-codex-spark",
+        "thinking": "medium"
+      },
+      "alt2": {
+        "provider": "anthropic",
+        "model": "claude-haiku-4-5",
+        "thinking": "low"
+      },
+      "note": "owner C0C6HJM0BV5:1791530636.151739: simple work = Sonnet 5.5 / Haiku (5.5 not available; newest is 4.5) / Codex simple (gpt-5.3-codex-spark)"
+    }
+  },
+  "skills": {
+    "ulw": "one bounded unit ending in a PR or a verified change",
+    "ulw-loop": "multi-stage, hours-long work with checkpoints (migration, dry-run -> fix -> re-run)",
+    "mass-ulw": "several dependent tasks across several cats",
+    "ulw-plan": "plan only, no product code; follow with ulw-execute",
+    "ulw-execute": "run an ulw-plan plan with workers",
+    "ulw-research": "investigation only"
+  },
+  "fallback_rule": "on provider-error or quota >= 95%: switch to the same-tier alt provider; after 2 failed attempts of the same task, step up one tier (quick->impl->review/secure)"
+}
