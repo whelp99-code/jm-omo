@@ -34,7 +34,7 @@ const CATS = [
 export function classify(screen) {
   const L = screen.split("\n");
   const tail = L.slice(-14).join("\n");
-  const footer = [...screen.matchAll(/(?:⚡|\([a-z-]+\))\s+([A-Za-z0-9._-]+):([a-z]+)/g)].at(-1);
+  const footer = [...screen.matchAll(/(?:⚡|\([a-z-]+\)|\s)\s*([a-z][A-Za-z0-9._-]+):(low|medium|high|xhigh|minimal|off)\s*$/gm)].at(-1);
   const model = footer ? `${footer[1]}:${footer[2]}` : "";
   let state = "idle";
   if (/compaction did not complete/i.test(tail) && !/Working \(/.test(tail)) state = "compaction-failed";
@@ -74,17 +74,38 @@ async function refresh() {
   return out;
 }
 
-function pickModel(type) {
+// Owner C0C6HJM0BV5:1791553182.735709: watch Claude/Codex usage so limits never stop development.
+// Claude quota is shared with the captain, so cats only fall back to it while it is low.
+async function usage() {
+  const tick = (await sh(`grep USAGE_TICK /home/jm/.omo/omonyang/usage-watch.log | tail -1`)).trim();
+  const pct = (k) => Number(tick.match(new RegExp(`${k}=(\\d+)%`))?.[1] ?? 0);
+  return { anthropic: pct("anthropic"), chatgpt: pct("chatgpt-subscription") };
+}
+
+async function pickModel(type) {
   const r = ROUTES.models[type];
   if (!r) throw new Error(`unknown task type ${type}; use ${Object.keys(ROUTES.models).join("|")}`);
-  return r;
+  const u = await usage();
+  const hot = (p) => (p.startsWith("chatgpt") && u.chatgpt >= 80) || (p.startsWith("anthropic") && u.anthropic >= 60);
+  for (const c of [r, r.alt, r.alt2, ROUTES.cursorFallback].filter(Boolean)) if (!hot(c.provider)) return { ...c, usage: u };
+  return { ...ROUTES.cursorFallback, usage: u };
 }
 
 async function switchModel(pane, want) {
   const before = classify(await read(pane)).model;
   if (before.startsWith(want.model)) return `MODEL_OK ${want.model}`;
-  await Bun.$`herdr pane send-text ${pane} ${`/model ${want.provider}/${want.model}`}`.nothrow().quiet();
+  // Verified sequence: open the picker, wait for the catalog, type the bare model name, pick the first match.
+  await Bun.$`herdr pane send-text ${pane} /model`.nothrow().quiet();
   await Bun.sleep(700);
+  await Bun.$`herdr pane send-keys ${pane} Enter`.nothrow().quiet();
+  await Bun.sleep(3500);
+  await Bun.$`herdr pane send-text ${pane} ${want.model}`.nothrow().quiet();
+  await Bun.sleep(1500);
+  const pick = await read(pane);
+  if (!new RegExp(`\u2192\\s+${want.model.replace(/\./g, "\\.")} \\[${want.provider}\\]`).test(pick)) {
+    await Bun.$`herdr pane send-keys ${pane} Escape`.nothrow().quiet();
+    return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (not first in picker)`;
+  }
   await Bun.$`herdr pane send-keys ${pane} Enter`.nothrow().quiet();
   let after = "";
   for (let i = 0; i < 8; i++) {
@@ -114,7 +135,7 @@ async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done
   const s0 = classify(await read(c.pane));
   if (s0.state === "working" || s0.state === "compacting") return `DISPATCH_HOLD ${catId} busy(${s0.state}); not sent`;
   if (s0.state === "question") return `DISPATCH_HOLD ${catId} has a pending question; answer it first`;
-  const want = pickModel(type);
+  const want = await pickModel(type);
   const modelNote = keepModel ? "MODEL_KEPT" : await switchModel(c.pane, want);
   if (modelNote.startsWith("MODEL_SWITCH_FAILED")) return modelNote;
   const head = `${key} [skill:${skill}${done ? ` | Done= ${done}` : ""}]`;

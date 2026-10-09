@@ -25,6 +25,11 @@
         "provider": "cursor-cli-oauth",
         "model": "grok-4.7-high-fast",
         "thinking": "high"
+      },
+      "alt2": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-5-5",
+        "thinking": "high"
       }
     },
     "review": {
@@ -72,5 +77,11 @@
     "ulw-execute": "run an ulw-plan plan with workers",
     "ulw-research": "investigation only"
   },
-  "fallback_rule": "on provider-error or quota >= 95%: switch to the same-tier alt provider; after 2 failed attempts of the same task, step up one tier (quick->impl->review/secure)"
+  "fallback_rule": "on provider-error or quota >= 95%: switch to the same-tier alt provider; after 2 failed attempts of the same task, step up one tier (quick->impl->review/secure)",
+  "cursorFallback": {
+    "provider": "cursor-cli-oauth",
+    "model": "grok-4.7-high-fast",
+    "thinking": "high"
+  },
+  "usage_rule": "owner 1791553182.735709: skip chatgpt at >=80%, skip anthropic at >=60% (shared with captain), then cursor grok"
 }
