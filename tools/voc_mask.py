@@ -19,7 +19,12 @@ RULES = [
     (re.compile(r"\b[A-Za-z0-9]{24,}\b"), "[긴문자열]"),
     (re.compile(r"(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)\S*\s+\S+(시|군|구)\s+\S+(로|길|동)\s*\d*\S*"), "[주소]"),
     (re.compile(r"(계정|아이디|ID|id|user(name)?)\s*[:=]\s*\S+"), r"\1: [계정]"),
+    (re.compile(r"\S*@\S+"), "[@주소]"),
+    (re.compile(r"\d{7,}"), "[숫자]"),
+    (re.compile(r"(\(주\)|㈜|주식회사)\s*\S+|\S+\s*(\(주\)|㈜|주식회사)"), "[조직]"),
+    (re.compile(r"[가-힣A-Za-z0-9]{2,}(대학교|대학|학교|병원|의료원|공사|공단|재단|연구원|연구소|진흥원|센터|시청|구청|군청|도청|교육청|은행|증권|보험|캐피탈|그룹|전자|산업|테크|텍|시스템즈?|솔루션|네트웍스|정보통신|컴퍼니|코리아|청)"), "[조직]"),
 ]
+QUOTE_START = re.compile(r"^\s*(-{2,}\s*Original Message|-{2,}\s*원본 메시지|From:|보낸 사람:|발신:|On .+wrote:|20\d\d[.-]\s?\d{1,2}[.-]\s?\d{1,2}.+(작성|wrote))", re.I)
 
 def load_names(path):
     if not path: return []
@@ -29,6 +34,11 @@ def load_names(path):
 def mask(text, names):
     out = []
     for line in (text or "").splitlines():
+        if QUOTE_START.search(line):
+            out.append("[이전 메일 인용 이하 생략]")
+            break
+        if line.lstrip().startswith(">"):
+            continue
         if SECRET_LINE.search(line):
             out.append("[비밀 의심 줄 삭제]")
             continue
@@ -36,6 +46,7 @@ def mask(text, names):
             line = rx.sub(rep, line)
         for n in names:
             line = line.replace(n, "[이름]")
+        line = line.replace("@", "[at]")
         out.append(line)
     return "\n".join(out)
 
