@@ -176,6 +176,22 @@ async function slackHistory(since) {
     messages.push(...(data.messages ?? []));
     cursor = data.response_metadata?.next_cursor ?? "";
   } while (cursor);
+  for (const root of messages.filter((message) => Number(message.reply_count) > 0)) {
+    let replyCursor = "";
+    do {
+      const params = new URLSearchParams({ channel: SLACK_REVIEW_CHANNEL, ts: root.ts, limit: "200", oldest: since });
+      if (replyCursor) params.set("cursor", replyCursor);
+      const response = await fetch(`https://slack.com/api/conversations.replies?${params}`, {
+        headers: { Authorization: `Bearer ${creds.token}` },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) return null;
+      const data = await response.json();
+      if (data.ok !== true) return null;
+      messages.push(...(data.messages ?? []).filter((reply) => reply.ts !== root.ts));
+      replyCursor = data.response_metadata?.next_cursor ?? "";
+    } while (replyCursor);
+  }
   return messages;
 }
 
@@ -187,10 +203,20 @@ async function slackHasHead(prefix, sentAt) {
   return cursorHeadMatches(messages, prefix);
 }
 
+/**
+ * A Cursor message accepts a head only when one line of its text carries both
+ * an ACCEPT/APPROVE verdict and that head, and the same line has no
+ * REJECT/REVISE verdict. A bare SHA mention, or a table row that reads REJECT,
+ * never counts as acceptance.
+ */
 export function cursorHeadMatches(messages, prefix) {
+  const want = String(prefix).toLowerCase();
   return messages.some((message) => message.user === CURSOR_USER_ID
-    && [...String(message.text ?? "").matchAll(/(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])/gi)]
-      .some((match) => match[0].toLowerCase().startsWith(prefix.toLowerCase())));
+    && String(message.text ?? "").split(/\n|(?<=\|)\s+(?=\|)/).some((line) => {
+      if (!/\b(?:ACCEPT|APPROVE)\b/i.test(line) || /\b(?:REJECT|REVISE)\b/i.test(line)) return false;
+      return [...line.matchAll(/(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])/gi)]
+        .some((match) => match[0].toLowerCase().startsWith(want));
+    }));
 }
 
 async function pullRequestHead(signal) {

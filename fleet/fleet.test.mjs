@@ -134,6 +134,24 @@ describe("fleet completion claim verification", () => {
     ], "abcdef1")).toBe(false);
   });
 
+  it("does not treat a REJECT verdict that names the head as acceptance", () => {
+    expect(cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "REJECT head=abcdef123456: claim check is wrong" },
+    ], "abcdef1")).toBe(false);
+    expect(cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "reviewed abcdef123456, needs changes" },
+    ], "abcdef1")).toBe(false);
+  });
+
+  it("reads the verdict on the head's own table row", () => {
+    const table = "| 건 | head | 판정 | | --- | --- | --- | | Mail #57 | `14344f04` | ACCEPT | | jm-omo #2 | `e2963141` | REJECT |";
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], "e2963141")).toBe(false);
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], "14344f04")).toBe(true);
+    const lines = "jm-omo #2 e2963141 REJECT\nMail #57 14344f04 ACCEPT";
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], "e2963141")).toBe(false);
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], "14344f04")).toBe(true);
+  });
+
   it("requires the Cursor author and matching seven-character head", async () => {
     const task = { sent_at: "2026-10-09T10:00:00.000Z" };
     const verified = await verifyClaims("Cursor ACCEPT head=abcdef123456", task, {
