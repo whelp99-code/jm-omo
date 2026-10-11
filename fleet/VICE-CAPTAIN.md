@@ -16,7 +16,7 @@ cd /home/jm/.omo/omonyang/fleet
 bun fleet.mjs status          # 모든 냥이 상태·작업
 bun fleet.mjs report          # 재민용 요약
 bun fleet.mjs tasks           # 작업 장부(완료 조건·증거)
-bun fleet.mjs dispatch <cat> <KEY> <지시문파일> --type impl|plan|review|secure|quick --skill ulw|ulw-loop|mass-ulw|ulw-plan|ulw-execute|ulw-research --done 'pr:o/r#N;url:..=200'
+bun fleet.mjs dispatch <cat> <KEY> <지시문파일> [--after <KEY>] --type impl|plan|review|secure|quick --skill ulw|ulw-loop|mass-ulw|ulw-plan|ulw-execute|ulw-research --done 'pr:o/r#N;url:..=200'
 bun fleet.mjs verify <KEY>    # 완료는 이걸로만(PR 머지·health 200 등 기계 확인)
 ```
 지시문 예시는 `/home/jm/.omo/omonyang/.omo/requests/TASK-*.txt` (끝에 "공통 규칙" 블록 그대로 붙임).

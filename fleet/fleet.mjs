@@ -3,19 +3,26 @@
 // Ideas taken from Dori (lane registry, verified pane send, Done= signals) and Gajae (accepted != done, no blind re-run).
 import { Database } from "bun:sqlite";
 import { mkdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 
 const STATE = `${process.env.HOME}/.local/state/omonyang`;
 mkdirSync(STATE, { recursive: true });
 const db = new Database(`${STATE}/fleet.sqlite`);
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;
 CREATE TABLE IF NOT EXISTS cats(id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT, state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT);
-CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT, done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT, result TEXT, evidence TEXT, history TEXT DEFAULT '[]');
+CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT, done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT, result TEXT, evidence TEXT, history TEXT DEFAULT '[]', depends_on TEXT, dispatch_type TEXT DEFAULT 'impl', keep_model INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);`);
+const taskColumns = new Set(db.query("PRAGMA table_info(tasks)").all().map((column) => column.name));
+for (const [name, definition] of [["depends_on", "TEXT"], ["dispatch_type", "TEXT DEFAULT 'impl'"], ["keep_model", "INTEGER DEFAULT 0"]]) {
+  if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
+}
 
 const now = () => new Date().toISOString();
 const sh = async (cmd) => (await Bun.$`bash -c ${cmd}`.nothrow().quiet()).stdout.toString();
 const read = (pane) => sh(`herdr pane read ${pane} --source visible --format text 2>/dev/null`);
 const ROUTES = JSON.parse(await Bun.file(new URL("./routes.json", import.meta.url)).text());
+const CURSOR_USER_ID = "U0B81F5GR6V";
+const SLACK_REVIEW_CHANNEL = "C0C6HJM0BV5";
 
 const CATS = [
   ["omonyang", "오모냥", "대장: 계획·배분·확인", "captain", "w5:p1", "-"],
@@ -42,12 +49,30 @@ export function classify(screen) {
   else if (/Working \(|Running eval|esc to interrupt/.test(tail)) state = "working";
   else if (/Question pending|unanswered/i.test(tail)) state = "question";
   else if (/Codex error|rate limit|usage limit|429|quota|Unable to verify/i.test(tail)) state = "provider-error";
-  const done = [...screen.matchAll(/(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b([^\n]*)/g)].filter((m) => !/[<]|또는|_BLOCKED reason=<|<숫자/.test(m[0])).at(-1);
-  const ready = [...screen.matchAll(/\b([A-Z]+) PR READY head=([0-9a-f]{40})/g)].at(-1);
-  // Result lines wrap in narrow panes: also look at the joined tail.
-  const joined = L.slice(-40).map((l) => l.trim()).join(" ");
+  const output = responseBlock(screen);
+  const done = [...output.matchAll(/^\s*(?:[•●⏺✻]\s*)?(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b([^\n]*)$/gm)]
+    .filter((m) => !/[<]|또는|<숫자/.test(m[0])).at(-1);
+  const ready = [...output.matchAll(/\b([A-Za-z0-9_.-]+) PR READY head=([0-9a-f]{7,40})\b/gi)].at(-1);
+  // Result lines wrap in narrow panes: also look at the latest output block.
+  const joined = output.split("\n").slice(-40).map((l) => l.trim()).join(" ");
   const readyLine = [...joined.matchAll(/\b([A-Z]+_[A-Z_]*READY)\b([^❯─]{0,400})/g)].at(-1);
-  return { state, model, done: done ? { key: done[1], kind: done[2], text: done[3].trim().slice(0, 200) } : null, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null };
+  const claimText = output.split("\n").filter((line) => /\bCursor\s+(?:ACCEPT|APPROVE)\b|\bPR READY\s+head=|\b(?:tests?\s+\d+\s+(?:passed|passing)|\d+\s+tests?\s+(?:passed|passing))\b|테스트\s*\d+\s*(?:개\s*)?통과/i.test(line)).join("\n");
+  return { state, model, done: done ? { key: done[1], kind: done[2], text: done[3].trim().slice(0, 200) } : null, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText };
+}
+
+function responseBlock(screen) {
+  const lines = screen.replace(/\r/g, "").split("\n");
+  const prompts = lines.flatMap((line, index) => /^\s*❯/.test(line) ? [index] : []);
+  const input = prompts.at(-1);
+  if (input === undefined) return "";
+  const previousPrompt = prompts.at(-2);
+  const visibleLines = lines.slice(previousPrompt === undefined ? 0 : previousPrompt + 1, input);
+  if (previousPrompt !== undefined) {
+    const response = visibleLines.findLastIndex((line) => /^\s*(?:⏺|●|•|✻|Assistant:)\s*/i.test(line));
+    return response < 0 ? "" : visibleLines.slice(response).join("\n").trimEnd();
+  }
+  const visible = visibleLines.join("\n").trimEnd();
+  return visible.split(/\n[ \t]*\n/).filter((block) => block.trim()).at(-1) ?? "";
 }
 
 function log(task, ev) {
@@ -77,7 +102,8 @@ async function refresh() {
 // Owner C0C6HJM0BV5:1791553182.735709: watch Claude/Codex usage so limits never stop development.
 // Claude quota is shared with the captain, so cats only fall back to it while it is low.
 async function usage() {
-  const tick = (await sh(`grep USAGE_TICK /home/jm/.omo/omonyang/usage-watch.log | tail -1`)).trim();
+  const usageText = await Bun.file(`${process.env.HOME}/.omo/omonyang/usage-watch.log`).text().catch(() => "");
+  const tick = usageText.split("\n").filter((line) => line.includes("USAGE_TICK")).at(-1) ?? "";
   const pct = (k) => Number(tick.match(new RegExp(`${k}=(\\d+)%`))?.[1] ?? 0);
   return { anthropic: pct("anthropic"), chatgpt: pct("chatgpt-subscription") };
 }
@@ -127,12 +153,161 @@ async function switchModel(pane, want) {
   return `MODEL_SWITCHED ${before} -> ${want.provider}/${want.model}`;
 }
 
+async function slackHistory(since) {
+  const nodeRoot = await Bun.$`npm root -g`.nothrow().quiet();
+  if (nodeRoot.exitCode !== 0) return null;
+  const credentialPath = join(nodeRoot.stdout.toString().trim(), "agent-messenger/dist/src/platforms/slackbot/credential-manager.js");
+  const { SlackBotCredentialManager } = await import(credentialPath);
+  const creds = await new SlackBotCredentialManager().getCredentials();
+  if (!creds?.token) return null;
+
+  const messages = [];
+  let cursor = "";
+  do {
+    const params = new URLSearchParams({ channel: SLACK_REVIEW_CHANNEL, limit: "100", oldest: since });
+    if (cursor) params.set("cursor", cursor);
+    const response = await fetch(`https://slack.com/api/conversations.history?${params}`, {
+      headers: { Authorization: `Bearer ${creds.token}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    if (data.ok !== true) return null;
+    messages.push(...(data.messages ?? []));
+    cursor = data.response_metadata?.next_cursor ?? "";
+  } while (cursor);
+  for (const root of messages.filter((message) => Number(message.reply_count) > 0)) {
+    let replyCursor = "";
+    do {
+      const params = new URLSearchParams({ channel: SLACK_REVIEW_CHANNEL, ts: root.ts, limit: "200", oldest: since });
+      if (replyCursor) params.set("cursor", replyCursor);
+      const response = await fetch(`https://slack.com/api/conversations.replies?${params}`, {
+        headers: { Authorization: `Bearer ${creds.token}` },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) return null;
+      const data = await response.json();
+      if (data.ok !== true) return null;
+      messages.push(...(data.messages ?? []).filter((reply) => reply.ts !== root.ts));
+      replyCursor = data.response_metadata?.next_cursor ?? "";
+    } while (replyCursor);
+  }
+  return messages;
+}
+
+async function slackHasHead(prefix, sentAt) {
+  const sentTime = Date.parse(sentAt);
+  if (!Number.isFinite(sentTime)) return false;
+  const messages = await slackHistory((sentTime / 1000).toFixed(6));
+  if (!messages) return false;
+  return cursorHeadMatches(messages, prefix);
+}
+
+/**
+ * A Cursor message accepts a head only when one line of its text carries both
+ * an ACCEPT/APPROVE verdict and that head, and the same line has no
+ * REJECT/REVISE verdict. A bare SHA mention, or a table row that reads REJECT,
+ * never counts as acceptance.
+ */
+export function cursorHeadMatches(messages, prefix) {
+  const want = String(prefix).toLowerCase();
+  return messages.some((message) => message.user === CURSOR_USER_ID
+    && String(message.text ?? "").split(/\n|(?<=\|)\s+(?=\|)/).some((line) => {
+      if (!/\b(?:ACCEPT|APPROVE)\b/i.test(line) || /\b(?:REJECT|REVISE)\b/i.test(line)) return false;
+      return [...line.matchAll(/(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])/gi)]
+        .some((match) => match[0].toLowerCase().startsWith(want));
+    }));
+}
+
+async function pullRequestHead(signal) {
+  const match = signal.match(/^pr:([\w.-]+\/[\w.-]+)#(\d+)$/);
+  if (!match) return null;
+  try {
+    const proc = Bun.spawn(["gh", "pr", "view", match[2], "--repo", match[1], "--json", "headRefOid"], {
+      stdout: "pipe",
+      stderr: "ignore",
+      env: process.env,
+      signal: AbortSignal.timeout(10000),
+    });
+    const [text, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    if (exitCode !== 0) return null;
+    return JSON.parse(text).headRefOid ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function pullRequestSignal(text, task) {
+  const url = text.match(/\bhttps:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)\b/i);
+  if (url) return `pr:${url[1]}#${url[2]}`;
+  const reference = text.match(/\b([\w.-]+\/[\w.-]+)#(\d+)\b/);
+  if (reference) return `pr:${reference[1]}#${reference[2]}`;
+  return task?.done?.split(";").map((part) => part.trim()).find((part) => /^pr:[\w.-]+\/[\w.-]+#\d+$/.test(part)) ?? null;
+}
+
+export async function verifyClaims(text, task, checks = {}) {
+  const results = [];
+  const checkSlackHead = checks.slackHasHead ?? slackHasHead;
+  const getPrHead = checks.getPrHead ?? pullRequestHead;
+  const cursor = text.match(/\bCursor\s+(ACCEPT|APPROVE)\b/i);
+  if (cursor) {
+    const claimLine = text.slice(cursor.index).split("\n", 1)[0];
+    const head = claimLine.match(/\bhead\s*[:=]\s*([0-9a-f]{7,40})\b/i)?.[1]
+      ?? claimLine.match(/\b(?:ACCEPT|APPROVE)\b[^\n]*?\b([0-9a-f]{7,40})\b/i)?.[1]
+      ?? text.match(/\bPR READY\s+head=([0-9a-f]{7,40})\b/i)?.[1];
+    let ok = false;
+    if (head && task?.sent_at) {
+      try { ok = await checkSlackHead(head.slice(0, 7), task.sent_at); } catch {}
+    }
+    results.push({ kind: "cursor-accept", ok: Boolean(ok), detail: !head ? "head_missing" : ok ? "slack_author_head_match" : "slack_author_or_head_mismatch" });
+  }
+
+  const ready = text.match(/\bPR READY\s+head=([0-9a-f]{7,40})\b/i);
+  if (ready) {
+    const signal = pullRequestSignal(text, task);
+    let actual = null;
+    if (signal) {
+      try { actual = await getPrHead(signal); } catch {}
+    }
+    const ok = Boolean(actual && actual.toLowerCase().startsWith(ready[1].toLowerCase()));
+    results.push({ kind: "pr-ready", ok, detail: !signal ? "pr_signal_missing" : ok ? "pr_head_match" : "pr_head_missing_or_mismatch" });
+  }
+
+  if (/\b(?:tests?\s+\d+\s+(?:passed|passing)|\d+\s+tests?\s+(?:passed|passing))\b/i.test(text)
+    || /테스트\s*\d+\s*(?:개\s*)?통과/.test(text)) {
+    results.push({ kind: "tests-count", ok: false, detail: "tests_count_is_not_evidence" });
+  }
+  return results;
+}
+
+export function claimEvent(catId, key, claim) {
+  return `FLEET_CLAIM_${claim.ok ? "OK" : "FALSE"} ${catId} ${key} ${claim.kind} ${claim.detail}`;
+}
+
+function waitForDependency(catId, key, prompt, options, reason) {
+  const { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after } = options;
+  db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,done,status,sent_at,depends_on,dispatch_type,keep_model)
+    VALUES(?,?,?,?,?,?,'waiting',?,?,?,?)
+    ON CONFLICT(key) DO UPDATE SET cat=excluded.cat, title=excluded.title, prompt=excluded.prompt, skill=excluded.skill, done=excluded.done, status='waiting', sent_at=excluded.sent_at, result=NULL, evidence=NULL, depends_on=excluded.depends_on, dispatch_type=excluded.dispatch_type, keep_model=excluded.keep_model`)
+    .run(key, catId, title || key, prompt, skill, done, now(), after, type, keepModel ? 1 : 0);
+  log(key, { ev: "dependency-wait", after, reason });
+  return `FLEET_DEPENDENCY_WAIT ${key} after=${after} ${reason}`;
+}
+
 // Verified send (Dori panes.ts idea): only into an idle agent prompt, one send, then confirm the agent actually started.
-async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done = "", title = "", keepModel = false } = {}) {
+async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after = "" } = {}) {
   const c = db.query("SELECT * FROM cats WHERE id=?").get(catId);
   if (!c || c.pane === "-") throw new Error(`cat ${catId} has no pane`);
   if (!(await Bun.file(prompt).exists())) throw new Error(`prompt file missing: ${prompt}`);
-  const s0 = classify(await read(c.pane));
+  if (after) {
+    const predecessor = db.query("SELECT status FROM tasks WHERE key=?").get(after);
+    if (predecessor?.status !== "verified-done") return waitForDependency(catId, key, prompt, { type, skill, done, title, keepModel, after }, `predecessor=${predecessor?.status ?? "unknown"}`);
+  }
+  const paneScreen = await read(c.pane);
+  const s0 = classify(paneScreen);
+  if (after && (!paneScreen.trim() || s0.state !== "idle")) {
+    return waitForDependency(catId, key, prompt, { type, skill, done, title, keepModel, after }, `pane=${paneScreen.trim() ? s0.state : "unreadable"}`);
+  }
   if (s0.state === "working" || s0.state === "compacting") return `DISPATCH_HOLD ${catId} busy(${s0.state}); not sent`;
   if (s0.state === "question") return `DISPATCH_HOLD ${catId} has a pending question; answer it first`;
   const want = await pickModel(type);
@@ -140,9 +315,9 @@ async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done
   if (modelNote.startsWith("MODEL_SWITCH_FAILED")) return modelNote;
   const head = `${key} [skill:${skill}${done ? ` | Done= ${done}` : ""}]`;
   const msg = `${head}: 지시문 파일 ${prompt} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 ${key}_DONE <한 줄 요약> 또는 ${key}_BLOCKED reason=<한 줄>.`;
-  db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,model,done,status,sent_at) VALUES(?,?,?,?,?,?,?,'sent',?)
-    ON CONFLICT(key) DO UPDATE SET cat=excluded.cat, prompt=excluded.prompt, skill=excluded.skill, model=excluded.model, done=excluded.done, status='sent', sent_at=excluded.sent_at, started_at=NULL, ended_at=NULL, result=NULL`)
-    .run(key, catId, title || key, prompt, skill, `${want.provider}/${want.model}:${want.thinking}`, done, now());
+  db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,model,done,status,sent_at,depends_on,dispatch_type,keep_model) VALUES(?,?,?,?,?,?,?,'sent',?,?,?,?)
+    ON CONFLICT(key) DO UPDATE SET cat=excluded.cat, title=excluded.title, prompt=excluded.prompt, skill=excluded.skill, model=excluded.model, done=excluded.done, status='sent', sent_at=excluded.sent_at, started_at=NULL, ended_at=NULL, result=NULL, depends_on=excluded.depends_on, dispatch_type=excluded.dispatch_type, keep_model=excluded.keep_model`)
+    .run(key, catId, title || key, prompt, skill, `${want.provider}/${want.model}:${want.thinking}`, done, now(), after || null, type, keepModel ? 1 : 0);
   db.query("UPDATE cats SET task=? WHERE id=?").run(key, catId);
   await Bun.$`herdr pane send-text ${c.pane} ${msg}`.nothrow().quiet();
   await Bun.sleep(700);
@@ -165,6 +340,26 @@ async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done
   db.query("UPDATE tasks SET status='sent-unconfirmed' WHERE key=?").run(key);
   log(key, { ev: "unconfirmed" });
   return `DISPATCH_UNCONFIRMED ${catId} ${key}: no Working within 60s (watch keeps checking)`;
+}
+
+export async function dispatchQueuedDependencies(dbHandle, paneRows, dispatchTask = dispatch) {
+  const waiting = dbHandle.query("SELECT * FROM tasks WHERE status='waiting' AND depends_on IS NOT NULL ORDER BY sent_at").all();
+  const paneStates = new Map(paneRows.map((row) => [row.id, row.state]));
+  const events = [];
+  for (const task of waiting) {
+    const predecessor = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(task.depends_on);
+    if (predecessor?.status !== "verified-done" || paneStates.get(task.cat) !== "idle") continue;
+    const result = await dispatchTask(task.cat, task.key, task.prompt, {
+      type: task.dispatch_type || "impl",
+      skill: task.skill || "ulw",
+      done: task.done || "",
+      title: task.title || "",
+      keepModel: Boolean(task.keep_model),
+      after: task.depends_on,
+    });
+    events.push(`FLEET_DEPENDENCY_DISPATCH ${task.key} ${result}`);
+  }
+  return events;
 }
 
 // Machine-checked done (Dori signals.ts idea). Spec: "pr:owner/repo#N" | "url:http://...=200" | "cmd:<shell>"; ';'-separated.
@@ -229,17 +424,32 @@ async function watch(intervalSec = 30) {
     try {
       const rows = await refresh();
       for (const r of rows) {
-        const sig = `${r.state}|${r.done?.key ?? ""}${r.done?.kind ?? ""}|${r.readyLine ?? ""}|${r.ready?.head ?? ""}`;
-        const prev = last.get(r.id);
-        if (prev !== undefined && prev !== sig) {
-          if (r.state !== prev.split("|")[0] && r.id !== "omonyang") console.log(`FLEET_STATE ${r.id} ${prev.split("|")[0]} -> ${r.state}`);
-          if (r.id !== "omonyang" && r.done && !prev.includes(`${r.done.key}${r.done.kind}`)) {
+        const sig = JSON.stringify({ state: r.state, doneKey: r.done?.key ?? "", doneKind: r.done?.kind ?? "", doneText: r.done?.text ?? "", readyLine: r.readyLine ?? "", readyHead: r.ready?.head ?? "", claimText: r.claimText ?? "" });
+        const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
+        if (previous && last.get(r.id) !== sig) {
+          if (r.state !== previous.state && r.id !== "omonyang") console.log(`FLEET_STATE ${r.id} ${previous.state} -> ${r.state}`);
+          const doneChanged = r.id !== "omonyang" && r.done && (r.done.key !== previous.doneKey || r.done.kind !== previous.doneKind);
+          const readyChanged = r.ready && r.ready.head !== previous.readyHead;
+          const readyLineChanged = r.readyLine && r.readyLine !== previous.readyLine;
+          const claimTextChanged = r.claimText && r.claimText !== previous.claimText;
+          if (doneChanged) {
             console.log(`FLEET_TASK_${r.done.kind} ${r.id} ${r.done.key} ${r.done.text}`);
             db.query("UPDATE tasks SET status=?, result=? WHERE key=?").run(r.done.kind === "DONE" ? "done-claimed" : "blocked", r.done.text, r.done.key);
             log(r.done.key, { ev: r.done.kind === "DONE" ? "done-claimed" : "blocked", text: r.done.text });
           }
-          if (r.ready && !prev.endsWith(r.ready.head)) console.log(`FLEET_PR_READY ${r.id} ${r.ready.repo} ${r.ready.head}`);
-          if (r.readyLine && !prev.includes(r.readyLine)) console.log(`FLEET_READY_LINE ${r.id} ${r.readyLine}`);
+          if (doneChanged || readyChanged || readyLineChanged || claimTextChanged) {
+            const taskKey = r.done?.key ?? r.task;
+            const task = taskKey ? db.query("SELECT * FROM tasks WHERE key=?").get(taskKey) : null;
+            const claims = await verifyClaims(r.claimText ?? "", task);
+            for (const claim of claims) {
+              console.log(claimEvent(r.id, taskKey ?? "-", claim));
+              if (taskKey) log(taskKey, { ev: claim.ok ? "claim-ok" : "claim-false", claim: claim.kind, detail: claim.detail });
+            }
+            if (readyChanged && claims.some((claim) => claim.kind === "pr-ready" && claim.ok)) {
+              console.log(`FLEET_PR_READY ${r.id} ${r.ready.repo} ${r.ready.head}`);
+            }
+          }
+          if (readyLineChanged) console.log(`FLEET_READY_LINE ${r.id} ${r.readyLine}`);
         }
         last.set(r.id, sig);
         if (r.task) {
@@ -253,6 +463,7 @@ async function watch(intervalSec = 30) {
           }
         }
       }
+      for (const event of await dispatchQueuedDependencies(db, rows)) console.log(event);
       const w5 = rows.find((r) => r.id === "omonyang");
       const listen = (await sh("pgrep -f 'bun slack-listen.mjs' | head -1")).trim();
       db.query("INSERT INTO beats(who,at,detail) VALUES('omonyang',?,?) ON CONFLICT(who) DO UPDATE SET at=excluded.at, detail=excluded.detail")
@@ -279,13 +490,13 @@ if (import.meta.main) {
   const out = await ({
     init: async () => { await init(); return status(); },
     status, report,
-    dispatch: () => dispatch(a[0], a[1], a[2], { type: opt("type"), skill: opt("skill"), done: opt("done"), title: opt("title"), keepModel: a.includes("--keep-model") }),
+    dispatch: () => dispatch(a[0], a[1], a[2], { type: opt("type"), skill: opt("skill"), done: opt("done"), title: opt("title"), keepModel: a.includes("--keep-model"), after: opt("after") }),
     track: () => track(a[0], a[1], opt("done"), opt("title")),
     verify: () => verify(a[0]),
-    tasks: async () => db.query("SELECT key,cat,status,skill,model,done,evidence FROM tasks ORDER BY sent_at DESC LIMIT 20").all().map((t) => JSON.stringify(t)).join("\n"),
+    tasks: async () => db.query("SELECT key,cat,status,depends_on,skill,model,done,evidence FROM tasks ORDER BY sent_at DESC LIMIT 20").all().map((t) => JSON.stringify(t)).join("\n"),
     beat: async () => JSON.stringify(db.query("SELECT * FROM beats").all()),
     routes: async () => JSON.stringify(ROUTES, null, 1),
     watch: () => watch(Number(a[0] || 30)),
-  }[cmd] ?? (async () => "usage: fleet init|status|report|dispatch <cat> <KEY> <prompt> [--type plan|impl|review|secure|quick] [--skill ulw|ulw-loop|mass-ulw|ulw-plan|ulw-execute|ulw-research] [--done 'pr:o/r#N;url:..=200;cmd:..'] [--keep-model]|track <KEY> <cat> --done ..|verify <KEY>|tasks|beat|routes|watch [sec]"))();
+  }[cmd] ?? (async () => "usage: fleet init|status|report|dispatch <cat> <KEY> <prompt> [--after <KEY>] [--type plan|impl|review|secure|quick] [--skill ulw|ulw-loop|mass-ulw|ulw-plan|ulw-execute|ulw-research] [--done 'pr:o/r#N;url:..=200;cmd:..'] [--keep-model]|track <KEY> <cat> --done ..|verify <KEY>|tasks|beat|routes|watch [sec]"))();
   if (out !== undefined) console.log(out);
 }
