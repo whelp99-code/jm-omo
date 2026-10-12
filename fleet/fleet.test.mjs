@@ -7,17 +7,11 @@ import { join } from "node:path";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, verify, verifyClaims } = await import("./fleet.mjs");
+const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
 afterAll(() => rmSync(unitHome, { recursive: true, force: true }));
-
-beforeEach(() => {
-  const db = unitDb();
-  db.exec("DELETE FROM dispatch_reservations; DELETE FROM tasks; DELETE FROM cats; DELETE FROM beats;");
-  db.close();
-});
 
 function unitDb() {
   return new Database(join(unitHome, ".local", "state", "omonyang", "fleet.sqlite"));
@@ -56,7 +50,7 @@ async function runBlockedDispatch(paneScreen) {
     CREATE TABLE tasks(
       key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
       done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
-      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]', completion_claimed INTEGER DEFAULT 0
     );`);
     db.query("INSERT INTO cats(id,name,pane) VALUES('crm','CRM','w6:p1')").run();
     db.close();
@@ -424,16 +418,23 @@ describe("fleet dispatch reservations", () => {
     writeFileSync(prompt, "failed Enter fixture\n");
     db.query("INSERT INTO cats(id,name,pane) VALUES('failed-enter-cat','Failed Enter','w-failed-enter:p1')").run();
     db.close();
-    const runCommand = async (argv) => ({
-      exitCode: argv[2] === "send-keys" && argv[4] === "Enter" ? 1 : 0,
-      stdout: argv[2] === "read" ? "Idle\n❯" : "",
-    });
+    let paneReads = 0;
+    const sleeps = [];
+    const runCommand = async (argv) => {
+      if (argv[2] === "read") paneReads++;
+      return {
+        exitCode: argv[2] === "send-keys" && argv[4] === "Enter" ? 1 : 0,
+        stdout: argv[2] === "read" ? "Idle\n❯" : "",
+      };
+    };
     const result = await dispatch("failed-enter-cat", "FAILED-ENTER", prompt, {
       keepModel: true,
       runCommand,
-      sleep: async () => {},
+      sleep: async (ms) => { sleeps.push(ms); },
     });
     expect(result).toContain("DISPATCH_UNCONFIRMED failed-enter-cat FAILED-ENTER");
+    expect(paneReads).toBe(16);
+    expect(sleeps.filter((ms) => ms === 5000)).toHaveLength(11);
     const stored = unitDb();
     expect(stored.query("SELECT status FROM tasks WHERE key='FAILED-ENTER'").get().status).toBe("send-failed-unconfirmed");
     expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-failed-enter:p1'").get()).toBeNull();
@@ -445,7 +446,7 @@ describe("fleet dispatch reservations", () => {
     const pane = "w-uncertain-cleanup:p1";
     const reservation = { pane, key: "UNCERTAIN-CLEANUP", attempt: "attempt-cleanup" };
     db.query("INSERT INTO cats(id,name,pane) VALUES('uncertain-cleanup-cat','Uncertain Cleanup',?)").run(pane);
-    db.query("INSERT INTO tasks(key,cat,status,history) VALUES(?,'uncertain-cleanup-cat','dispatching',?)")
+    db.query("INSERT INTO tasks(key,cat,status,history,send_attempted) VALUES(?,'uncertain-cleanup-cat','dispatching',?,1)")
       .run(reservation.key, JSON.stringify([{ ev: "send-attempted", attempt: reservation.attempt }]));
     db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,?,?)").run(pane, reservation.key, reservation.attempt);
     const readFailed = await reconcileFailedDispatch(db, reservation, async () => ({ exitCode: 1, stdout: "" }), async () => ({ exitCode: 0, stdout: "" }));
@@ -455,6 +456,27 @@ describe("fleet dispatch reservations", () => {
     const cleanupFailed = await reconcileFailedDispatch(db, reservation, async () => ({ exitCode: 0, stdout: "Idle\n❯" }), async () => ({ exitCode: 1, stdout: "" }));
     expect(cleanupFailed).toBe(false);
     expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(pane).key).toBe(reservation.key);
+    db.close();
+  });
+
+  it("allows only one recovery owner to clear pending pane input", async () => {
+    const db = unitDb();
+    const pane = "w-exclusive-clear:p1";
+    const reservation = { pane, key: "EXCLUSIVE-CLEAR", attempt: "exclusive-attempt" };
+    db.query("INSERT INTO cats(id,name,pane) VALUES('exclusive-clear-cat','Exclusive Clear',?)").run(pane);
+    db.query("INSERT INTO tasks(key,cat,status,history,send_attempted) VALUES(?,'exclusive-clear-cat','send-failed-unconfirmed',?,1)")
+      .run(reservation.key, JSON.stringify([{ ev: "send-attempted", attempt: reservation.attempt }]));
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,?,?)").run(pane, reservation.key, reservation.attempt);
+    let releases = 0;
+    const paneRead = async () => ({ exitCode: 0, stdout: "Idle\n❯" });
+    const runCommand = async () => { releases++; return { exitCode: 0, stdout: "" }; };
+    const results = await Promise.all([
+      reconcileFailedDispatch(db, reservation, paneRead, runCommand),
+      reconcileFailedDispatch(db, reservation, paneRead, runCommand),
+    ]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(releases).toBe(1);
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(pane)).toBeNull();
     db.close();
   });
 
@@ -606,6 +628,21 @@ describe("fleet dispatch reservations", () => {
     db.close();
   });
 
+  it("keeps send-attempt evidence after history truncation", () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('durable-send-cat','Durable Send','w-durable-send:p1')").run();
+    const history = JSON.stringify(Array.from({ length: 40 }, (_, index) => ({ ev: "noise", index })));
+    db.query("INSERT INTO tasks(key,cat,status,history,send_attempted) VALUES('DURABLE-SEND','durable-send-cat','dispatching',?,1)").run(history);
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-durable-send:p1", "DURABLE-SEND", "durable-send-attempt", reservedAt);
+    const reservation = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key=?").get("DURABLE-SEND");
+    expect(recoverDispatchReservation(db, reservation, "idle", Date.parse(reservedAt) + 11 * 60_000)).toBeNull();
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get("DURABLE-SEND").status).toBe("dispatching");
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get("w-durable-send:p1").key).toBe("DURABLE-SEND");
+    db.close();
+  });
+
   it("claims recovery ownership before allowing picker Escape to mutate the pane", () => {
     const db = unitDb();
     const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
@@ -700,7 +737,7 @@ describe("fleet dispatch reservations", () => {
     const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
     writeFileSync(prompt, "after uncertain send fixture\n");
     db.query("INSERT INTO cats(id,name,pane) VALUES('send-failed-recovery-cat','Send Failed','w-send-failed:p1')").run();
-    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('SEND-ATTEMPTED-OLD','send-failed-recovery-cat','dispatching',?)")
+    db.query("INSERT INTO tasks(key,cat,status,history,send_attempted) VALUES('SEND-ATTEMPTED-OLD','send-failed-recovery-cat','dispatching',?,1)")
       .run(JSON.stringify([{ ev: "send-attempted", attempt: "attempt-send-failed" }]));
     db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
       .run("w-send-failed:p1", "SEND-ATTEMPTED-OLD", "attempt-send-failed", reservedAt);
@@ -984,10 +1021,11 @@ describe("fleet completion classification", () => {
 
 describe("fleet completion claim verification", () => {
   it("re-verifies not-done tasks with prior completion claims during watch polling", async () => {
-    const db = unitDb();
-    db.query("INSERT INTO tasks(key,cat,done,status,history) VALUES('RETRY-PR','crm','pr:owner/repo#1','not-done',?)")
-      .run(JSON.stringify([{ ev: "done-claimed", text: "finished" }]));
-    db.query("INSERT INTO tasks(key,cat,done,status,history) VALUES('NOT-A-CLAIM','crm','pr:owner/repo#2','not-done','[]')").run();
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE tasks(key TEXT,cat TEXT,done TEXT,status TEXT,history TEXT,completion_claimed INTEGER)");
+    db.query("INSERT INTO tasks(key,cat,done,status,history,completion_claimed) VALUES('RETRY-PR','crm','pr:owner/repo#1','not-done',?,1)")
+      .run(JSON.stringify(Array.from({ length: 40 }, (_, index) => ({ ev: "not-done", detail: `retry-${index}` }))));
+    db.query("INSERT INTO tasks(key,cat,done,status,history,completion_claimed) VALUES('NOT-A-CLAIM','crm','cmd:true','not-done','[]',1)").run();
     const keys = [];
     const events = await retryNotDoneTasks(db, async (key) => { keys.push(key); return `VERIFY ${key}`; });
     expect(events).toEqual(["VERIFY RETRY-PR"]);
@@ -1009,20 +1047,19 @@ describe("fleet completion claim verification", () => {
   });
 
   it("retries not-done tasks with completion claims and skips unrelated tasks", async () => {
-    const db = unitDb();
-    db.query("INSERT INTO tasks(key,status,done,history) VALUES('NOT-DONE-PR','not-done','pr:owner/repo#1',?)")
-      .run(JSON.stringify([{ ev: "done-claimed", text: "complete" }]));
-    db.query("INSERT INTO tasks(key,status,done,history) VALUES('NOT-DONE-NO-CLAIM','not-done','pr:owner/repo#2','[]')").run();
-    db.close();
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE tasks(key TEXT,done TEXT,status TEXT,history TEXT,completion_claimed INTEGER)");
+    db.query("INSERT INTO tasks(key,status,done,history,completion_claimed) VALUES('NOT-DONE-PR','not-done','pr:owner/repo#1',?,1)")
+      .run(JSON.stringify(Array.from({ length: 40 }, (_, index) => ({ ev: "not-done", index }))));
+    db.query("INSERT INTO tasks(key,status,done,history,completion_claimed) VALUES('NOT-DONE-NO-CLAIM','not-done','pr:owner/repo#2','[]',0)").run();
 
     const retried = [];
-    const retryDb = unitDb();
-    expect(await retryNotDoneTasks(retryDb, async (key) => {
+    expect(await retryNotDoneTasks(db, async (key) => {
       retried.push(key);
       return `VERIFY_RETRY ${key}`;
     })).toEqual(["VERIFY_RETRY NOT-DONE-PR"]);
     expect(retried).toEqual(["NOT-DONE-PR"]);
-    retryDb.close();
+    db.close();
   });
 
   it("preserves concurrent task history appends", async () => {
@@ -1230,18 +1267,21 @@ describe("fleet completion claim verification", () => {
     stored.close();
   });
 
-  it("accepts only Cursor's same-line full SHA", async () => {
+  it("accepts full SHA only when the ACCEPT identifies the target PR", async () => {
     const head = "abcdef0123456789abcdef0123456789abcdef01";
     expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `ACCEPT owner/jm-omo#5 head=${head}` },
+      { user: "UOTHER", text: `ACCEPT owner/jm-omo#5 head=${head}` },
+    ], head, { repo: "owner/jm-omo", prNumber: "5" })).toBe(true);
+    expect(await cursorHeadMatches([
+      { user: "UOTHER", text: `ACCEPT owner/jm-omo#5 head=${head}` },
+      { user: "U0B81F5GR6V", text: `ACCEPT owner/jm-omo#99 head=${head}` },
+    ], head, { repo: "owner/jm-omo", prNumber: "5" })).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `ACCEPT jm-omo PR5 head=${head}` },
+    ], head, { repo: "owner/jm-omo", prNumber: "5" })).toBe(true);
+    expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: `ACCEPT head=${head}` },
-      { user: "UOTHER", text: `ACCEPT head=${head}` },
-    ], head)).toBe(true);
-    expect(await cursorHeadMatches([
-      { user: "UOTHER", text: `ACCEPT head=${head}` },
-      { user: "U0B81F5GR6V", text: `ACCEPT head=${head.slice(0, 8)}` },
-    ], head)).toBe(false);
-    expect(await cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "ACCEPT head=ffffffff" },
     ], head)).toBe(false);
   });
 
@@ -1255,14 +1295,20 @@ describe("fleet completion claim verification", () => {
       { user: "U0B81F5GR6V", text: "ACCEPT head=ce1cbb7b" },
     ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
     expect(await cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "ACCEPT PR #5 head=ce1cbb7b" },
+      { user: "U0B81F5GR6V", text: "ACCEPT jm-omo PR5 head=ce1cbb7b" },
     ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(true);
     expect(await cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "ACCEPT PR #99 head=ce1cbb7b" },
+      { user: "U0B81F5GR6V", text: "ACCEPT jm-omo PR99 head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT other-repo#5 head=ce1cbb7b" },
     ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
     expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: `ACCEPT head=${head}` },
-    ], head)).toBe(true);
+    ], head)).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `ACCEPT TASK-OMO-5 head=${head}` },
+    ], head, { taskKey: "TASK-OMO-5" })).toBe(true);
     expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: "ACCEPT whelp99-code/jm-omo head=ce1cbb7b" },
     ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
@@ -1282,18 +1328,18 @@ describe("fleet completion claim verification", () => {
     const rejected = `e2963141${"0".repeat(32)}`;
     const accepted = `14344f04${"0".repeat(32)}`;
     const table = `| 건 | head | 판정 | | --- | --- | --- | | Mail #57 | \`${accepted}\` | ACCEPT | | jm-omo #2 | \`${rejected}\` | REJECT |`;
-    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], rejected)).toBe(false);
-    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], accepted)).toBe(true);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], rejected, { repo: "owner/jm-omo", prNumber: "2" })).toBe(false);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], accepted, { repo: "owner/mail", prNumber: "57" })).toBe(true);
     const lines = `jm-omo #2 ${rejected} REJECT\nMail #57 ${accepted} ACCEPT`;
-    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], rejected)).toBe(false);
-    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], accepted)).toBe(true);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], rejected, { repo: "owner/jm-omo", prNumber: "2" })).toBe(false);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], accepted, { repo: "owner/mail", prNumber: "57" })).toBe(true);
   });
 
   it("resolves a short claim through the PR and checks Slack against the full SHA", async () => {
     const fullHead = "abcdef0123456789abcdef0123456789abcdef01";
     const acceptedPrefix = fullHead.slice(0, 8);
     const task = { sent_at: "2026-10-09T10:00:00.000Z", done: "pr:whelp99-code/jm-omo#1" };
-    const slackMessages = [{ user: "U0B81F5GR6V", text: `ACCEPT PR #1 head=${acceptedPrefix}` }];
+    const slackMessages = [{ user: "U0B81F5GR6V", text: `ACCEPT jm-omo#1 head=${acceptedPrefix}` }];
     let checkedHead;
     const verified = await verifyClaims(`Cursor ACCEPT head=${acceptedPrefix}`, task, {
       slackHasHead: async (head, sentAt) => {
@@ -1334,6 +1380,43 @@ describe("fleet completion claim verification", () => {
     expect(separateLine.find((claim) => claim.kind === "cursor-accept").ok).toBe(false);
   });
 
+  it("uses the parsed task PR number in default Slack short-head verification", async () => {
+    const repo = "whelp99-code/jm-omo";
+    const prNumber = "85";
+    const fullHead = "efaf6d9222222222222222222222222222222222";
+    const prefix = "efaf6d92";
+    const task = {
+      sent_at: "2026-10-12T10:00:00.000Z",
+      done: `pr:${repo}#${prNumber}`,
+    };
+    const calls = [];
+    let messages = [{ user: "U0B81F5GR6V", text: `ACCEPT jm-omo PR${prNumber} head=${prefix}` }];
+    const runCommand = async (argv) => {
+      calls.push(argv);
+      if (argv[1] === "pr") return { exitCode: 0, stdout: JSON.stringify({ headRefOid: fullHead }) };
+      if (argv[1] === "api") return { exitCode: 0, stdout: `${fullHead}\n` };
+      throw new Error(`unexpected command: ${argv.join(" ")}`);
+    };
+    const matched = await verifyClaims(`Cursor ACCEPT PR #${prNumber} head=${prefix}`, task, {
+      runCommand,
+      slackHistory: async () => messages,
+    });
+    expect(matched[0]).toMatchObject({ kind: "cursor-accept", ok: true, head: fullHead, actualHead: fullHead });
+    expect(calls).toEqual([
+      ["gh", "pr", "view", prNumber, "--repo", repo, "--json", "headRefOid"],
+      ["gh", "api", `repos/${repo}/pulls/${prNumber}/commits`, "--paginate", "--jq", ".[].sha"],
+    ]);
+
+    calls.length = 0;
+    messages = [{ user: "U0B81F5GR6V", text: `ACCEPT jm-omo PR99 head=${prefix}` }];
+    const wrongPr = await verifyClaims(`Cursor ACCEPT PR #99 head=${prefix}`, task, {
+      runCommand,
+      slackHistory: async () => messages,
+    });
+    expect(wrongPr[0]).toMatchObject({ kind: "cursor-accept", ok: false });
+    expect(calls).toEqual([["gh", "pr", "view", prNumber, "--repo", repo, "--json", "headRefOid"]]);
+  });
+
   it("rejects a Slack ACCEPT prefix that resolves to a different commit", async () => {
     const mergedHead = "efaf6d945ebb757ee0d349e3a65c5345cf882a8d";
     const differentHead = "efaf6d9a1234567890abcdef1234567890abcdef";
@@ -1370,7 +1453,7 @@ describe("fleet completion claim verification", () => {
   it("accepts a prefix that uniquely identifies the current PR head", async () => {
     const head = "efaf6d9222222222222222222222222222222222";
     const accepted = await cursorHeadMatches(
-      [{ user: "U0B81F5GR6V", text: "ACCEPT PR #85 head=efaf6d92" }],
+      [{ user: "U0B81F5GR6V", text: "ACCEPT owner/repo#85 head=efaf6d92" }],
       head,
       { repo: "owner/repo", prNumber: "85" },
       async () => ({ exitCode: 0, stdout: `${head}\n` }),
@@ -1382,7 +1465,7 @@ describe("fleet completion claim verification", () => {
     const current = "efaf6d9222222222222222222222222222222222";
     const previous = "efaf6d9111111111111111111111111111111111";
     const accepted = await cursorHeadMatches(
-      [{ user: "U0B81F5GR6V", text: "ACCEPT PR #86 head=efaf6d91" }],
+      [{ user: "U0B81F5GR6V", text: "ACCEPT owner/repo#86 head=efaf6d91" }],
       current,
       { repo: "owner/repo", prNumber: "86" },
       async () => ({ exitCode: 0, stdout: `${previous}\n${current}\n` }),
@@ -1408,33 +1491,20 @@ describe("fleet completion claim verification", () => {
     await verifyClaims(`PR READY head=${head} https://github.com/whelp99-code/jm-omo/pull/7`, { done: "pr:other/repo#1" }, {
       getPrHead: async (signal) => { urlSignal = signal; return head; },
     });
-    expect(urlSignal).toBe("pr:whelp99-code/jm-omo#7");
+    expect(urlSignal).toBe("pr:other/repo#1");
   });
 
-  it("uses a read-only gh pr view for the referenced PR", async () => {
-    const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-gh-"));
-    const bin = join(home, "bin");
-    mkdirSync(bin);
-    const ghPath = join(bin, "gh");
-    const ghLog = join(home, "gh.log");
+  it("uses a read-only argv gh pr view for the referenced PR", async () => {
     const head = "abcdef0123456789abcdef0123456789abcdef01";
-    writeFileSync(ghPath, `#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_LOG\"\nprintf '{\"headRefOid\":\"${head}\"}\\n'\n`);
-    chmodSync(ghPath, 0o755);
-    const previousPath = process.env.PATH;
-    const previousGhLog = process.env.GH_LOG;
-    process.env.PATH = `${bin}:${previousPath ?? ""}`;
-    process.env.GH_LOG = ghLog;
-    try {
-      const claims = await verifyClaims(`PR READY head=${head}`, { done: "pr:whelp99-code/jm-omo#1" });
-      expect(readFileSync(ghLog, "utf8").trim()).toBe("pr view 1 --repo whelp99-code/jm-omo --json headRefOid");
-      expect(claims[0]).toMatchObject({ kind: "pr-ready", ok: true });
-    } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-      if (previousGhLog === undefined) delete process.env.GH_LOG;
-      else process.env.GH_LOG = previousGhLog;
-      rmSync(home, { recursive: true, force: true });
-    }
+    const calls = [];
+    const claims = await verifyClaims(`PR READY head=${head}`, { done: "pr:whelp99-code/jm-omo#1" }, {
+      runCommand: async (argv) => {
+        calls.push(argv);
+        return { exitCode: 0, stdout: JSON.stringify({ headRefOid: head }) };
+      },
+    });
+    expect(calls).toEqual([["gh", "pr", "view", "1", "--repo", "whelp99-code/jm-omo", "--json", "headRefOid"]]);
+    expect(claims[0]).toMatchObject({ kind: "pr-ready", ok: true });
   });
 
   it("does not treat a tests count as completion evidence", async () => {
@@ -1926,7 +1996,11 @@ describe("fleet review-stall request correlation", () => {
       since = oldest;
       return [request];
     });
-    expect(since).toBe("0");
+    const bootstrapCursor = ((nowMs - 30 * 24 * 60 * 60_000) / 1000).toFixed(6);
+    expect(since).toBe(bootstrapCursor);
+    const exactRootParams = slackHistoryParams(requestTs);
+    expect(exactRootParams.get("oldest")).toBe(requestTs);
+    expect(exactRootParams.get("inclusive")).toBe("true");
     expect(first).toHaveLength(1);
     expect(first[0]).toContain("TASK-OLD-REVIEW");
     expect(db.query("SELECT value FROM fleet_state WHERE key='slack-review-cursor'").get().value).toBe(requestTs);
