@@ -88,17 +88,17 @@ function isQuestionStatusLine(line) {
 }
 
 const CATS = [
-  ["omonyang", "오모냥", "대장: 계획·배분·확인", "captain", "w5:p1", "-"],
+  ["omonyang", "오모냥", "대장: 계획·배분·확인", "captain", "w3:p2", "-"],
   ["nahee", "나희", "부대장: 대장 대행, 지원", "vice", "-", "-"],
   ["seoyun", "서윤", "감시·Cursor 검수 전달", "bot", "-", "-"],
   ["cursor", "Cursor 봇", "독립 검수(ACCEPT/REVISE)", "bot", "-", "-"],
-  ["gajae", "가재", "서버 이전·인프라 실행", "bot", "w1:p3", "-"],
-  ["jarvis", "JARVIS 냥", "JARVIS 개발", "pane", "wC:p1", "Orca-JARVIS"],
-  ["sb", "SB 냥", "Second Brain 개발", "pane", "w2:p1", "second-brain-app"],
-  ["crm", "CRM 냥", "CRM(core5) 개발", "pane", "w6:p1", "ai-crm-project-manager"],
-  ["price", "Price 냥", "Price 개발", "pane", "wD:p1", "price-ai-tax"],
-  ["mail", "Mail 냥", "Mail 개발", "pane", "wE:p1", "mail-intelligence"],
-  ["jarvis2", "JARVIS 보조 냥", "JARVIS 보조(압축 문제로 휴식)", "pane", "wK:p1", "Orca-JARVIS"],
+  ["gajae", "가재", "서버 이전·인프라 실행", "bot", "w2:p1", "-"],
+  ["jarvis", "JARVIS 냥", "JARVIS 개발", "pane", "-", "Orca-JARVIS"],
+  ["sb", "SB 냥", "Second Brain 개발", "pane", "-", "second-brain-app"],
+  ["crm", "CRM 냥", "CRM(core5) 개발", "pane", "-", "ai-crm-project-manager"],
+  ["price", "Price 냥", "Price 개발", "pane", "-", "price-ai-tax"],
+  ["mail", "Mail 냥", "Mail 개발", "pane", "-", "mail-intelligence"],
+  ["jarvis2", "JARVIS 보조 냥", "JARVIS 보조(압축 문제로 휴식)", "pane", "-", "Orca-JARVIS"],
 ];
 
 export function classify(screen) {
