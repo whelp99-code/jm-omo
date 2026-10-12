@@ -166,6 +166,20 @@ export function recordDispatchSendAttempt(dbHandle, pane, key, attempt) {
   }).immediate();
 }
 
+export function reservationExpiredAndOwned(dbHandle, reservation, nowMs = Date.now()) {
+  return dbHandle.transaction(() => {
+    const current = dbHandle.query(`SELECT reserved_at FROM dispatch_reservations
+      WHERE pane=? AND key=? AND attempt=?`).get(reservation.pane, reservation.key, reservation.attempt);
+    if (!current || current.reserved_at !== reservation.reserved_at) return false;
+    const task = dbHandle.query("SELECT status,history FROM tasks WHERE key=?").get(reservation.key);
+    if (task?.status !== "dispatching") return false;
+    const reservedAt = Date.parse(current.reserved_at);
+    if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) return false;
+    const history = JSON.parse(task.history || "[]");
+    return !history.some((event) => event.ev === "send-attempted" && event.attempt === reservation.attempt);
+  }).immediate();
+}
+
 export function recoverDispatchReservation(dbHandle, reservation, paneState, nowMs = Date.now()) {
   return dbHandle.transaction(() => {
     const current = dbHandle.query(`SELECT reserved_at FROM dispatch_reservations
@@ -194,9 +208,13 @@ export function recoverDispatchReservation(dbHandle, reservation, paneState, now
     }
     if (paneState !== "idle") return null;
     if (sendAttempted) {
+      const deleted = dbHandle.query(`DELETE FROM dispatch_reservations
+        WHERE pane=? AND key=? AND attempt=? AND reserved_at=?`)
+        .run(reservation.pane, reservation.key, reservation.attempt, reservation.reserved_at).changes;
+      if (!deleted) return null;
       dbHandle.query("UPDATE tasks SET status='send-failed-unconfirmed' WHERE key=? AND status='dispatching'").run(reservation.key);
       appendHistoryInTransaction(dbHandle, reservation.key, { ev: "send-failed-unconfirmed", attempt: reservation.attempt });
-      return null;
+      return `FLEET_SEND_FAILED_UNCONFIRMED ${reservation.key} pane=${reservation.pane} reservation_released`;
     }
     const deleted = dbHandle.query(`DELETE FROM dispatch_reservations
       WHERE pane=? AND key=? AND attempt=? AND reserved_at=?`)
@@ -217,6 +235,7 @@ export async function recoverInterruptedDispatches(dbHandle, paneRows, nowMs = D
     try {
       let state = paneStates.get(reservation.cat);
       if (state === "model-picker") {
+        if (!reservationExpiredAndOwned(dbHandle, reservation, nowMs)) continue;
         const escape = await runCommand(["herdr", "pane", "send-keys", reservation.pane, "Escape"]);
         if (escape.exitCode !== 0) continue;
         const screen = await runCommand(["herdr", "pane", "read", reservation.pane, "--source", "visible", "--format", "text"]);
@@ -428,8 +447,8 @@ export function cursorHeadMatches(messages, fullHead) {
   return messages.some((message) => message.user === CURSOR_USER_ID
     && String(message.text ?? "").split(/\n|(?<=\|)\s+(?=\|)/).some((line) => {
       if (!/\b(?:ACCEPT|APPROVE)\b/i.test(line) || /\b(?:REJECT|REVISE)\b/i.test(line)) return false;
-      return [...line.matchAll(/(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/gi)]
-        .some((match) => match[0].toLowerCase() === want);
+      return [...line.matchAll(/(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])/gi)]
+        .some((match) => want.startsWith(match[0].toLowerCase()));
     }));
 }
 
@@ -742,7 +761,7 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     if (existing && (existing.cat !== catId || !["waiting", "dispatch-interrupted", "dispatch-error"].includes(existing.status))) return { hold: "duplicate-key" };
     if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)) return { hold: "pane-reserved" };
     const active = db.query(`SELECT t.key FROM tasks t JOIN cats c ON c.id=t.cat
-      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','prompt-lost','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
+      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
     if (active) return { hold: "prior-task-unresolved" };
     const attempt = crypto.randomUUID();
     const model = want ? `${want.provider}/${want.model}:${want.thinking}` : "kept";
@@ -971,7 +990,7 @@ export async function track(key, cat, done, title) {
     const c = db.query("SELECT * FROM cats WHERE id=?").get(cat);
     if (!c) throw new Error("NO_CAT");
     if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)
-      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','prompt-lost','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
+      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
       return `TRACK_HOLD ${key}: prior-task-unresolved`;
     }
     db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,?,?,?,'tracked-unconfirmed',?)").run(key, cat, title || key, done || "", now());

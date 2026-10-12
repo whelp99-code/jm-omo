@@ -460,6 +460,36 @@ describe("fleet dispatch reservations", () => {
     expect(result).toContain("DISPATCH_OK interrupted-cat INTERRUPTED-TASK");
   });
 
+  it("releases an expired send-failed reservation so the pane can accept new work", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "after-send-failed-prompt.txt");
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    writeFileSync(prompt, "after uncertain send fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('send-failed-recovery-cat','Send Failed','w-send-failed:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('SEND-ATTEMPTED-OLD','send-failed-recovery-cat','dispatching',?)")
+      .run(JSON.stringify([{ ev: "send-attempted", attempt: "attempt-send-failed" }]));
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-send-failed:p1", "SEND-ATTEMPTED-OLD", "attempt-send-failed", reservedAt);
+    const reservation = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key=?").get("SEND-ATTEMPTED-OLD");
+
+    const event = recoverDispatchReservation(db, reservation, "idle", Date.parse(reservedAt) + 10 * 60_000);
+    expect(event).toBe("FLEET_SEND_FAILED_UNCONFIRMED SEND-ATTEMPTED-OLD pane=w-send-failed:p1 reservation_released");
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get("SEND-ATTEMPTED-OLD").status).toBe("send-failed-unconfirmed");
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane='w-send-failed:p1'").get()).toBeNull();
+    db.close();
+
+    let reads = 0;
+    const result = await dispatch("send-failed-recovery-cat", "AFTER-SEND-FAILED", prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async (argv) => ({
+        exitCode: 0,
+        stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+      }),
+    });
+    expect(result).toContain("DISPATCH_OK send-failed-recovery-cat AFTER-SEND-FAILED");
+  });
+
   it("escapes and confirms the prompt before reclaiming a stale model-picker reservation", async () => {
     const db = unitDb();
     const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
@@ -482,6 +512,27 @@ describe("fleet dispatch reservations", () => {
     ]);
     expect(events).toEqual(["FLEET_DISPATCH_INTERRUPTED PICKER-TASK pane=w-picker:p1 reservation_released"]);
     expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-picker:p1'").get()).toBeNull();
+    recovered.close();
+  });
+
+  it("does not escape a model picker while its reservation is fresh", async () => {
+    const db = unitDb();
+    const reservedAt = new Date().toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('fresh-picker-cat','Fresh Picker','w-fresh-picker:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('FRESH-PICKER-TASK','fresh-picker-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-fresh-picker:p1", "FRESH-PICKER-TASK", "fresh-picker-attempt", reservedAt);
+    db.close();
+
+    const calls = [];
+    const recovered = unitDb();
+    expect(await recoverInterruptedDispatches(recovered, [{ id: "fresh-picker-cat", state: "model-picker" }], Date.now(), async (argv) => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: "Idle\n❯" };
+    })).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-fresh-picker:p1'").get().key)
+      .toBe("FRESH-PICKER-TASK");
     recovered.close();
   });
 
@@ -905,7 +956,10 @@ describe("fleet completion claim verification", () => {
     ], head)).toBe(true);
     expect(cursorHeadMatches([
       { user: "UOTHER", text: `ACCEPT head=${head}` },
-      { user: "U0B81F5GR6V", text: "ACCEPT head=abcdef0" },
+      { user: "U0B81F5GR6V", text: `ACCEPT head=${head.slice(0, 8)}` },
+    ], head)).toBe(true);
+    expect(cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT head=ffffffff" },
     ], head)).toBe(false);
   });
 
@@ -934,9 +988,10 @@ describe("fleet completion claim verification", () => {
     const fullHead = "abcdef0123456789abcdef0123456789abcdef01";
     const acceptedPrefix = fullHead.slice(0, 8);
     const task = { sent_at: "2026-10-09T10:00:00.000Z", done: "pr:whelp99-code/jm-omo#1" };
+    const slackMessages = [{ user: "U0B81F5GR6V", text: `ACCEPT head=${acceptedPrefix}` }];
     let checkedHead;
     const verified = await verifyClaims(`Cursor ACCEPT head=${acceptedPrefix}`, task, {
-      slackHasHead: async (head, sentAt) => { checkedHead = head; return head === fullHead && sentAt === task.sent_at; },
+      slackHasHead: async (head, sentAt) => { checkedHead = head; return head === fullHead && sentAt === task.sent_at && cursorHeadMatches(slackMessages, head); },
       getPrHead: async () => fullHead,
     });
     expect(checkedHead).toBe(fullHead);
@@ -971,7 +1026,7 @@ describe("fleet completion claim verification", () => {
     }, {
       slackHasHead: async (head) => {
         checkedHead = head;
-        return differentHead.startsWith(head);
+        return cursorHeadMatches([{ user: "U0B81F5GR6V", text: `ACCEPT head=${differentHead.slice(0, 8)}` }], head);
       },
       getPrHead: async () => mergedHead,
     });
