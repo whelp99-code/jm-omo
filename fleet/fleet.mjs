@@ -99,11 +99,15 @@ function questionPolicy(question) {
   return QUESTION_POLICIES.find((policy) => policy.matches.test(question)) ?? null;
 }
 
-async function answerPaneQuestion(pane, answer) {
-  const send = Bun.spawn(["herdr", "pane", "send-text", pane, answer], { stdout: "ignore", stderr: "ignore" });
-  if (await send.exited !== 0) return false;
-  const enter = Bun.spawn(["herdr", "pane", "send-keys", pane, "Enter"], { stdout: "ignore", stderr: "ignore" });
-  return await enter.exited === 0;
+export async function answerPaneQuestion(pane, expectedQuestion, answer, runCommand = executeSignalCommand) {
+  const current = await runCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
+  if (current.exitCode !== 0) return false;
+  const state = classify(current.stdout);
+  if (state.state !== "question" || state.questionText !== expectedQuestion) return false;
+  const send = await runCommand(["herdr", "pane", "send-text", pane, answer]);
+  if (send.exitCode !== 0) return false;
+  const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
+  return enter.exitCode === 0;
 }
 
 function log(task, ev) {
@@ -112,6 +116,22 @@ function log(task, ev) {
   const h = JSON.parse(t.history || "[]");
   h.push({ at: now(), ...ev });
   db.query("UPDATE tasks SET history=? WHERE key=?").run(JSON.stringify(h.slice(-40)), task);
+}
+
+export function markTaskBlocked(key, result) {
+  return db.transaction(() => {
+    db.query("UPDATE tasks SET status='blocked',result=? WHERE key=?").run(result, key);
+    db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
+    log(key, { ev: "blocked", text: result });
+  }).immediate();
+}
+
+export function markTaskPromptLost(key, attempt) {
+  return db.transaction(() => {
+    db.query("UPDATE tasks SET status='prompt-lost' WHERE key=?").run(key);
+    db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
+    log(key, { ev: "prompt-lost", ...(attempt ? { attempt } : {}) });
+  }).immediate();
 }
 
 async function init() {
@@ -363,20 +383,36 @@ export function reviewStallDrafts(requests, replies, nowMs, alerted = new Set())
   return drafts;
 }
 
+export async function reviewStallEvents(nowMs, alerted, fetchMessages = slackHistory) {
+  let messages;
+  try {
+    messages = await fetchMessages(((nowMs - 24 * 60 * 60_000) / 1000).toFixed(6));
+  } catch {
+    return [];
+  }
+  if (!messages) return [];
+  return reviewStallDrafts(
+    messages.filter(isReviewRequest),
+    messages.filter(isReviewResponder),
+    nowMs,
+    alerted,
+  );
+}
+
 function parsePullRequestSignal(signal) {
   const match = signal.match(/^pr:([\w.-]+\/[\w.-]+)#(\d+)$/);
   return match ? { repo: match[1], number: match[2] } : null;
 }
 
-async function pullRequestHead(signal) {
-  const pr = parsePullRequestSignal(signal);
+async function pullRequestHead(prSignal, abortSignal = AbortSignal.timeout(10000)) {
+  const pr = parsePullRequestSignal(prSignal);
   if (!pr) return null;
   try {
     const proc = Bun.spawn(["gh", "pr", "view", pr.number, "--repo", pr.repo, "--json", "headRefOid"], {
       stdout: "pipe",
       stderr: "ignore",
       env: process.env,
-      signal: AbortSignal.timeout(10000),
+      signal: abortSignal,
     });
     const [text, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
     if (exitCode !== 0) return null;
@@ -386,13 +422,13 @@ async function pullRequestHead(signal) {
   }
 }
 
-async function checkRunsForHead(repo, head) {
+async function checkRunsForHead(repo, head, abortSignal = AbortSignal.timeout(10000)) {
   try {
     const proc = Bun.spawn(["gh", "api", `repos/${repo}/commits/${head}/check-runs`], {
       stdout: "pipe",
       stderr: "ignore",
       env: process.env,
-      signal: AbortSignal.timeout(10000),
+      signal: abortSignal,
     });
     const [text, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
     if (exitCode !== 0) return null;
@@ -403,12 +439,12 @@ async function checkRunsForHead(repo, head) {
   }
 }
 
-async function pullRequestCheckRuns(signal) {
-  const pr = parsePullRequestSignal(signal);
+async function pullRequestCheckRuns(prSignal, abortSignal) {
+  const pr = parsePullRequestSignal(prSignal);
   if (!pr) return null;
-  const head = await pullRequestHead(signal);
+  const head = await pullRequestHead(prSignal, abortSignal ?? AbortSignal.timeout(10000));
   if (!head) return null;
-  const checkRuns = await checkRunsForHead(pr.repo, head);
+  const checkRuns = await checkRunsForHead(pr.repo, head, abortSignal ?? AbortSignal.timeout(10000));
   return checkRuns ? { head, checkRuns } : null;
 }
 
@@ -419,9 +455,9 @@ export function isBugbotUsageLimit(checkRuns) {
   return /\busage limit (?:has been )?(?:reached|exceeded)\b/i.test(output);
 }
 
-async function bugbotLimitEvents(dbHandle, previous) {
+export async function bugbotLimitEvents(dbHandle, previous, getCheckRuns = pullRequestCheckRuns) {
   const tasks = dbHandle.query(`SELECT key,done FROM tasks
-    WHERE status IN ('sent','sent-unconfirmed','working','done-claimed') AND done IS NOT NULL AND done!=''
+    WHERE status IN ('sent','sent-unconfirmed','send-failed-unconfirmed','working','done-claimed') AND done IS NOT NULL AND done!=''
     ORDER BY sent_at DESC LIMIT 20`).all();
   const targets = new Map();
   for (const task of tasks) {
@@ -430,16 +466,21 @@ async function bugbotLimitEvents(dbHandle, previous) {
     }
   }
   const events = [];
-  for (const [signal, taskKey] of targets) {
-    const result = await pullRequestCheckRuns(signal);
-    if (!result) continue;
-    const alertKey = `${signal}@${result.head}`;
-    const limited = isBugbotUsageLimit(result.checkRuns);
-    const wasLimited = previous.get(alertKey) === true;
-    previous.set(alertKey, limited);
-    if (limited && !wasLimited) {
-      events.push(`FLEET_BUGBOT_LIMIT ${taskKey} ${signal.slice(3)} head=${result.head.slice(0, 7)} reason=usage_limit_reached`);
-    }
+  const entries = [...targets];
+  const deadline = AbortSignal.timeout(15000);
+  for (let offset = 0; offset < entries.length && !deadline.aborted; offset += 5) {
+    const batch = await Promise.all(entries.slice(offset, offset + 5).map(async ([signal, taskKey]) => {
+      const result = await getCheckRuns(signal, deadline);
+      if (!result) return null;
+      const alertKey = `${signal}@${result.head}`;
+      const limited = isBugbotUsageLimit(result.checkRuns);
+      const wasLimited = previous.get(alertKey) === true;
+      previous.set(alertKey, limited);
+      return limited && !wasLimited
+        ? `FLEET_BUGBOT_LIMIT ${taskKey} ${signal.slice(3)} head=${result.head.slice(0, 7)} reason=usage_limit_reached`
+        : null;
+    }));
+    events.push(...batch.filter(Boolean));
   }
   return events;
 }
@@ -460,13 +501,17 @@ export async function verifyClaims(text, task, checks = {}) {
   if (cursor) {
     const claimLine = text.slice(cursor.index).split("\n", 1)[0];
     const head = claimLine.match(/\bhead\s*[:=]\s*([0-9a-f]{7,40})\b/i)?.[1]
-      ?? claimLine.match(/\b(?:ACCEPT|APPROVE)\b[^\n]*?\b([0-9a-f]{7,40})\b/i)?.[1]
-      ?? text.match(/\bPR READY\s+head=([0-9a-f]{7,40})\b/i)?.[1];
+      ?? claimLine.match(/\b(?:ACCEPT|APPROVE)\b[^\n]*?\b([0-9a-f]{7,40})\b/i)?.[1];
     let ok = false;
     if (head && task?.sent_at) {
       try { ok = await checkSlackHead(head.slice(0, 7), task.sent_at); } catch {}
     }
-    results.push({ kind: "cursor-accept", ok: Boolean(ok), detail: !head ? "head_missing" : ok ? "slack_author_head_match" : "slack_author_or_head_mismatch" });
+    results.push({
+      kind: "cursor-accept",
+      ok: Boolean(ok),
+      head: head?.toLowerCase() ?? null,
+      detail: !head ? "head_missing_on_accept_line" : ok ? "slack_author_head_match" : "slack_author_or_head_mismatch",
+    });
   }
 
   const ready = text.match(/\bPR READY\s+head=([0-9a-f]{7,40})\b/i);
@@ -476,8 +521,10 @@ export async function verifyClaims(text, task, checks = {}) {
     if (signal) {
       try { actual = await getPrHead(signal); } catch {}
     }
-    const ok = Boolean(actual && actual.toLowerCase().startsWith(ready[1].toLowerCase()));
-    results.push({ kind: "pr-ready", ok, detail: !signal ? "pr_signal_missing" : ok ? "pr_head_match" : "pr_head_missing_or_mismatch" });
+    const actualHead = typeof actual === "string" && /^[a-f0-9]{40}$/i.test(actual) ? actual.toLowerCase() : null;
+    const head = ready[1].toLowerCase();
+    const ok = Boolean(actualHead && actualHead.startsWith(head));
+    results.push({ kind: "pr-ready", ok, head, actualHead, detail: !signal ? "pr_signal_missing" : ok ? "pr_head_match" : "pr_head_missing_or_mismatch" });
   }
 
   if (/\b(?:tests?\s+\d+\s+(?:passed|passing)|\d+\s+tests?\s+(?:passed|passing))\b/i.test(text)
@@ -502,7 +549,7 @@ function queueDispatch(catId, key, prompt, options, reason) {
 }
 
 // Verified send (Dori panes.ts idea): only into an idle agent prompt, one send, then confirm the agent actually started.
-export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after = "", runCommand = executeSignalCommand, sleep = Bun.sleep } = {}) {
+export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after = "", runCommand = executeSignalCommand, sleep = Bun.sleep, switchPaneModel = switchModel } = {}) {
   if (typeof key !== "string" || !key.trim()) throw new Error("INVALID_TASK_KEY");
   const c = db.query("SELECT * FROM cats WHERE id=?").get(catId);
   if (!c || c.pane === "-") throw new Error(`cat ${catId} has no pane`);
@@ -521,14 +568,12 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     return queueDispatch(catId, key, prompt, { type, skill, done, title, keepModel, after }, `pane=${paneScreen.trim() ? s0.state : "unreadable"}`);
   }
   const want = keepModel ? null : await pickModel(type);
-  const modelNote = keepModel ? "MODEL_KEPT" : await switchModel(c.pane, want);
-  if (modelNote.startsWith("MODEL_SWITCH_FAILED")) return modelNote;
   const claim = db.transaction(() => {
     const existing = db.query("SELECT key,cat,status FROM tasks WHERE key=?").get(key);
     if (existing && (existing.cat !== catId || existing.status !== "waiting")) return { hold: "duplicate-key" };
     if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)) return { hold: "pane-reserved" };
     const active = db.query(`SELECT t.key FROM tasks t JOIN cats c ON c.id=t.cat
-      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
+      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','prompt-lost','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
     if (active) return { hold: "prior-task-unresolved" };
     const attempt = crypto.randomUUID();
     const model = want ? `${want.provider}/${want.model}:${want.thinking}` : "kept";
@@ -553,6 +598,11 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     db.query("DELETE FROM dispatch_reservations WHERE pane=? AND attempt=?").run(c.pane, attempt);
   }).immediate();
   try {
+    const modelNote = keepModel ? "MODEL_KEPT" : await switchPaneModel(c.pane, want);
+    if (modelNote.startsWith("MODEL_SWITCH_FAILED")) {
+      releaseUnsent("dispatch-held");
+      return modelNote;
+    }
     const latest = await paneRead();
     if (latest.exitCode !== 0 || !latest.stdout.trim() || classify(latest.stdout).state !== "idle") {
       releaseUnsent("waiting");
@@ -577,8 +627,7 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
         return `DISPATCH_OK ${catId} ${key} started (${modelNote})`;
       }
       if (state === "compaction-failed") {
-        db.query("UPDATE tasks SET status='prompt-lost' WHERE key=?").run(key);
-        log(key, { ev: "prompt-lost", attempt });
+        markTaskPromptLost(key, attempt);
         return `DISPATCH_PROMPT_LOST ${catId} ${key}: compaction failed; resend after compaction`;
       }
       if (i < 11) await sleep(5000);
@@ -663,24 +712,49 @@ export async function verify(key, check = checkSignal) {
   const t = db.query("SELECT * FROM tasks WHERE key=?").get(key);
   if (!t) throw new Error(`no task ${key}`);
   if (t.status === "verified-done") return `VERIFIED_DONE ${key}: already verified`;
-  if (t.status !== "done-claimed") return `VERIFY_UNCONFIRMED ${key}: worker completion claim missing`;
+  if (t.status !== "done-claimed" && !(t.status === "not-done" && t.result)) return `VERIFY_UNCONFIRMED ${key}: worker completion claim missing`;
   if (!t.done) return `VERIFY_NO_SIGNAL ${key}: no Done= spec; cannot be verified-done`;
   const res = [];
   for (const s of t.done.split(";").map((part) => part.trim()).filter(Boolean)) res.push({ s, ...(await check(s)) });
   const history = JSON.parse(t.history || "[]");
   const claims = history.filter((event) => event.ev === "claim-ok" || event.ev === "claim-false");
-  const hasPrSignal = t.done.split(";").some((signal) => /^pr:[\w.-]+\/[\w.-]+#\d+$/.test(signal.trim()));
-  const requiredClaims = hasPrSignal
-    ? ["cursor-accept", "pr-ready"].map((kind) => claims.findLast((event) => event.claim === kind))
-    : [];
-  const claimsOk = requiredClaims.length === 0 || requiredClaims.every((claim) => claim?.ev === "claim-ok");
+  const prSignals = res.filter((result) => parsePullRequestSignal(result.s));
+  const requiredClaims = prSignals.map((result) => {
+    const headRefOid = /^[a-f0-9]{40}$/i.test(result.headRefOid || "") ? result.headRefOid.toLowerCase() : null;
+    const cursorAccept = headRefOid && claims.findLast((event) => event.ev === "claim-ok"
+      && event.claim === "cursor-accept"
+      && /^[a-f0-9]{40}$/i.test(event.head || "")
+      && event.head.toLowerCase() === headRefOid);
+    const prReady = headRefOid && claims.findLast((event) => event.ev === "claim-ok"
+      && event.claim === "pr-ready"
+      && /^[a-f0-9]{40}$/i.test(event.head || "")
+      && event.actualHead?.toLowerCase() === headRefOid
+      && event.head.toLowerCase() === headRefOid);
+    return { headRefOid, cursorAccept, prReady };
+  });
+  const hasPrSignal = res.some((result) => parsePullRequestSignal(result.s));
+  const claimsOk = !hasPrSignal || (requiredClaims.length > 0
+    && requiredClaims.every((claim) => claim.headRefOid && claim.cursorAccept && claim.prReady));
   const ok = res.length > 0 && res.every((result) => result.ok) && claimsOk;
   const reserved = db.query("SELECT attempt FROM dispatch_reservations WHERE key=?").get(key);
   const reservedEvent = history.findLast((event) => event.ev === "reserved");
   const evidence = JSON.stringify({
     attempt: reserved?.attempt ?? reservedEvent?.attempt ?? null,
     checkedAt: now(),
-    claims: requiredClaims.map((claim) => ({ kind: claim?.claim, ok: claim?.ev === "claim-ok", detail: claim?.detail ?? "missing" })),
+    claims: requiredClaims.map(({ headRefOid, cursorAccept, prReady }) => ({
+      headRefOid,
+      cursorAccept: {
+        head: cursorAccept?.head ?? null,
+        ok: Boolean(cursorAccept),
+        detail: cursorAccept?.detail ?? "missing_or_wrong_head",
+      },
+      prReady: {
+        head: prReady?.head ?? null,
+        actualHead: prReady?.actualHead ?? null,
+        ok: Boolean(prReady),
+        detail: prReady?.detail ?? "missing_or_wrong_head",
+      },
+    })),
     signals: res.map((result) => ({ signal: result.s, ok: result.ok, detail: result.detail, headRefOid: result.headRefOid, mergeCommit: result.mergeCommit, httpCode: result.httpCode })),
   });
   db.transaction(() => {
@@ -697,7 +771,7 @@ export async function track(key, cat, done, title) {
     const c = db.query("SELECT * FROM cats WHERE id=?").get(cat);
     if (!c) throw new Error("NO_CAT");
     if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)
-      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
+      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','prompt-lost','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
       return `TRACK_HOLD ${key}: prior-task-unresolved`;
     }
     db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,?,?,?,'tracked-unconfirmed',?)").run(key, cat, title || key, done || "", now());
@@ -788,7 +862,7 @@ async function board() {
   if (repo) signals.set(`pr:${repo}#2`, "roadmap");
   for (const pr of branchPullRequests ?? []) signals.set(`pr:${repo}#${pr.number}`, "current-branch");
   const tasks = db.query(`SELECT key,done FROM tasks
-    WHERE status IN ('sent','sent-unconfirmed','working','done-claimed') AND done IS NOT NULL AND done!=''
+    WHERE status IN ('sent','sent-unconfirmed','send-failed-unconfirmed','working','done-claimed') AND done IS NOT NULL AND done!=''
     ORDER BY sent_at DESC LIMIT 20`).all();
   for (const task of tasks) {
     for (const signal of task.done.split(";").map((part) => part.trim())) {
@@ -869,6 +943,7 @@ async function watch(intervalSec = 30) {
   const last = new Map();
   const usageAlerted = new Map();
   const bugbotAlerted = new Map();
+  const reviewStallAlerted = new Set();
   // journalctl --since takes local time; keep the cursor in epoch seconds to avoid TZ drift.
   let jcursor = Math.floor(Date.now() / 1000) - 60;
   for (;;) {
@@ -885,8 +960,11 @@ async function watch(intervalSec = 30) {
           const claimTextChanged = r.claimText && r.claimText !== previous.claimText;
           if (doneChanged) {
             console.log(`FLEET_TASK_${r.done.kind} ${r.id} ${r.done.key} ${r.done.text}`);
-            db.query("UPDATE tasks SET status=?, result=? WHERE key=?").run(r.done.kind === "DONE" ? "done-claimed" : "blocked", r.done.text, r.done.key);
-            log(r.done.key, { ev: r.done.kind === "DONE" ? "done-claimed" : "blocked", text: r.done.text });
+            if (r.done.kind === "BLOCKED") markTaskBlocked(r.done.key, r.done.text);
+            else {
+              db.query("UPDATE tasks SET status='done-claimed', result=? WHERE key=?").run(r.done.text, r.done.key);
+              log(r.done.key, { ev: "done-claimed", text: r.done.text });
+            }
           }
           if (doneChanged || readyChanged || readyLineChanged || claimTextChanged) {
             const taskKey = r.done?.key ?? r.task;
@@ -894,7 +972,7 @@ async function watch(intervalSec = 30) {
             const claims = await verifyClaims(r.claimText ?? "", task);
             for (const claim of claims) {
               console.log(claimEvent(r.id, taskKey ?? "-", claim));
-              if (taskKey) log(taskKey, { ev: claim.ok ? "claim-ok" : "claim-false", claim: claim.kind, detail: claim.detail });
+              if (taskKey) log(taskKey, { ev: claim.ok ? "claim-ok" : "claim-false", claim: claim.kind, head: claim.head, actualHead: claim.actualHead, detail: claim.detail });
             }
             if (readyChanged && claims.some((claim) => claim.kind === "pr-ready" && claim.ok)) {
               console.log(`FLEET_PR_READY ${r.id} ${r.ready.repo} ${r.ready.head}`);
@@ -909,7 +987,7 @@ async function watch(intervalSec = 30) {
           const policy = questionPolicy(r.questionText || "");
           if (policy) {
             let answered = false;
-            try { answered = await answerPaneQuestion(r.pane, policy.answer); } catch {}
+            try { answered = await answerPaneQuestion(r.pane, r.questionText, policy.answer); } catch {}
             if (answered) {
               console.log(`FLEET_QUESTION_ANSWERED ${r.id} ${taskKey} policy=${policy.id}`);
               if (taskKey !== "-") log(taskKey, { ev: "question-auto-answer", policy: policy.id });
@@ -925,17 +1003,18 @@ async function watch(intervalSec = 30) {
         last.set(r.id, sig);
         if (r.task) {
           const t = db.query("SELECT status,sent_at FROM tasks WHERE key=?").get(r.task);
-          if (t?.status === "sent-unconfirmed" && r.state === "working") {
+          if (["sent-unconfirmed", "send-failed-unconfirmed"].includes(t?.status) && r.state === "working") {
             db.query("UPDATE tasks SET status='working', started_at=? WHERE key=?").run(now(), r.task);
             console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
           }
           if (t?.status === "sent" || t?.status === "sent-unconfirmed") {
-            if (r.state === "compaction-failed") { db.query("UPDATE tasks SET status='prompt-lost' WHERE key=?").run(r.task); console.log(`FLEET_PROMPT_LOST ${r.id} ${r.task}`); }
+            if (r.state === "compaction-failed") { markTaskPromptLost(r.task); console.log(`FLEET_PROMPT_LOST ${r.id} ${r.task}`); }
           }
         }
       }
       for (const event of usageLimitEvents(await usageTick(), usageAlerted)) console.log(event);
       for (const event of await bugbotLimitEvents(db, bugbotAlerted)) console.log(event);
+      for (const event of await reviewStallEvents(Date.now(), reviewStallAlerted)) console.log(event);
       for (const event of await dispatchWaitingTasks(db, rows)) console.log(event);
       const w5 = rows.find((r) => r.id === "omonyang");
       const listen = (await sh("pgrep -f 'bun slack-listen.mjs' | head -1")).trim();
