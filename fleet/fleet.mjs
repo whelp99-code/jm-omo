@@ -33,6 +33,8 @@ const REVIEW_REPLY_APP_ID = "A08SKDT6QUW";
 const REVIEW_STALL_MS = 45 * 60 * 1000;
 const USAGE_ALERT_THRESHOLDS = { anthropic: 60, "chatgpt-subscription": 80 };
 const DISPATCH_RESERVATION_TTL_MS = 2 * 60_000;
+const SLACK_THREAD_CONCURRENCY = 5;
+const SLACK_HISTORY_TIMEOUT_MS = 15_000;
 
 const CATS = [
   ["omonyang", "오모냥", "대장: 계획·배분·확인", "captain", "w5:p1", "-"],
@@ -59,6 +61,7 @@ export function classify(screen) {
   else if (/Working \(|Running eval|esc to interrupt/.test(tail)) state = "working";
   else if (/Question pending|unanswered/i.test(tail)) state = "question";
   else if (/Codex error|rate limit|usage limit|429|quota|Unable to verify/i.test(tail)) state = "provider-error";
+  else if (/→\s+\S+\s+\[[^\]]+\]/.test(tail)) state = "model-picker";
   const output = responseBlock(screen);
   const done = [...output.matchAll(/^\s*(?:[•●⏺✻]\s*)?(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b([^\n]*)$/gm)]
     .filter((m) => !/[<]|또는|<숫자/.test(m[0])).at(-1);
@@ -116,12 +119,21 @@ export async function answerPaneQuestion(pane, expectedQuestion, answer, runComm
   return enter.exitCode === 0;
 }
 
+function appendHistoryInTransaction(dbHandle, task, ev) {
+  const event = JSON.stringify({ at: now(), ...ev });
+  dbHandle.query(`UPDATE tasks SET history=CASE
+    WHEN json_array_length(COALESCE(history,'[]')) >= 40
+      THEN json_remove(json_insert(COALESCE(history,'[]'),'$[#]',json(?)),'$[0]')
+    ELSE json_insert(COALESCE(history,'[]'),'$[#]',json(?))
+    END WHERE key=?`).run(event, event, task);
+}
+
+export function appendTaskHistory(dbHandle, task, ev) {
+  return dbHandle.transaction(() => appendHistoryInTransaction(dbHandle, task, ev)).immediate();
+}
+
 function logOn(dbHandle, task, ev) {
-  const t = dbHandle.query("SELECT history FROM tasks WHERE key=?").get(task);
-  if (!t) return;
-  const h = JSON.parse(t.history || "[]");
-  h.push({ at: now(), ...ev });
-  dbHandle.query("UPDATE tasks SET history=? WHERE key=?").run(JSON.stringify(h.slice(-40)), task);
+  return appendTaskHistory(dbHandle, task, ev);
 }
 
 function log(task, ev) {
@@ -132,7 +144,7 @@ export function markTaskBlocked(key, result) {
   return db.transaction(() => {
     db.query("UPDATE tasks SET status='blocked',result=? WHERE key=?").run(result, key);
     db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
-    log(key, { ev: "blocked", text: result });
+    appendHistoryInTransaction(db, key, { ev: "blocked", text: result });
   }).immediate();
 }
 
@@ -140,49 +152,80 @@ export function markTaskPromptLost(key, attempt) {
   return db.transaction(() => {
     db.query("UPDATE tasks SET status='prompt-lost' WHERE key=?").run(key);
     db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
-    log(key, { ev: "prompt-lost", ...(attempt ? { attempt } : {}) });
+    appendHistoryInTransaction(db, key, { ev: "prompt-lost", ...(attempt ? { attempt } : {}) });
   }).immediate();
 }
 
-export function recoverInterruptedDispatches(dbHandle, paneRows, nowMs = Date.now()) {
+export function recordDispatchSendAttempt(dbHandle, pane, key, attempt) {
+  return dbHandle.transaction(() => {
+    const reservation = dbHandle.query("SELECT key,attempt FROM dispatch_reservations WHERE pane=?").get(pane);
+    const task = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(key);
+    if (reservation?.key !== key || reservation.attempt !== attempt || task?.status !== "dispatching") return false;
+    appendHistoryInTransaction(dbHandle, key, { ev: "send-attempted", attempt });
+    return true;
+  }).immediate();
+}
+
+export function recoverDispatchReservation(dbHandle, reservation, paneState, nowMs = Date.now()) {
+  return dbHandle.transaction(() => {
+    const current = dbHandle.query(`SELECT reserved_at FROM dispatch_reservations
+      WHERE pane=? AND key=? AND attempt=?`).get(reservation.pane, reservation.key, reservation.attempt);
+    if (!current || current.reserved_at !== reservation.reserved_at) return null;
+    const task = dbHandle.query("SELECT status,history FROM tasks WHERE key=?").get(reservation.key);
+    if (task?.status !== "dispatching") return null;
+    const reservedAt = Date.parse(current.reserved_at);
+    if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) return null;
+    const history = JSON.parse(task.history || "[]");
+    const sendAttempted = history.some((event) => event.ev === "send-attempted" && event.attempt === reservation.attempt);
+    if (paneState === "working" || paneState === "question" || paneState === "compacting" || paneState === "provider-error") {
+      const status = sendAttempted ? "send-failed-unconfirmed" : "sent-unconfirmed";
+      dbHandle.query("UPDATE tasks SET status=? WHERE key=? AND status='dispatching'").run(status, reservation.key);
+      appendHistoryInTransaction(dbHandle, reservation.key, { ev: status, attempt: reservation.attempt });
+      return null;
+    }
+    if (paneState === "compaction-failed") {
+      const deleted = dbHandle.query(`DELETE FROM dispatch_reservations
+        WHERE pane=? AND key=? AND attempt=? AND reserved_at=?`)
+        .run(reservation.pane, reservation.key, reservation.attempt, reservation.reserved_at).changes;
+      if (!deleted) return null;
+      dbHandle.query("UPDATE tasks SET status='prompt-lost' WHERE key=? AND status='dispatching'").run(reservation.key);
+      appendHistoryInTransaction(dbHandle, reservation.key, { ev: "prompt-lost", attempt: reservation.attempt });
+      return `FLEET_PROMPT_LOST ${reservation.key} pane=${reservation.pane} reservation_released`;
+    }
+    if (paneState !== "idle") return null;
+    if (sendAttempted) {
+      dbHandle.query("UPDATE tasks SET status='send-failed-unconfirmed' WHERE key=? AND status='dispatching'").run(reservation.key);
+      appendHistoryInTransaction(dbHandle, reservation.key, { ev: "send-failed-unconfirmed", attempt: reservation.attempt });
+      return null;
+    }
+    const deleted = dbHandle.query(`DELETE FROM dispatch_reservations
+      WHERE pane=? AND key=? AND attempt=? AND reserved_at=?`)
+      .run(reservation.pane, reservation.key, reservation.attempt, reservation.reserved_at).changes;
+    if (!deleted) return null;
+    dbHandle.query("UPDATE tasks SET status='dispatch-interrupted',result='dispatch process stopped before confirming send' WHERE key=? AND status='dispatching'").run(reservation.key);
+    appendHistoryInTransaction(dbHandle, reservation.key, { ev: "dispatch-interrupted", attempt: reservation.attempt });
+    return `FLEET_DISPATCH_INTERRUPTED ${reservation.key} pane=${reservation.pane} reservation_released`;
+  }).immediate();
+}
+
+export async function recoverInterruptedDispatches(dbHandle, paneRows, nowMs = Date.now(), runCommand = executeSignalCommand) {
   const paneStates = new Map(paneRows.map((row) => [row.id, row.state]));
   const reservations = dbHandle.query(`SELECT r.pane,r.key,r.attempt,r.reserved_at,t.cat
     FROM dispatch_reservations r JOIN tasks t ON t.key=r.key WHERE t.status='dispatching'`).all();
   const events = [];
   for (const reservation of reservations) {
     try {
-    const reservedAt = Date.parse(reservation.reserved_at);
-    if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) continue;
-    const state = paneStates.get(reservation.cat);
-    const task = dbHandle.query("SELECT history FROM tasks WHERE key=?").get(reservation.key);
-    const history = JSON.parse(task?.history || "[]");
-    const sendAttempted = history.some((event) => event.ev === "send-attempted" && event.attempt === reservation.attempt);
-    if (state === "working" || state === "question" || state === "compacting" || state === "provider-error") {
-      dbHandle.query("UPDATE tasks SET status='sent-unconfirmed' WHERE key=? AND status='dispatching'").run(reservation.key);
-      logOn(dbHandle, reservation.key, { ev: "interrupted-send-unconfirmed", attempt: reservation.attempt });
-      continue;
-    }
-    if (state === "compaction-failed") {
-      dbHandle.transaction(() => {
-        dbHandle.query("UPDATE tasks SET status='prompt-lost' WHERE key=? AND status='dispatching'").run(reservation.key);
-        dbHandle.query("DELETE FROM dispatch_reservations WHERE pane=? AND attempt=?").run(reservation.pane, reservation.attempt);
-        logOn(dbHandle, reservation.key, { ev: "prompt-lost", attempt: reservation.attempt });
-      }).immediate();
-      events.push(`FLEET_PROMPT_LOST ${reservation.key} pane=${reservation.pane} reservation_released`);
-      continue;
-    }
-    if (state !== "idle") continue;
-    if (sendAttempted) {
-      dbHandle.query("UPDATE tasks SET status='send-failed-unconfirmed' WHERE key=? AND status='dispatching'").run(reservation.key);
-      logOn(dbHandle, reservation.key, { ev: "interrupted-send-unconfirmed", attempt: reservation.attempt });
-      continue;
-    }
-    dbHandle.transaction(() => {
-      dbHandle.query("UPDATE tasks SET status='dispatch-interrupted',result='dispatch process stopped before confirming send' WHERE key=? AND status='dispatching'").run(reservation.key);
-      dbHandle.query("DELETE FROM dispatch_reservations WHERE pane=? AND attempt=?").run(reservation.pane, reservation.attempt);
-      logOn(dbHandle, reservation.key, { ev: "dispatch-interrupted", attempt: reservation.attempt });
-    }).immediate();
-    events.push(`FLEET_DISPATCH_INTERRUPTED ${reservation.key} pane=${reservation.pane} reservation_released`);
+      let state = paneStates.get(reservation.cat);
+      if (state === "model-picker") {
+        const escape = await runCommand(["herdr", "pane", "send-keys", reservation.pane, "Escape"]);
+        if (escape.exitCode !== 0) continue;
+        const screen = await runCommand(["herdr", "pane", "read", reservation.pane, "--source", "visible", "--format", "text"]);
+        if (screen.exitCode !== 0) continue;
+        state = classify(screen.stdout).state;
+        if (state !== "idle") continue;
+      }
+      const event = recoverDispatchReservation(dbHandle, reservation, state, nowMs);
+      if (event) events.push(event);
     } catch (error) {
       events.push(`FLEET_DISPATCH_RECOVERY_ERROR ${reservation.key} ${String(error?.message ?? error).slice(0, 120)}`);
     }
@@ -293,13 +336,38 @@ async function switchModel(pane, want) {
   return `MODEL_SWITCHED ${before} -> ${want.provider}/${want.model}`;
 }
 
+export async function fetchSlackThreadReplies(roots, fetchThread, signal, concurrency = SLACK_THREAD_CONCURRENCY) {
+  const replies = [];
+  for (let offset = 0; offset < roots.length; offset += concurrency) {
+    if (signal.aborted) return null;
+    const batch = await Promise.all(roots.slice(offset, offset + concurrency).map(async (root) => {
+      try { return await fetchThread(root, signal); } catch { return null; }
+    }));
+    if (batch.some((thread) => thread === null)) return null;
+    replies.push(...batch.flat());
+  }
+  return replies;
+}
+
+export function reviewRequestThreadRoots(messages) {
+  return messages.filter((message) => Number(message.reply_count) > 0 && isReviewRequest(message));
+}
+
 async function slackHistory(since) {
-  const nodeRoot = await Bun.$`npm root -g`.nothrow().quiet();
-  if (nodeRoot.exitCode !== 0) return null;
-  const credentialPath = join(nodeRoot.stdout.toString().trim(), "agent-messenger/dist/src/platforms/slackbot/credential-manager.js");
+  const deadline = AbortSignal.timeout(SLACK_HISTORY_TIMEOUT_MS);
+  const nodeRoot = await commandOutput("npm", ["root", "-g"], process.cwd(), deadline);
+  if (!nodeRoot || deadline.aborted) return null;
+  const credentialPath = join(nodeRoot, "agent-messenger/dist/src/platforms/slackbot/credential-manager.js");
   const { SlackBotCredentialManager } = await import(credentialPath);
-  const creds = await new SlackBotCredentialManager().getCredentials();
-  if (!creds?.token) return null;
+  const credentials = new SlackBotCredentialManager().getCredentials();
+  const creds = await Promise.race([
+    credentials,
+    new Promise((resolve) => {
+      if (deadline.aborted) resolve(null);
+      else deadline.addEventListener("abort", () => resolve(null), { once: true });
+    }),
+  ]);
+  if (!creds?.token || deadline.aborted) return null;
 
   const messages = [];
   let cursor = "";
@@ -308,7 +376,7 @@ async function slackHistory(since) {
     if (cursor) params.set("cursor", cursor);
     const response = await fetch(`https://slack.com/api/conversations.history?${params}`, {
       headers: { Authorization: `Bearer ${creds.token}` },
-      signal: AbortSignal.timeout(10000),
+      signal: deadline,
     });
     if (!response.ok) return null;
     const data = await response.json();
@@ -316,22 +384,26 @@ async function slackHistory(since) {
     messages.push(...(data.messages ?? []));
     cursor = data.response_metadata?.next_cursor ?? "";
   } while (cursor);
-  for (const root of messages.filter((message) => Number(message.reply_count) > 0)) {
+  const replies = await fetchSlackThreadReplies(reviewRequestThreadRoots(messages), async (root, signal) => {
+    const thread = [];
     let replyCursor = "";
     do {
       const params = new URLSearchParams({ channel: SLACK_REVIEW_CHANNEL, ts: root.ts, limit: "200", oldest: since });
       if (replyCursor) params.set("cursor", replyCursor);
       const response = await fetch(`https://slack.com/api/conversations.replies?${params}`, {
         headers: { Authorization: `Bearer ${creds.token}` },
-        signal: AbortSignal.timeout(10000),
+        signal,
       });
       if (!response.ok) return null;
       const data = await response.json();
       if (data.ok !== true) return null;
-      messages.push(...(data.messages ?? []).filter((reply) => reply.ts !== root.ts));
+      thread.push(...(data.messages ?? []).filter((reply) => reply.ts !== root.ts));
       replyCursor = data.response_metadata?.next_cursor ?? "";
     } while (replyCursor);
-  }
+    return thread;
+  }, deadline);
+  if (replies === null) return null;
+  messages.push(...replies);
   return messages;
 }
 
@@ -649,7 +721,7 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
   let existing = db.query("SELECT cat,status FROM tasks WHERE key=?").get(key);
   if (existing?.status === "dispatching") {
     const screen = await paneRead();
-    recoverInterruptedDispatches(db, [{ id: catId, state: screen.exitCode === 0 ? classify(screen.stdout).state : "unknown" }]);
+    await recoverInterruptedDispatches(db, [{ id: catId, state: screen.exitCode === 0 ? classify(screen.stdout).state : "unknown" }]);
     existing = db.query("SELECT cat,status FROM tasks WHERE key=?").get(key);
   }
   if (existing && (existing.cat !== catId || !["waiting", "dispatch-interrupted", "dispatch-error"].includes(existing.status))) return `DISPATCH_HOLD ${catId} duplicate-key; not sent`;
@@ -719,7 +791,7 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     if (!ownsReservation()) return `DISPATCH_HOLD ${catId} reservation-expired; not sent`;
     const head = `${key} [attempt=${attempt} skill:${skill}${done ? ` | Done= ${done}` : ""}]`;
     const msg = `${head}: 지시문 파일 ${prompt} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 ${key}_DONE <한 줄 요약> 또는 ${key}_BLOCKED reason=<한 줄>.`;
-    log(key, { ev: "send-attempted", attempt });
+    if (!recordDispatchSendAttempt(db, c.pane, key, attempt)) return `DISPATCH_HOLD ${catId} reservation-reclaimed; not sent`;
     sendAttempted = true;
     const text = await runCommand(["herdr", "pane", "send-text", c.pane, msg]);
     if (text.exitCode !== 0) throw new Error("SEND_TEXT_FAILED");
@@ -923,14 +995,14 @@ async function report() {
   return `*냥이 현황* (${now().slice(11, 16)}Z)\n${lines.join("\n")}\n• 대장 heartbeat: ${beat ? beat.at.slice(11, 19) + "Z" : "없음"}`;
 }
 
-async function commandOutput(command, args, cwd) {
+async function commandOutput(command, args, cwd, signal = AbortSignal.timeout(10000)) {
   try {
     const proc = Bun.spawn([command, ...args], {
       cwd,
       stdout: "pipe",
       stderr: "ignore",
       env: process.env,
-      signal: AbortSignal.timeout(10000),
+      signal,
     });
     const [text, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
     return exitCode === 0 ? text.trim() : null;
@@ -973,6 +1045,9 @@ function bugbotState(checkRuns) {
 }
 
 export function shouldSuppressGajae(seen, key, nowMs = Date.now()) {
+  for (const [seenKey, seenAt] of seen) {
+    if (nowMs - seenAt >= 30 * 60_000) seen.delete(seenKey);
+  }
   if (seen.has(key) && nowMs - seen.get(key) < 30 * 60_000) return true;
   seen.set(key, nowMs);
   return false;
@@ -1081,7 +1156,7 @@ async function watch(intervalSec = 30) {
   for (;;) {
     try {
       const rows = await refresh();
-      for (const event of recoverInterruptedDispatches(db, rows)) console.log(event);
+      for (const event of await recoverInterruptedDispatches(db, rows)) console.log(event);
       for (const r of rows) {
         try {
         const sig = JSON.stringify({ state: r.state, doneKey: r.done?.key ?? "", doneKind: r.done?.kind ?? "", doneText: r.done?.text ?? "", readyLine: r.readyLine ?? "", readyHead: r.ready?.head ?? "", claimText: r.claimText ?? "", questionText: r.questionText ?? "" });
@@ -1143,7 +1218,7 @@ async function watch(intervalSec = 30) {
             db.query("UPDATE tasks SET status='working', started_at=? WHERE key=?").run(now(), r.task);
             console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
           }
-          if (t?.status === "sent" || t?.status === "sent-unconfirmed") {
+          if (["sent", "sent-unconfirmed", "send-failed-unconfirmed", "working"].includes(t?.status)) {
             if (r.state === "compaction-failed") { markTaskPromptLost(r.task); console.log(`FLEET_PROMPT_LOST ${r.id} ${r.task}`); }
           }
         }

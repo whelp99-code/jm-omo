@@ -7,7 +7,7 @@ import { join } from "node:path";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, bugbotLimitEvents, checkSignal, claimEvent, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, recoverInterruptedDispatches, reviewRequestKeys, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, verify, verifyClaims } = await import("./fleet.mjs");
+const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -153,7 +153,7 @@ async function runRawUtf8Dispatch() {
   }
 }
 
-async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", reservation = false, waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
   const state = join(home, ".local", "state", "omonyang");
   const bin = join(home, "bin");
@@ -175,10 +175,12 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
     result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
   );
-  CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);`);
+  CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);
+  CREATE TABLE dispatch_reservations(pane TEXT PRIMARY KEY,key TEXT UNIQUE NOT NULL,attempt TEXT NOT NULL,reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
   const taskKey = catTask || (prDone ? "PR-TASK" : "");
   if (taskKey) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,'crm',?,?,?,?)").run(taskKey, taskKey, prDone, taskStatus, new Date().toISOString());
   db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture','unknown',?)").run(taskKey || null);
+  if (reservation && taskKey) db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('w6:p1',?,'fixture-attempt')").run(taskKey);
   db.close();
   writeFileSync(join(usageDir, "usage-watch.log"), usageTick ? `${usageTick}\n` : "");
   const herdrPath = join(bin, "herdr");
@@ -253,12 +255,14 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     const herdrCalls = existsSync(herdrLog) ? readFileSync(herdrLog, "utf8").trim().split("\n") : [];
     const stored = new Database(dbPath);
     const storedTaskStatus = taskKey ? stored.query("SELECT status FROM tasks WHERE key=?").get(taskKey)?.status : null;
+    const reservationLeft = taskKey ? Boolean(stored.query("SELECT key FROM dispatch_reservations WHERE key=?").get(taskKey)) : false;
     stored.close();
     return {
       output,
       stderr,
       exitCode,
       taskStatus: storedTaskStatus,
+      reservationLeft,
       ghCalls: existsSync(ghLog) ? readFileSync(ghLog, "utf8").trim().split("\n") : [],
       herdrCalls,
       herdrWrites: herdrCalls.filter((line) => /^pane send-(?:text|keys) /.test(line)),
@@ -368,6 +372,64 @@ describe("fleet dependency dispatch", () => {
 });
 
 describe("fleet dispatch reservations", () => {
+  it("does not reclaim a refreshed send attempt or send after a reclaimed reservation", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "reservation-interleave-prompt.txt");
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    const refreshedAt = new Date().toISOString();
+    writeFileSync(prompt, "reservation interleave fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('interleave-cat','Interleave','w-interleave:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('INTERLEAVE-TASK','interleave-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-interleave:p1", "INTERLEAVE-TASK", "attempt-interleave", reservedAt);
+    const snapshot = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key='INTERLEAVE-TASK'").get();
+
+    db.query("UPDATE dispatch_reservations SET reserved_at=? WHERE key=?").run(refreshedAt, "INTERLEAVE-TASK");
+    expect(recordDispatchSendAttempt(db, snapshot.pane, snapshot.key, snapshot.attempt)).toBe(true);
+    expect(recoverDispatchReservation(db, snapshot, "idle", Date.parse(reservedAt) + 10 * 60_000)).toBeNull();
+    expect(db.query("SELECT key,reserved_at FROM dispatch_reservations WHERE key='INTERLEAVE-TASK'").get())
+      .toEqual({ key: "INTERLEAVE-TASK", reserved_at: refreshedAt });
+    db.query("INSERT INTO cats(id,name,pane) VALUES('reclaim-cat','Reclaim','w-reclaim:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('RECLAIMED-TASK','reclaim-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-reclaim:p1", "RECLAIMED-TASK", "attempt-reclaimed", reservedAt);
+    const reclaimedSnapshot = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key='RECLAIMED-TASK'").get();
+    expect(recoverDispatchReservation(db, reclaimedSnapshot, "idle", Date.parse(reservedAt) + 10 * 60_000))
+      .toBe("FLEET_DISPATCH_INTERRUPTED RECLAIMED-TASK pane=w-reclaim:p1 reservation_released");
+
+    let switchStarted;
+    let releaseSwitch;
+    const started = new Promise((resolve) => { switchStarted = resolve; });
+    const switchGate = new Promise((resolve) => { releaseSwitch = resolve; });
+    const sendCalls = [];
+    const runCommand = async (argv) => {
+      sendCalls.push(argv);
+      return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+    };
+    db.query("UPDATE tasks SET status='dispatch-interrupted',history='[]' WHERE key=?").run("RECLAIMED-TASK");
+    db.close();
+
+    const dispatching = dispatch("reclaim-cat", "RECLAIMED-TASK", prompt, {
+      runCommand,
+      sleep: async () => {},
+      switchPaneModel: async () => { switchStarted(); await switchGate; return "MODEL_SWITCHED fixture"; },
+    });
+    const switchOutcome = await Promise.race([
+      started.then(() => "switch-started"),
+      dispatching.then((result) => `returned:${result}`, (error) => `threw:${error?.message ?? error}`),
+    ]);
+    expect(switchOutcome).toBe("switch-started");
+    const staleDb = unitDb();
+    staleDb.query("UPDATE dispatch_reservations SET reserved_at=? WHERE key=?")
+      .run(reservedAt, "RECLAIMED-TASK");
+    expect(await recoverInterruptedDispatches(staleDb, [{ id: "reclaim-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000))
+      .toEqual(["FLEET_DISPATCH_INTERRUPTED RECLAIMED-TASK pane=w-reclaim:p1 reservation_released"]);
+    staleDb.close();
+    releaseSwitch();
+    expect(await dispatching).toBe("DISPATCH_HOLD reclaim-cat reservation-expired; not sent");
+    expect(sendCalls.some((argv) => argv[2] === "send-text")).toBe(false);
+  });
+
   it("recovers an expired dispatch and allows its task key to be retried", async () => {
     const db = unitDb();
     const prompt = join(unitHome, "interrupted-dispatch-prompt.txt");
@@ -380,7 +442,7 @@ describe("fleet dispatch reservations", () => {
     db.close();
 
     const recovered = unitDb();
-    const events = recoverInterruptedDispatches(recovered, [{ id: "interrupted-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000);
+    const events = await recoverInterruptedDispatches(recovered, [{ id: "interrupted-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000);
     expect(events).toEqual(["FLEET_DISPATCH_INTERRUPTED INTERRUPTED-TASK pane=w-interrupted:p1 reservation_released"]);
     expect(recovered.query("SELECT status FROM tasks WHERE key='INTERRUPTED-TASK'").get().status).toBe("dispatch-interrupted");
     expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-interrupted:p1'").get()).toBeNull();
@@ -396,6 +458,31 @@ describe("fleet dispatch reservations", () => {
       }),
     });
     expect(result).toContain("DISPATCH_OK interrupted-cat INTERRUPTED-TASK");
+  });
+
+  it("escapes and confirms the prompt before reclaiming a stale model-picker reservation", async () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('picker-cat','Picker','w-picker:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('PICKER-TASK','picker-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-picker:p1", "PICKER-TASK", "picker-attempt", reservedAt);
+    db.close();
+
+    expect(classify("Select model\n→ claude-sonnet [anthropic]\n❯").state).toBe("model-picker");
+    const calls = [];
+    const recovered = unitDb();
+    const events = await recoverInterruptedDispatches(recovered, [{ id: "picker-cat", state: "model-picker" }], Date.parse(reservedAt) + 10 * 60_000, async (argv) => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+    });
+    expect(calls.map((argv) => argv.slice(1, 4))).toEqual([
+      ["pane", "send-keys", "w-picker:p1"],
+      ["pane", "read", "w-picker:p1"],
+    ]);
+    expect(events).toEqual(["FLEET_DISPATCH_INTERRUPTED PICKER-TASK pane=w-picker:p1 reservation_released"]);
+    expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-picker:p1'").get()).toBeNull();
+    recovered.close();
   });
 
   it("reserves the pane before either concurrent dispatch can switch its model", async () => {
@@ -605,6 +692,27 @@ describe("fleet completion classification", () => {
 });
 
 describe("fleet completion claim verification", () => {
+  it("preserves concurrent task history appends", async () => {
+    const db = unitDb();
+    const key = "HISTORY-CONCURRENT";
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES(?,'reservation-cat','working','[]')").run(key);
+    db.close();
+
+    const first = unitDb();
+    const second = unitDb();
+    await Promise.all([
+      Promise.resolve().then(() => appendTaskHistory(first, key, { ev: "done-claimed", text: "finished" })),
+      Promise.resolve().then(() => appendTaskHistory(second, key, { ev: "claim-ok", claim: "cursor-accept" })),
+    ]);
+    first.close();
+    second.close();
+
+    const stored = unitDb();
+    const history = JSON.parse(stored.query("SELECT history FROM tasks WHERE key=?").get(key).history);
+    expect(history.map((event) => event.ev)).toEqual(["done-claimed", "claim-ok"]);
+    stored.close();
+  });
+
   it("checks PR signals using injected argv commands and validates full object IDs", async () => {
     const calls = [];
     const head = "0123456789abcdef0123456789abcdef01234567";
@@ -930,6 +1038,18 @@ describe("fleet completion claim verification", () => {
 });
 
 describe("fleet Gajae event deduplication", () => {
+  it("evicts expired origins while retaining recent dedupe keys", () => {
+    const nowMs = 5_000_000;
+    const seen = new Map([
+      ["expired C0C6HJM0BV5:1.1", nowMs - 31 * 60_000],
+      ["recent C0C6HJM0BV5:2.2", nowMs - 20 * 60_000],
+    ]);
+    expect(shouldSuppressGajae(seen, "new C0C6HJM0BV5:3.3", nowMs)).toBe(false);
+    expect(seen.has("expired C0C6HJM0BV5:1.1")).toBe(false);
+    expect(seen.has("recent C0C6HJM0BV5:2.2")).toBe(true);
+    expect(seen.size).toBe(2);
+  });
+
   it("suppresses the same reason and origin for thirty minutes", () => {
     const seen = new Map();
     expect(shouldSuppressGajae(seen, "recovery_hold C0C6HJM0BV5:123.456", 1_000_000)).toBe(false);
@@ -1103,6 +1223,21 @@ describe("fleet watch sent-unconfirmed recheck", () => {
     }
   });
 });
+
+describe("fleet working-task compaction recovery", () => {
+  it("releases a working task reservation when compaction definitively fails", async () => {
+    const result = await runWatchCycle({
+      catTask: "WORKING-COMPACTION",
+      taskStatus: "working",
+      reservation: true,
+      paneScreen: "compaction did not complete\n❯",
+    });
+    expect(result.output).toContain("FLEET_PROMPT_LOST crm WORKING-COMPACTION");
+    expect(result.taskStatus).toBe("prompt-lost");
+    expect(result.reservationLeft).toBe(false);
+  });
+});
+
 describe("fleet usage and Bugbot alerts", () => {
   it("monitors tracked tasks in the watcher and board before completion", async () => {
     const options = {
@@ -1300,6 +1435,37 @@ describe("fleet UTF-8 dispatch and prompt isolation", () => {
 });
 
 describe("fleet review-stall request correlation", () => {
+  it("fetches thread replies only for review-request roots", () => {
+    const roots = reviewRequestThreadRoots([
+      { ts: "1.1", reply_count: 3, user: "UOTHER", text: "Cursor 검수 요청 PR #12" },
+      { ts: "2.2", reply_count: 8, user: "UOTHER", text: "Unrelated discussion" },
+      { ts: "3.3", reply_count: 0, user: "UOTHER", text: "Cursor 검수 요청 PR #13" },
+    ]);
+    expect(roots.map((root) => root.ts)).toEqual(["1.1"]);
+  });
+
+  it("bounds Slack thread fetch concurrency and respects an expired deadline", async () => {
+    const roots = Array.from({ length: 12 }, (_, i) => ({ ts: String(i) }));
+    const controller = new AbortController();
+    let active = 0;
+    let maximum = 0;
+    const replies = await fetchSlackThreadReplies(roots, async (root) => {
+      active++;
+      maximum = Math.max(maximum, active);
+      await Promise.resolve();
+      active--;
+      return [`reply-${root.ts}`];
+    }, controller.signal);
+    expect(replies).toHaveLength(12);
+    expect(maximum).toBeLessThanOrEqual(5);
+
+    const expired = new AbortController();
+    expired.abort();
+    let called = false;
+    expect(await fetchSlackThreadReplies(roots, async () => { called = true; return []; }, expired.signal)).toBeNull();
+    expect(called).toBe(false);
+  });
+
   it("fetches unanswered review requests and emits each stall once", async () => {
     const nowMs = 100_000_000;
     const requestTs = String((nowMs - 46 * 60_000) / 1000);
