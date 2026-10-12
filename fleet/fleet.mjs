@@ -12,10 +12,15 @@ db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;
 CREATE TABLE IF NOT EXISTS cats(id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT, state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT, done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT, result TEXT, evidence TEXT, history TEXT DEFAULT '[]', depends_on TEXT, dispatch_type TEXT DEFAULT 'impl', keep_model INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);
-CREATE TABLE IF NOT EXISTS dispatch_reservations(pane TEXT PRIMARY KEY, key TEXT UNIQUE NOT NULL, attempt TEXT NOT NULL);`);
+CREATE TABLE IF NOT EXISTS dispatch_reservations(pane TEXT PRIMARY KEY, key TEXT UNIQUE NOT NULL, attempt TEXT NOT NULL, reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
 const taskColumns = new Set(db.query("PRAGMA table_info(tasks)").all().map((column) => column.name));
 for (const [name, definition] of [["depends_on", "TEXT"], ["dispatch_type", "TEXT DEFAULT 'impl'"], ["keep_model", "INTEGER DEFAULT 0"]]) {
   if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
+}
+const reservationColumns = new Set(db.query("PRAGMA table_info(dispatch_reservations)").all().map((column) => column.name));
+if (!reservationColumns.has("reserved_at")) {
+  db.exec("ALTER TABLE dispatch_reservations ADD COLUMN reserved_at TEXT NOT NULL DEFAULT ''");
+  db.query("UPDATE dispatch_reservations SET reserved_at=? WHERE reserved_at=''").run(new Date().toISOString());
 }
 
 const now = () => new Date().toISOString();
@@ -27,6 +32,7 @@ const SLACK_REVIEW_CHANNEL = "C0C6HJM0BV5";
 const REVIEW_REPLY_APP_ID = "A08SKDT6QUW";
 const REVIEW_STALL_MS = 45 * 60 * 1000;
 const USAGE_ALERT_THRESHOLDS = { anthropic: 60, "chatgpt-subscription": 80 };
+const DISPATCH_RESERVATION_TTL_MS = 2 * 60_000;
 
 const CATS = [
   ["omonyang", "오모냥", "대장: 계획·배분·확인", "captain", "w5:p1", "-"],
@@ -110,12 +116,16 @@ export async function answerPaneQuestion(pane, expectedQuestion, answer, runComm
   return enter.exitCode === 0;
 }
 
-function log(task, ev) {
-  const t = db.query("SELECT history FROM tasks WHERE key=?").get(task);
+function logOn(dbHandle, task, ev) {
+  const t = dbHandle.query("SELECT history FROM tasks WHERE key=?").get(task);
   if (!t) return;
   const h = JSON.parse(t.history || "[]");
   h.push({ at: now(), ...ev });
-  db.query("UPDATE tasks SET history=? WHERE key=?").run(JSON.stringify(h.slice(-40)), task);
+  dbHandle.query("UPDATE tasks SET history=? WHERE key=?").run(JSON.stringify(h.slice(-40)), task);
+}
+
+function log(task, ev) {
+  logOn(db, task, ev);
 }
 
 export function markTaskBlocked(key, result) {
@@ -134,6 +144,52 @@ export function markTaskPromptLost(key, attempt) {
   }).immediate();
 }
 
+export function recoverInterruptedDispatches(dbHandle, paneRows, nowMs = Date.now()) {
+  const paneStates = new Map(paneRows.map((row) => [row.id, row.state]));
+  const reservations = dbHandle.query(`SELECT r.pane,r.key,r.attempt,r.reserved_at,t.cat
+    FROM dispatch_reservations r JOIN tasks t ON t.key=r.key WHERE t.status='dispatching'`).all();
+  const events = [];
+  for (const reservation of reservations) {
+    try {
+    const reservedAt = Date.parse(reservation.reserved_at);
+    if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) continue;
+    const state = paneStates.get(reservation.cat);
+    const task = dbHandle.query("SELECT history FROM tasks WHERE key=?").get(reservation.key);
+    const history = JSON.parse(task?.history || "[]");
+    const sendAttempted = history.some((event) => event.ev === "send-attempted" && event.attempt === reservation.attempt);
+    if (state === "working" || state === "question" || state === "compacting" || state === "provider-error") {
+      dbHandle.query("UPDATE tasks SET status='sent-unconfirmed' WHERE key=? AND status='dispatching'").run(reservation.key);
+      logOn(dbHandle, reservation.key, { ev: "interrupted-send-unconfirmed", attempt: reservation.attempt });
+      continue;
+    }
+    if (state === "compaction-failed") {
+      dbHandle.transaction(() => {
+        dbHandle.query("UPDATE tasks SET status='prompt-lost' WHERE key=? AND status='dispatching'").run(reservation.key);
+        dbHandle.query("DELETE FROM dispatch_reservations WHERE pane=? AND attempt=?").run(reservation.pane, reservation.attempt);
+        logOn(dbHandle, reservation.key, { ev: "prompt-lost", attempt: reservation.attempt });
+      }).immediate();
+      events.push(`FLEET_PROMPT_LOST ${reservation.key} pane=${reservation.pane} reservation_released`);
+      continue;
+    }
+    if (state !== "idle") continue;
+    if (sendAttempted) {
+      dbHandle.query("UPDATE tasks SET status='send-failed-unconfirmed' WHERE key=? AND status='dispatching'").run(reservation.key);
+      logOn(dbHandle, reservation.key, { ev: "interrupted-send-unconfirmed", attempt: reservation.attempt });
+      continue;
+    }
+    dbHandle.transaction(() => {
+      dbHandle.query("UPDATE tasks SET status='dispatch-interrupted',result='dispatch process stopped before confirming send' WHERE key=? AND status='dispatching'").run(reservation.key);
+      dbHandle.query("DELETE FROM dispatch_reservations WHERE pane=? AND attempt=?").run(reservation.pane, reservation.attempt);
+      logOn(dbHandle, reservation.key, { ev: "dispatch-interrupted", attempt: reservation.attempt });
+    }).immediate();
+    events.push(`FLEET_DISPATCH_INTERRUPTED ${reservation.key} pane=${reservation.pane} reservation_released`);
+    } catch (error) {
+      events.push(`FLEET_DISPATCH_RECOVERY_ERROR ${reservation.key} ${String(error?.message ?? error).slice(0, 120)}`);
+    }
+  }
+  return events;
+}
+
 async function init() {
   const up = db.query("INSERT INTO cats(id,name,role,kind,pane,product,state) VALUES(?,?,?,?,?,?,'unknown') ON CONFLICT(id) DO UPDATE SET name=excluded.name, role=excluded.role, kind=excluded.kind, pane=excluded.pane, product=excluded.product");
   for (const c of CATS) up.run(...c);
@@ -143,9 +199,14 @@ async function init() {
 async function refresh() {
   const out = [];
   for (const c of db.query("SELECT * FROM cats WHERE pane!='-'").all()) {
-    const s = classify(await read(c.pane));
-    db.query("UPDATE cats SET state=?, model=?, last_seen=? WHERE id=?").run(s.state, s.model, now(), c.id);
-    out.push({ ...c, ...s });
+    try {
+      const s = classify(await read(c.pane));
+      db.query("UPDATE cats SET state=?, model=?, last_seen=? WHERE id=?").run(s.state, s.model, now(), c.id);
+      out.push({ ...c, ...s });
+    } catch (error) {
+      console.log(`FLEET_REFRESH_ERROR ${c.id} ${error?.message ?? error}`);
+      out.push({ ...c, state: "unknown", model: "", done: null, ready: null, readyLine: null, claimText: "", questionText: "" });
+    }
   }
   return out;
 }
@@ -274,12 +335,13 @@ async function slackHistory(since) {
   return messages;
 }
 
-async function slackHasHead(prefix, sentAt) {
+async function slackHasHead(fullHead, sentAt) {
+  if (!/^[a-f0-9]{40}$/i.test(fullHead || "")) return false;
   const sentTime = Date.parse(sentAt);
   if (!Number.isFinite(sentTime)) return false;
   const messages = await slackHistory((sentTime / 1000).toFixed(6));
   if (!messages) return false;
-  return cursorHeadMatches(messages, prefix);
+  return cursorHeadMatches(messages, fullHead);
 }
 
 /**
@@ -288,13 +350,14 @@ async function slackHasHead(prefix, sentAt) {
  * REJECT/REVISE verdict. A bare SHA mention, or a table row that reads REJECT,
  * never counts as acceptance.
  */
-export function cursorHeadMatches(messages, prefix) {
-  const want = String(prefix).toLowerCase();
+export function cursorHeadMatches(messages, fullHead) {
+  const want = String(fullHead).toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(want)) return false;
   return messages.some((message) => message.user === CURSOR_USER_ID
     && String(message.text ?? "").split(/\n|(?<=\|)\s+(?=\|)/).some((line) => {
       if (!/\b(?:ACCEPT|APPROVE)\b/i.test(line) || /\b(?:REJECT|REVISE)\b/i.test(line)) return false;
-      return [...line.matchAll(/(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])/gi)]
-        .some((match) => match[0].toLowerCase().startsWith(want));
+      return [...line.matchAll(/(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/gi)]
+        .some((match) => match[0].toLowerCase() === want);
     }));
 }
 
@@ -346,15 +409,14 @@ export function pairReviewReplies(requests, replies) {
     const replyKeys = reviewRequestKeys(reply.text);
     const candidates = pending.filter((request) => {
       const requestTs = Number(request.ts);
-      const requestKeys = reviewRequestKeys(request.text);
       return !paired.has(String(request.ts))
         && reviewThreadRoot(request) === reviewThreadRoot(reply)
         && Number.isFinite(requestTs)
-        && requestTs < replyTs
-        && (!requestKeys.length || reviewReplyScore(requestKeys, replyKeys) > 0);
+        && requestTs < replyTs;
     });
     if (!candidates.length) continue;
-    const keyed = candidates.filter((request) => reviewRequestKeys(request.text).length > 0);
+    const keyed = candidates.filter((request) => reviewReplyScore(reviewRequestKeys(request.text), replyKeys) > 0);
+    if (!keyed.length && (candidates.length !== 1 || replyKeys.length > 0)) continue;
     const chosen = keyed.length
       ? keyed.map((request) => ({
         request,
@@ -402,6 +464,14 @@ export async function reviewStallEvents(nowMs, alerted, fetchMessages = slackHis
 function parsePullRequestSignal(signal) {
   const match = signal.match(/^pr:([\w.-]+\/[\w.-]+)#(\d+)$/);
   return match ? { repo: match[1], number: match[2] } : null;
+}
+
+function headPrefixMatchesFull(fullHead, prefix) {
+  const normalizedHead = String(fullHead ?? "").toLowerCase();
+  const normalizedPrefix = String(prefix ?? "").toLowerCase();
+  return /^[a-f0-9]{40}$/.test(normalizedHead)
+    && /^[a-f0-9]{7,40}$/.test(normalizedPrefix)
+    && normalizedHead.startsWith(normalizedPrefix);
 }
 
 async function pullRequestHead(prSignal, abortSignal = AbortSignal.timeout(10000)) {
@@ -457,28 +527,34 @@ export function isBugbotUsageLimit(checkRuns) {
 
 export async function bugbotLimitEvents(dbHandle, previous, getCheckRuns = pullRequestCheckRuns) {
   const tasks = dbHandle.query(`SELECT key,done FROM tasks
-    WHERE status IN ('sent','sent-unconfirmed','send-failed-unconfirmed','working','done-claimed') AND done IS NOT NULL AND done!=''
+    WHERE status IN ('sent','sent-unconfirmed','send-failed-unconfirmed','tracked-unconfirmed','working','done-claimed') AND done IS NOT NULL AND done!=''
     ORDER BY sent_at DESC LIMIT 20`).all();
   const targets = new Map();
   for (const task of tasks) {
-    for (const signal of task.done.split(";").map((part) => part.trim())) {
-      if (parsePullRequestSignal(signal) && !targets.has(signal)) targets.set(signal, task.key);
-    }
+    try {
+      for (const signal of task.done.split(";").map((part) => part.trim())) {
+        if (parsePullRequestSignal(signal) && !targets.has(signal)) targets.set(signal, task.key);
+      }
+    } catch {}
   }
   const events = [];
   const entries = [...targets];
   const deadline = AbortSignal.timeout(15000);
   for (let offset = 0; offset < entries.length && !deadline.aborted; offset += 5) {
     const batch = await Promise.all(entries.slice(offset, offset + 5).map(async ([signal, taskKey]) => {
-      const result = await getCheckRuns(signal, deadline);
-      if (!result) return null;
-      const alertKey = `${signal}@${result.head}`;
-      const limited = isBugbotUsageLimit(result.checkRuns);
-      const wasLimited = previous.get(alertKey) === true;
-      previous.set(alertKey, limited);
-      return limited && !wasLimited
-        ? `FLEET_BUGBOT_LIMIT ${taskKey} ${signal.slice(3)} head=${result.head.slice(0, 7)} reason=usage_limit_reached`
-        : null;
+      try {
+        const result = await getCheckRuns(signal, deadline);
+        if (!result) return null;
+        const alertKey = `${signal}@${result.head}`;
+        const limited = isBugbotUsageLimit(result.checkRuns);
+        const wasLimited = previous.get(alertKey) === true;
+        previous.set(alertKey, limited);
+        return limited && !wasLimited
+          ? `FLEET_BUGBOT_LIMIT ${taskKey} ${signal.slice(3)} head=${result.head.slice(0, 7)} reason=usage_limit_reached`
+          : null;
+      } catch {
+        return null;
+      }
     }));
     events.push(...batch.filter(Boolean));
   }
@@ -497,34 +573,50 @@ export async function verifyClaims(text, task, checks = {}) {
   const results = [];
   const checkSlackHead = checks.slackHasHead ?? slackHasHead;
   const getPrHead = checks.getPrHead ?? pullRequestHead;
+  const signal = pullRequestSignal(text, task);
+  let actualHead = null;
+  if (signal) {
+    try {
+      const head = await getPrHead(signal);
+      if (typeof head === "string" && /^[a-f0-9]{40}$/i.test(head)) actualHead = head.toLowerCase();
+    } catch {}
+  }
   const cursor = text.match(/\bCursor\s+(ACCEPT|APPROVE)\b/i);
   if (cursor) {
     const claimLine = text.slice(cursor.index).split("\n", 1)[0];
-    const head = claimLine.match(/\bhead\s*[:=]\s*([0-9a-f]{7,40})\b/i)?.[1]
+    const acceptedPrefix = claimLine.match(/\bhead\s*[:=]\s*([0-9a-f]{7,40})\b/i)?.[1]
       ?? claimLine.match(/\b(?:ACCEPT|APPROVE)\b[^\n]*?\b([0-9a-f]{7,40})\b/i)?.[1];
+    const normalizedHead = acceptedPrefix
+      ? actualHead
+        ? headPrefixMatchesFull(actualHead, acceptedPrefix) ? actualHead : null
+        : /^[a-f0-9]{40}$/i.test(acceptedPrefix) ? acceptedPrefix.toLowerCase() : null
+      : null;
     let ok = false;
-    if (head && task?.sent_at) {
-      try { ok = await checkSlackHead(head.slice(0, 7), task.sent_at); } catch {}
+    if (normalizedHead && task?.sent_at) {
+      try { ok = await checkSlackHead(normalizedHead, task.sent_at); } catch {}
     }
     results.push({
       kind: "cursor-accept",
       ok: Boolean(ok),
-      head: head?.toLowerCase() ?? null,
-      detail: !head ? "head_missing_on_accept_line" : ok ? "slack_author_head_match" : "slack_author_or_head_mismatch",
+      head: normalizedHead,
+      acceptedPrefix: acceptedPrefix?.toLowerCase() ?? null,
+      actualHead,
+      detail: !acceptedPrefix ? "head_missing_on_accept_line" : !normalizedHead ? "head_does_not_resolve_to_pr" : ok ? "slack_author_full_head_match" : "slack_author_or_head_mismatch",
     });
   }
 
   const ready = text.match(/\bPR READY\s+head=([0-9a-f]{7,40})\b/i);
   if (ready) {
-    const signal = pullRequestSignal(text, task);
-    let actual = null;
-    if (signal) {
-      try { actual = await getPrHead(signal); } catch {}
-    }
-    const actualHead = typeof actual === "string" && /^[a-f0-9]{40}$/i.test(actual) ? actual.toLowerCase() : null;
-    const head = ready[1].toLowerCase();
-    const ok = Boolean(actualHead && actualHead.startsWith(head));
-    results.push({ kind: "pr-ready", ok, head, actualHead, detail: !signal ? "pr_signal_missing" : ok ? "pr_head_match" : "pr_head_missing_or_mismatch" });
+    const acceptedPrefix = ready[1].toLowerCase();
+    const ok = Boolean(actualHead && headPrefixMatchesFull(actualHead, acceptedPrefix));
+    results.push({
+      kind: "pr-ready",
+      ok,
+      head: ok ? actualHead : null,
+      acceptedPrefix,
+      actualHead,
+      detail: !signal ? "pr_signal_missing" : ok ? "pr_head_match" : "pr_head_missing_or_mismatch",
+    });
   }
 
   if (/\b(?:tests?\s+\d+\s+(?:passed|passing)|\d+\s+tests?\s+(?:passed|passing))\b/i.test(text)
@@ -553,14 +645,19 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
   if (typeof key !== "string" || !key.trim()) throw new Error("INVALID_TASK_KEY");
   const c = db.query("SELECT * FROM cats WHERE id=?").get(catId);
   if (!c || c.pane === "-") throw new Error(`cat ${catId} has no pane`);
-  const existing = db.query("SELECT cat,status FROM tasks WHERE key=?").get(key);
-  if (existing && (existing.cat !== catId || existing.status !== "waiting")) return `DISPATCH_HOLD ${catId} duplicate-key; not sent`;
+  const paneRead = async () => runCommand(["herdr", "pane", "read", c.pane, "--source", "visible", "--format", "text"]);
+  let existing = db.query("SELECT cat,status FROM tasks WHERE key=?").get(key);
+  if (existing?.status === "dispatching") {
+    const screen = await paneRead();
+    recoverInterruptedDispatches(db, [{ id: catId, state: screen.exitCode === 0 ? classify(screen.stdout).state : "unknown" }]);
+    existing = db.query("SELECT cat,status FROM tasks WHERE key=?").get(key);
+  }
+  if (existing && (existing.cat !== catId || !["waiting", "dispatch-interrupted", "dispatch-error"].includes(existing.status))) return `DISPATCH_HOLD ${catId} duplicate-key; not sent`;
   if (!(await Bun.file(prompt).exists())) throw new Error(`prompt file missing: ${prompt}`);
   if (after) {
     const predecessor = db.query("SELECT status FROM tasks WHERE key=?").get(after);
     if (predecessor?.status !== "verified-done") return queueDispatch(catId, key, prompt, { type, skill, done, title, keepModel, after }, `predecessor=${predecessor?.status ?? "unknown"}`);
   }
-  const paneRead = async () => runCommand(["herdr", "pane", "read", c.pane, "--source", "visible", "--format", "text"]);
   const firstScreen = await paneRead();
   const paneScreen = firstScreen.exitCode === 0 ? firstScreen.stdout : "";
   const s0 = classify(paneScreen);
@@ -570,10 +667,10 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
   const want = keepModel ? null : await pickModel(type);
   const claim = db.transaction(() => {
     const existing = db.query("SELECT key,cat,status FROM tasks WHERE key=?").get(key);
-    if (existing && (existing.cat !== catId || existing.status !== "waiting")) return { hold: "duplicate-key" };
+    if (existing && (existing.cat !== catId || !["waiting", "dispatch-interrupted", "dispatch-error"].includes(existing.status))) return { hold: "duplicate-key" };
     if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)) return { hold: "pane-reserved" };
     const active = db.query(`SELECT t.key FROM tasks t JOIN cats c ON c.id=t.cat
-      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','prompt-lost','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
+      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','prompt-lost','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
     if (active) return { hold: "prior-task-unresolved" };
     const attempt = crypto.randomUUID();
     const model = want ? `${want.provider}/${want.model}:${want.thinking}` : "kept";
@@ -586,7 +683,7 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
         VALUES(?,?,?,?,?,?,?,'dispatching',?,?,?,?,?)`)
         .run(key, catId, title || key, prompt, skill, model, done, now(), after || null, type, keepModel ? 1 : 0, "[]");
     }
-    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,?,?)").run(c.pane, key, attempt);
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)").run(c.pane, key, attempt, now());
     db.query("UPDATE cats SET task=? WHERE id=?").run(key, catId);
     return { attempt, model };
   }).immediate();
@@ -594,22 +691,35 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
   const { attempt, model } = claim;
   let sendAttempted = false;
   const releaseUnsent = (status) => db.transaction(() => {
+    if (!db.query("SELECT 1 FROM dispatch_reservations WHERE pane=? AND key=? AND attempt=?").get(c.pane, key, attempt)) return false;
     db.query("UPDATE tasks SET status=? WHERE key=?").run(status, key);
     db.query("DELETE FROM dispatch_reservations WHERE pane=? AND attempt=?").run(c.pane, attempt);
+    return true;
   }).immediate();
+  const ownsReservation = () => Boolean(db.query("SELECT 1 FROM dispatch_reservations WHERE pane=? AND key=? AND attempt=?").get(c.pane, key, attempt));
+  let leaseHeartbeat;
   try {
+    leaseHeartbeat = setInterval(() => {
+      try {
+        db.query("UPDATE dispatch_reservations SET reserved_at=? WHERE pane=? AND key=? AND attempt=?")
+          .run(now(), c.pane, key, attempt);
+      } catch {}
+    }, 30_000);
+    leaseHeartbeat.unref?.();
     const modelNote = keepModel ? "MODEL_KEPT" : await switchPaneModel(c.pane, want);
     if (modelNote.startsWith("MODEL_SWITCH_FAILED")) {
-      releaseUnsent("dispatch-held");
+      if (!releaseUnsent("dispatch-held")) return `DISPATCH_HOLD ${catId} reservation-expired; not sent`;
       return modelNote;
     }
     const latest = await paneRead();
     if (latest.exitCode !== 0 || !latest.stdout.trim() || classify(latest.stdout).state !== "idle") {
-      releaseUnsent("waiting");
+      if (!releaseUnsent("waiting")) return `DISPATCH_HOLD ${catId} reservation-expired; not sent`;
       return queueDispatch(catId, key, prompt, { type, skill, done, title, keepModel, after }, `pane=${latest.stdout?.trim() ? classify(latest.stdout).state : "unreadable"}`);
     }
+    if (!ownsReservation()) return `DISPATCH_HOLD ${catId} reservation-expired; not sent`;
     const head = `${key} [attempt=${attempt} skill:${skill}${done ? ` | Done= ${done}` : ""}]`;
     const msg = `${head}: 지시문 파일 ${prompt} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 ${key}_DONE <한 줄 요약> 또는 ${key}_BLOCKED reason=<한 줄>.`;
+    log(key, { ev: "send-attempted", attempt });
     sendAttempted = true;
     const text = await runCommand(["herdr", "pane", "send-text", c.pane, msg]);
     if (text.exitCode !== 0) throw new Error("SEND_TEXT_FAILED");
@@ -640,8 +750,10 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
       log(key, { ev: "send-failed-unconfirmed", attempt });
       return `DISPATCH_UNCONFIRMED ${catId} ${key}: send failed; partial delivery not excluded`;
     }
-    releaseUnsent("dispatch-failed-before-send");
+    if (!releaseUnsent("dispatch-failed-before-send")) return `DISPATCH_HOLD ${catId} reservation-expired; not sent`;
     return `DISPATCH_FAILED ${catId} ${key}: not sent`;
+  } finally {
+    if (leaseHeartbeat) clearInterval(leaseHeartbeat);
   }
 }
 
@@ -650,20 +762,33 @@ export async function dispatchWaitingTasks(dbHandle, paneRows, dispatchTask = di
   const paneStates = new Map(paneRows.map((row) => [row.id, row.state]));
   const events = [];
   for (const task of waiting) {
-    if (task.depends_on) {
-      const predecessor = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(task.depends_on);
-      if (predecessor?.status !== "verified-done") continue;
+    try {
+      if (task.depends_on) {
+        const predecessor = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(task.depends_on);
+        if (predecessor?.status !== "verified-done") continue;
+      }
+      if (paneStates.get(task.cat) !== "idle") continue;
+      const result = await dispatchTask(task.cat, task.key, task.prompt, {
+        type: task.dispatch_type || "impl",
+        skill: task.skill || "ulw",
+        done: task.done || "",
+        title: task.title || "",
+        keepModel: Boolean(task.keep_model),
+        after: task.depends_on,
+      });
+      events.push(`${task.depends_on ? "FLEET_DEPENDENCY_DISPATCH" : "FLEET_DISPATCH_RESUMED"} ${task.key} ${result}`);
+    } catch (error) {
+      const detail = `dispatch failed: ${String(error?.message ?? error).slice(0, 200)}`;
+      try {
+        const current = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(task.key);
+        const status = current?.status === "waiting" ? "dispatch-error" : "send-failed-unconfirmed";
+        dbHandle.query("UPDATE tasks SET status=?,result=? WHERE key=?").run(status, detail, task.key);
+        try { logOn(dbHandle, task.key, { ev: status, detail }); } catch {}
+        events.push(`FLEET_DISPATCH_ERROR ${task.key} ${detail}`);
+      } catch (recordError) {
+        events.push(`FLEET_DISPATCH_ERROR ${task.key} ${detail}; record failed: ${String(recordError?.message ?? recordError).slice(0, 100)}`);
+      }
     }
-    if (paneStates.get(task.cat) !== "idle") continue;
-    const result = await dispatchTask(task.cat, task.key, task.prompt, {
-      type: task.dispatch_type || "impl",
-      skill: task.skill || "ulw",
-      done: task.done || "",
-      title: task.title || "",
-      keepModel: Boolean(task.keep_model),
-      after: task.depends_on,
-    });
-    events.push(`${task.depends_on ? "FLEET_DEPENDENCY_DISPATCH" : "FLEET_DISPATCH_RESUMED"} ${task.key} ${result}`);
   }
   return events;
 }
@@ -712,24 +837,25 @@ export async function verify(key, check = checkSignal) {
   const t = db.query("SELECT * FROM tasks WHERE key=?").get(key);
   if (!t) throw new Error(`no task ${key}`);
   if (t.status === "verified-done") return `VERIFIED_DONE ${key}: already verified`;
-  if (t.status !== "done-claimed" && !(t.status === "not-done" && t.result)) return `VERIFY_UNCONFIRMED ${key}: worker completion claim missing`;
+  const history = JSON.parse(t.history || "[]");
+  const hasCompletionClaim = history.some((event) => event.ev === "done-claimed");
+  if (t.status !== "done-claimed" && !(t.status === "not-done" && hasCompletionClaim)) return `VERIFY_UNCONFIRMED ${key}: worker completion claim missing`;
   if (!t.done) return `VERIFY_NO_SIGNAL ${key}: no Done= spec; cannot be verified-done`;
   const res = [];
   for (const s of t.done.split(";").map((part) => part.trim()).filter(Boolean)) res.push({ s, ...(await check(s)) });
-  const history = JSON.parse(t.history || "[]");
   const claims = history.filter((event) => event.ev === "claim-ok" || event.ev === "claim-false");
   const prSignals = res.filter((result) => parsePullRequestSignal(result.s));
   const requiredClaims = prSignals.map((result) => {
     const headRefOid = /^[a-f0-9]{40}$/i.test(result.headRefOid || "") ? result.headRefOid.toLowerCase() : null;
     const cursorAccept = headRefOid && claims.findLast((event) => event.ev === "claim-ok"
       && event.claim === "cursor-accept"
-      && /^[a-f0-9]{40}$/i.test(event.head || "")
-      && event.head.toLowerCase() === headRefOid);
+      && event.head?.toLowerCase() === headRefOid
+      && event.actualHead?.toLowerCase() === headRefOid);
     const prReady = headRefOid && claims.findLast((event) => event.ev === "claim-ok"
       && event.claim === "pr-ready"
-      && /^[a-f0-9]{40}$/i.test(event.head || "")
+      && event.head?.toLowerCase() === headRefOid
       && event.actualHead?.toLowerCase() === headRefOid
-      && event.head.toLowerCase() === headRefOid);
+    );
     return { headRefOid, cursorAccept, prReady };
   });
   const hasPrSignal = res.some((result) => parsePullRequestSignal(result.s));
@@ -744,12 +870,14 @@ export async function verify(key, check = checkSignal) {
     claims: requiredClaims.map(({ headRefOid, cursorAccept, prReady }) => ({
       headRefOid,
       cursorAccept: {
-        head: cursorAccept?.head ?? null,
+        headRefOid: cursorAccept ? headRefOid : null,
+        acceptedPrefix: cursorAccept?.acceptedPrefix ?? null,
         ok: Boolean(cursorAccept),
         detail: cursorAccept?.detail ?? "missing_or_wrong_head",
       },
       prReady: {
-        head: prReady?.head ?? null,
+        headRefOid: prReady ? headRefOid : null,
+        acceptedPrefix: prReady?.acceptedPrefix ?? null,
         actualHead: prReady?.actualHead ?? null,
         ok: Boolean(prReady),
         detail: prReady?.detail ?? "missing_or_wrong_head",
@@ -771,7 +899,7 @@ export async function track(key, cat, done, title) {
     const c = db.query("SELECT * FROM cats WHERE id=?").get(cat);
     if (!c) throw new Error("NO_CAT");
     if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)
-      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','prompt-lost','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
+      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','prompt-lost','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
       return `TRACK_HOLD ${key}: prior-task-unresolved`;
     }
     db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,?,?,?,'tracked-unconfirmed',?)").run(key, cat, title || key, done || "", now());
@@ -862,20 +990,24 @@ async function board() {
   if (repo) signals.set(`pr:${repo}#2`, "roadmap");
   for (const pr of branchPullRequests ?? []) signals.set(`pr:${repo}#${pr.number}`, "current-branch");
   const tasks = db.query(`SELECT key,done FROM tasks
-    WHERE status IN ('sent','sent-unconfirmed','send-failed-unconfirmed','working','done-claimed') AND done IS NOT NULL AND done!=''
+    WHERE status IN ('sent','sent-unconfirmed','send-failed-unconfirmed','tracked-unconfirmed','working','done-claimed') AND done IS NOT NULL AND done!=''
     ORDER BY sent_at DESC LIMIT 20`).all();
   for (const task of tasks) {
-    for (const signal of task.done.split(";").map((part) => part.trim())) {
-      if (parsePullRequestSignal(signal) && !signals.has(signal)) signals.set(signal, task.key);
-    }
+    try {
+      for (const signal of task.done.split(";").map((part) => part.trim())) {
+        if (parsePullRequestSignal(signal) && !signals.has(signal)) signals.set(signal, task.key);
+      }
+    } catch {}
   }
 
   const pullRequests = [];
   for (const [signal, source] of signals) {
-    const target = parsePullRequestSignal(signal);
-    const info = await pullRequestInfo(target.repo, target.number, repoRoot);
-    const checkRuns = info?.headRefOid ? await checkRunsForHead(target.repo, info.headRefOid) : null;
-    pullRequests.push({ target, source, info, checkRuns });
+    try {
+      const target = parsePullRequestSignal(signal);
+      const info = await pullRequestInfo(target.repo, target.number, repoRoot);
+      const checkRuns = info?.headRefOid ? await checkRunsForHead(target.repo, info.headRefOid) : null;
+      pullRequests.push({ target, source, info, checkRuns });
+    } catch {}
   }
   const bySignal = new Map(pullRequests.map((pr) => [`pr:${pr.target.repo}#${pr.target.number}`, pr]));
   const prior = repo ? bySignal.get(`pr:${repo}#2`) : null;
@@ -949,7 +1081,9 @@ async function watch(intervalSec = 30) {
   for (;;) {
     try {
       const rows = await refresh();
+      for (const event of recoverInterruptedDispatches(db, rows)) console.log(event);
       for (const r of rows) {
+        try {
         const sig = JSON.stringify({ state: r.state, doneKey: r.done?.key ?? "", doneKind: r.done?.kind ?? "", doneText: r.done?.text ?? "", readyLine: r.readyLine ?? "", readyHead: r.ready?.head ?? "", claimText: r.claimText ?? "", questionText: r.questionText ?? "" });
         const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
         if (previous && last.get(r.id) !== sig) {
@@ -972,7 +1106,7 @@ async function watch(intervalSec = 30) {
             const claims = await verifyClaims(r.claimText ?? "", task);
             for (const claim of claims) {
               console.log(claimEvent(r.id, taskKey ?? "-", claim));
-              if (taskKey) log(taskKey, { ev: claim.ok ? "claim-ok" : "claim-false", claim: claim.kind, head: claim.head, actualHead: claim.actualHead, detail: claim.detail });
+              if (taskKey) log(taskKey, { ev: claim.ok ? "claim-ok" : "claim-false", claim: claim.kind, head: claim.head, acceptedPrefix: claim.acceptedPrefix, actualHead: claim.actualHead, detail: claim.detail });
             }
             if (readyChanged && claims.some((claim) => claim.kind === "pr-ready" && claim.ok)) {
               console.log(`FLEET_PR_READY ${r.id} ${r.ready.repo} ${r.ready.head}`);
@@ -980,6 +1114,7 @@ async function watch(intervalSec = 30) {
           }
           if (r.id !== "omonyang" && readyLineChanged) console.log(`FLEET_READY_LINE ${r.id} ${r.readyLine}`);
         }
+        let retryQuestion = false;
         const questionChanged = r.id !== "omonyang" && r.state === "question"
           && (!previous || previous.state !== "question" || r.questionText !== previous.questionText);
         if (questionChanged) {
@@ -993,6 +1128,7 @@ async function watch(intervalSec = 30) {
               if (taskKey !== "-") log(taskKey, { ev: "question-auto-answer", policy: policy.id });
             } else {
               console.log(`FLEET_QUESTION_SEND_FAILED ${r.id} ${taskKey} policy=${policy.id}`);
+              retryQuestion = true;
             }
           } else {
             const excerpt = (r.questionText || "unreadable").replace(/[\r\n\t]+/g, " ").replaceAll('"', "'").slice(0, 180);
@@ -1000,16 +1136,19 @@ async function watch(intervalSec = 30) {
             if (taskKey !== "-") log(taskKey, { ev: "question-owner-notify", excerpt });
           }
         }
-        last.set(r.id, sig);
+        if (!retryQuestion) last.set(r.id, sig);
         if (r.task) {
           const t = db.query("SELECT status,sent_at FROM tasks WHERE key=?").get(r.task);
-          if (["sent-unconfirmed", "send-failed-unconfirmed"].includes(t?.status) && r.state === "working") {
+          if (["sent-unconfirmed", "send-failed-unconfirmed", "tracked-unconfirmed"].includes(t?.status) && r.state === "working") {
             db.query("UPDATE tasks SET status='working', started_at=? WHERE key=?").run(now(), r.task);
             console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
           }
           if (t?.status === "sent" || t?.status === "sent-unconfirmed") {
             if (r.state === "compaction-failed") { markTaskPromptLost(r.task); console.log(`FLEET_PROMPT_LOST ${r.id} ${r.task}`); }
           }
+        }
+        } catch (e) {
+          console.log(`FLEET_WATCH_CAT_ERROR ${r.id} ${e?.message ?? e}`);
         }
       }
       for (const event of usageLimitEvents(await usageTick(), usageAlerted)) console.log(event);

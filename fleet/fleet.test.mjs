@@ -7,7 +7,7 @@ import { join } from "node:path";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, bugbotLimitEvents, checkSignal, claimEvent, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, reviewRequestKeys, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, verify, verifyClaims } = await import("./fleet.mjs");
+const { answerPaneQuestion, bugbotLimitEvents, checkSignal, claimEvent, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, recoverInterruptedDispatches, reviewRequestKeys, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -153,7 +153,7 @@ async function runRawUtf8Dispatch() {
   }
 }
 
-async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", command = ["watch", "1"] } = {}) {
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
   const state = join(home, ".local", "state", "omonyang");
   const bin = join(home, "bin");
@@ -164,6 +164,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const dbPath = join(state, "fleet.sqlite");
   const herdrLog = join(home, "herdr.log");
   const ghLog = join(home, "gh.log");
+  const firstAnswerFailedPath = join(home, "first-answer-failed");
   const db = new Database(dbPath);
   db.exec(`CREATE TABLE cats(
     id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT,
@@ -185,7 +186,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const journalPath = join(bin, "journalctl");
   const ghPath = join(bin, "gh");
   const gitPath = join(bin, "git");
-  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf '%s\\n' \"$PANE_SCREEN\"; fi\n");
+  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf '%s\\n' \"$PANE_SCREEN\"; elif [ \"$1\" = pane ] && [ \"$2\" = send-text ] && [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n");
   writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(gitPath, "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then printf 'https://github.com/whelp99-code/jm-omo.git\\n'; elif [ \"$1\" = branch ] && [ \"$2\" = --show-current ]; then printf 'fixture-branch\\n'; else exit 2; fi\n");
@@ -199,19 +200,22 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     HERDR_LOG: herdrLog,
     GH_LOG: ghLog,
     PANE_SCREEN: paneScreen,
+    FAIL_FIRST_ANSWER: failFirstQuestionAnswer ? "1" : "0",
+    FIRST_ANSWER_FAILED: firstAnswerFailedPath,
     GH_PR_JSON: JSON.stringify({ number: 77, title: "Fixture review", state: "OPEN", isDraft: true, url: "https://github.com/whelp99-code/jm-omo/pull/77", headRefOid: "abcdef0123456789abcdef0123456789abcdef01", reviewDecision: "REVIEW_REQUIRED", statusCheckRollup: [] }),
     GH_PR2_JSON: JSON.stringify({ number: 2, title: "Prior fleet work", state: "OPEN", isDraft: true, url: "https://github.com/whelp99-code/jm-omo/pull/2", headRefOid: "e2963141674beffb244e237b7a6e3cc29fb08f56", reviewDecision: "REVIEW_REQUIRED", statusCheckRollup: [] }),
     GH_PR_LIST_JSON: "[]",
     GH_CHECK_RUNS_JSON: JSON.stringify({ check_runs: checkRuns }),
   };
   let watcher;
-  let timeout;
+  let heartbeatTimeout;
+  let outputTimeout;
   let proc;
   try {
     let heartbeat;
     if (command[0] === "watch") {
       heartbeat = new Promise((resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error("watch heartbeat timeout")), 5000);
+        heartbeatTimeout = setTimeout(() => reject(new Error("watch heartbeat timeout")), 5000);
         watcher = watchFs(state, (_event, filename) => {
           if (filename?.toString() === "captain-heartbeat.json") resolve();
         });
@@ -219,10 +223,29 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     }
     const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
     proc = Bun.spawn(["bun", fleetPath, ...command], { cwd: new URL("..", import.meta.url).pathname, env, stdout: "pipe", stderr: "pipe" });
-    const outputPromise = new Response(proc.stdout).text();
+    let outputPromise;
+    if (waitForOutput) {
+      const reader = proc.stdout.getReader();
+      const decoder = new TextDecoder();
+      outputPromise = (async () => {
+        let output = "";
+        while (!output.includes(waitForOutput)) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          output += decoder.decode(value, { stream: true });
+        }
+        reader.releaseLock();
+        return output;
+      })();
+      outputTimeout = setTimeout(() => proc?.kill(), 5000);
+    } else {
+      outputPromise = new Response(proc.stdout).text();
+    }
     const stderrPromise = new Response(proc.stderr).text();
     if (heartbeat) {
       await heartbeat;
+      clearTimeout(heartbeatTimeout);
+      if (waitForOutput) await outputPromise;
       proc.kill();
     }
     const [output, stderr, exitCode] = await Promise.all([outputPromise, stderrPromise, proc.exited]);
@@ -241,7 +264,8 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
       herdrWrites: herdrCalls.filter((line) => /^pane send-(?:text|keys) /.test(line)),
     };
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(heartbeatTimeout);
+    clearTimeout(outputTimeout);
     watcher?.close();
     if (proc) {
       proc.kill();
@@ -318,9 +342,62 @@ describe("fleet dependency dispatch", () => {
     expect(calls).toHaveLength(1);
     db.close();
   });
+
+  it("marks a bad queued task and continues dispatching later tasks", async () => {
+    const db = dependencyDb("verified-done");
+    db.query("DELETE FROM tasks WHERE key='CHILD'").run();
+    db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,done,status,sent_at,depends_on,dispatch_type,keep_model)
+      VALUES('BAD','crm','bad','/missing/prompt','ulw','','waiting','1',NULL,'impl',0)`).run();
+    db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,done,status,sent_at,depends_on,dispatch_type,keep_model)
+      VALUES('GOOD','crm','good','/tmp/good-prompt','ulw','','waiting','2',NULL,'impl',0)`).run();
+
+    const events = await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], async (cat, key) => {
+      if (key === "BAD") throw new Error("PROMPT_FILE_MISSING");
+      db.query("UPDATE tasks SET status='sent' WHERE key=?").run(key);
+      return `DISPATCH_OK ${cat} ${key}`;
+    });
+    expect(events).toEqual([
+      "FLEET_DISPATCH_ERROR BAD dispatch failed: PROMPT_FILE_MISSING",
+      "FLEET_DISPATCH_RESUMED GOOD DISPATCH_OK crm GOOD",
+    ]);
+    expect(db.query("SELECT status,result FROM tasks WHERE key='BAD'").get())
+      .toEqual({ status: "dispatch-error", result: "dispatch failed: PROMPT_FILE_MISSING" });
+    expect(db.query("SELECT status FROM tasks WHERE key='GOOD'").get().status).toBe("sent");
+    db.close();
+  });
 });
 
 describe("fleet dispatch reservations", () => {
+  it("recovers an expired dispatch and allows its task key to be retried", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "interrupted-dispatch-prompt.txt");
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    writeFileSync(prompt, "interrupted dispatch fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('interrupted-cat','Interrupted','w-interrupted:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('INTERRUPTED-TASK','interrupted-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-interrupted:p1", "INTERRUPTED-TASK", "interrupted-attempt", reservedAt);
+    db.close();
+
+    const recovered = unitDb();
+    const events = recoverInterruptedDispatches(recovered, [{ id: "interrupted-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000);
+    expect(events).toEqual(["FLEET_DISPATCH_INTERRUPTED INTERRUPTED-TASK pane=w-interrupted:p1 reservation_released"]);
+    expect(recovered.query("SELECT status FROM tasks WHERE key='INTERRUPTED-TASK'").get().status).toBe("dispatch-interrupted");
+    expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-interrupted:p1'").get()).toBeNull();
+    recovered.close();
+
+    let reads = 0;
+    const result = await dispatch("interrupted-cat", "INTERRUPTED-TASK", prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async (argv) => ({
+        exitCode: 0,
+        stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+      }),
+    });
+    expect(result).toContain("DISPATCH_OK interrupted-cat INTERRUPTED-TASK");
+  });
+
   it("reserves the pane before either concurrent dispatch can switch its model", async () => {
     const db = unitDb();
     const prompt = join(unitHome, "model-reservation-prompt.txt");
@@ -571,8 +648,8 @@ describe("fleet completion claim verification", () => {
     const head = "0123456789abcdef0123456789abcdef01234567";
     const history = [
       { ev: "reserved", attempt: "attempt-123" },
-      { ev: "claim-ok", claim: "cursor-accept", head, detail: "slack_author_head_match" },
-      { ev: "claim-ok", claim: "pr-ready", head, actualHead: head, detail: "pr_head_match" },
+      { ev: "claim-ok", claim: "cursor-accept", head, acceptedPrefix: head, actualHead: head, detail: "slack_author_full_head_match" },
+      { ev: "claim-ok", claim: "pr-ready", head, acceptedPrefix: head, actualHead: head, detail: "pr_head_match" },
     ];
     db.query("INSERT INTO tasks(key,cat,done,status,history) VALUES(?,?,?,'done-claimed',?)")
       .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#77", JSON.stringify(history));
@@ -591,7 +668,7 @@ describe("fleet completion claim verification", () => {
     expect(task.status).toBe("verified-done");
     expect(JSON.parse(task.evidence)).toMatchObject({
       attempt: "attempt-123",
-      claims: [{ headRefOid: head, cursorAccept: { head, ok: true }, prReady: { head, actualHead: head, ok: true } }],
+      claims: [{ headRefOid: head, cursorAccept: { headRefOid: head, acceptedPrefix: head, ok: true }, prReady: { headRefOid: head, acceptedPrefix: head, actualHead: head, ok: true } }],
     });
     stored.close();
   });
@@ -603,8 +680,8 @@ describe("fleet completion claim verification", () => {
     const headB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
       .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#79", JSON.stringify([
-        { ev: "claim-ok", claim: "cursor-accept", head: headA, detail: "slack_author_head_match" },
-        { ev: "claim-ok", claim: "pr-ready", head: headA, actualHead: headA, detail: "pr_head_match" },
+        { ev: "claim-ok", claim: "cursor-accept", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "slack_author_full_head_match" },
+        { ev: "claim-ok", claim: "pr-ready", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "pr_head_match" },
       ]));
     db.close();
 
@@ -612,6 +689,43 @@ describe("fleet completion claim verification", () => {
     expect(result).toContain("NOT_DONE VERIFY-OLD-HEAD");
     const stored = unitDb();
     expect(stored.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("not-done");
+    stored.close();
+  });
+
+  it("normalizes abbreviated accepted and PR READY heads to the full merged head", async () => {
+    const db = unitDb();
+    const key = "VERIFY-SHORT-HEAD";
+    const fullHead = "abcdef0123456789abcdef0123456789abcdef01";
+    const sentAt = "2026-10-12T00:00:00.000Z";
+    let slackHead;
+    const claims = await verifyClaims("Cursor ACCEPT head=abcdef01\nPR READY head=abcdef0123", {
+      sent_at: sentAt,
+      done: "pr:whelp99-code/jm-omo#81",
+    }, {
+      slackHasHead: async (head) => { slackHead = head; return head === fullHead; },
+      getPrHead: async () => fullHead,
+    });
+    expect(slackHead).toBe(fullHead);
+    expect(claims).toMatchObject([
+      { kind: "cursor-accept", ok: true, head: fullHead, acceptedPrefix: "abcdef01", actualHead: fullHead },
+      { kind: "pr-ready", ok: true, head: fullHead, acceptedPrefix: "abcdef0123", actualHead: fullHead },
+    ]);
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
+      .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#81", JSON.stringify([
+        ...claims.map((claim) => ({ ev: "claim-ok", claim: claim.kind, head: claim.head, acceptedPrefix: claim.acceptedPrefix, actualHead: claim.actualHead, detail: claim.detail })),
+      ]));
+    db.close();
+
+    const result = await verify(key, async () => ({ ok: true, headRefOid: fullHead, mergeCommit: "e".repeat(40) }));
+    expect(result).toContain("VERIFIED_DONE VERIFY-SHORT-HEAD");
+    const stored = unitDb();
+    const task = stored.query("SELECT status,evidence FROM tasks WHERE key=?").get(key);
+    expect(task.status).toBe("verified-done");
+    expect(JSON.parse(task.evidence).claims[0]).toMatchObject({
+      headRefOid: fullHead,
+      cursorAccept: { headRefOid: fullHead, acceptedPrefix: "abcdef01", ok: true },
+      prReady: { headRefOid: fullHead, acceptedPrefix: "abcdef0123", actualHead: fullHead, ok: true },
+    });
     stored.close();
   });
 
@@ -623,8 +737,9 @@ describe("fleet completion claim verification", () => {
     const done = "pr:whelp99-code/jm-omo#80";
     db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
       .run(key, "reservation-cat", done, JSON.stringify([
-        { ev: "claim-ok", claim: "cursor-accept", head: headA, detail: "slack_author_head_match" },
-        { ev: "claim-ok", claim: "pr-ready", head: headA, actualHead: headA, detail: "pr_head_match" },
+        { ev: "done-claimed", text: "finished" },
+        { ev: "claim-ok", claim: "cursor-accept", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "slack_author_full_head_match" },
+        { ev: "claim-ok", claim: "pr-ready", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "pr_head_match" },
       ]));
     db.close();
 
@@ -634,6 +749,27 @@ describe("fleet completion claim verification", () => {
     expect(second).toContain("VERIFIED_DONE VERIFY-RETRY");
     const stored = unitDb();
     expect(stored.query("SELECT status,done FROM tasks WHERE key=?").get(key)).toEqual({ status: "verified-done", done });
+    stored.close();
+  });
+
+  it("retries failed verification after a bare DONE claim with an empty result", async () => {
+    const db = unitDb();
+    const key = "VERIFY-EMPTY-RESULT";
+    const head = "abcdef0123456789abcdef0123456789abcdef01";
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'not-done','',?)")
+      .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#82", JSON.stringify([
+        { ev: "done-claimed", text: "" },
+        { ev: "claim-ok", claim: "cursor-accept", head, acceptedPrefix: head.slice(0, 8), actualHead: head, detail: "slack_author_full_head_match" },
+        { ev: "claim-ok", claim: "pr-ready", head, acceptedPrefix: head.slice(0, 10), actualHead: head, detail: "pr_head_match" },
+        { ev: "not-done", detail: "PR was not merged yet" },
+      ]));
+    db.close();
+
+    const result = await verify(key, async () => ({ ok: true, headRefOid: head, mergeCommit: "f".repeat(40) }));
+    expect(result).toContain("VERIFIED_DONE VERIFY-EMPTY-RESULT");
+    const stored = unitDb();
+    expect(stored.query("SELECT status,result FROM tasks WHERE key=?").get(key))
+      .toEqual({ status: "verified-done", result: "" });
     stored.close();
   });
 
@@ -653,45 +789,55 @@ describe("fleet completion claim verification", () => {
     stored.close();
   });
 
-  it("accepts only Cursor's message with the matching head prefix", () => {
+  it("accepts only Cursor's same-line full SHA", () => {
+    const head = "abcdef0123456789abcdef0123456789abcdef01";
     expect(cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "ACCEPT head=abcdef123456" },
-      { user: "UOTHER", text: "ACCEPT head=abcdef123456" },
-    ], "abcdef1")).toBe(true);
+      { user: "U0B81F5GR6V", text: `ACCEPT head=${head}` },
+      { user: "UOTHER", text: `ACCEPT head=${head}` },
+    ], head)).toBe(true);
     expect(cursorHeadMatches([
-      { user: "UOTHER", text: "ACCEPT head=abcdef123456" },
-      { user: "U0B81F5GR6V", text: "ACCEPT head=1234567" },
-    ], "abcdef1")).toBe(false);
+      { user: "UOTHER", text: `ACCEPT head=${head}` },
+      { user: "U0B81F5GR6V", text: "ACCEPT head=abcdef0" },
+    ], head)).toBe(false);
   });
 
   it("does not treat a REJECT verdict that names the head as acceptance", () => {
+    const head = "abcdef0123456789abcdef0123456789abcdef01";
     expect(cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "REJECT head=abcdef123456: claim check is wrong" },
-    ], "abcdef1")).toBe(false);
+      { user: "U0B81F5GR6V", text: `REJECT head=${head}: claim check is wrong` },
+    ], head)).toBe(false);
     expect(cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "reviewed abcdef123456, needs changes" },
-    ], "abcdef1")).toBe(false);
+      { user: "U0B81F5GR6V", text: `reviewed ${head}, needs changes` },
+    ], head)).toBe(false);
   });
 
   it("reads the verdict on the head's own table row", () => {
-    const table = "| 건 | head | 판정 | | --- | --- | --- | | Mail #57 | `14344f04` | ACCEPT | | jm-omo #2 | `e2963141` | REJECT |";
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], "e2963141")).toBe(false);
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], "14344f04")).toBe(true);
-    const lines = "jm-omo #2 e2963141 REJECT\nMail #57 14344f04 ACCEPT";
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], "e2963141")).toBe(false);
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], "14344f04")).toBe(true);
+    const rejected = `e2963141${"0".repeat(32)}`;
+    const accepted = `14344f04${"0".repeat(32)}`;
+    const table = `| 건 | head | 판정 | | --- | --- | --- | | Mail #57 | \`${accepted}\` | ACCEPT | | jm-omo #2 | \`${rejected}\` | REJECT |`;
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], rejected)).toBe(false);
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], accepted)).toBe(true);
+    const lines = `jm-omo #2 ${rejected} REJECT\nMail #57 ${accepted} ACCEPT`;
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], rejected)).toBe(false);
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], accepted)).toBe(true);
   });
 
-  it("requires the Cursor author and matching seven-character head", async () => {
-    const task = { sent_at: "2026-10-09T10:00:00.000Z" };
-    const verified = await verifyClaims("Cursor ACCEPT head=abcdef123456", task, {
-      slackHasHead: async (head, sentAt) => head === "abcdef1" && sentAt === task.sent_at,
+  it("resolves a short claim through the PR and checks Slack against the full SHA", async () => {
+    const fullHead = "abcdef0123456789abcdef0123456789abcdef01";
+    const acceptedPrefix = fullHead.slice(0, 8);
+    const task = { sent_at: "2026-10-09T10:00:00.000Z", done: "pr:whelp99-code/jm-omo#1" };
+    let checkedHead;
+    const verified = await verifyClaims(`Cursor ACCEPT head=${acceptedPrefix}`, task, {
+      slackHasHead: async (head, sentAt) => { checkedHead = head; return head === fullHead && sentAt === task.sent_at; },
+      getPrHead: async () => fullHead,
     });
-    expect(verified[0]).toMatchObject({ kind: "cursor-accept", ok: true });
-    expect(claimEvent("crm", "TASK-X", verified[0])).toBe("FLEET_CLAIM_OK crm TASK-X cursor-accept slack_author_head_match");
+    expect(checkedHead).toBe(fullHead);
+    expect(verified[0]).toMatchObject({ kind: "cursor-accept", ok: true, head: fullHead, acceptedPrefix, actualHead: fullHead });
+    expect(claimEvent("crm", "TASK-X", verified[0])).toBe("FLEET_CLAIM_OK crm TASK-X cursor-accept slack_author_full_head_match");
 
-    const rejected = await verifyClaims("Cursor APPROVE head=abcdef123456", task, {
+    const rejected = await verifyClaims(`Cursor APPROVE head=${acceptedPrefix}`, task, {
       slackHasHead: async () => false,
+      getPrHead: async () => fullHead,
     });
     expect(rejected[0]).toMatchObject({ kind: "cursor-accept", ok: false });
     expect(claimEvent("crm", "TASK-X", rejected[0])).toStartWith("FLEET_CLAIM_FALSE ");
@@ -700,10 +846,29 @@ describe("fleet completion claim verification", () => {
       sent_at: task.sent_at,
       done: "pr:whelp99-code/jm-omo#1",
     }, {
-      slackHasHead: async (head) => head === "abcdef1",
-      getPrHead: async () => "abcdef123456",
+      slackHasHead: async () => true,
+      getPrHead: async () => fullHead,
     });
     expect(separateLine.find((claim) => claim.kind === "cursor-accept").ok).toBe(false);
+  });
+
+  it("rejects a Slack ACCEPT collision on the same seven-character prefix", async () => {
+    const mergedHead = "efaf6d945ebb757ee0d349e3a65c5345cf882a8d";
+    const differentHead = "efaf6d9a1234567890abcdef1234567890abcdef";
+    const prefix = mergedHead.slice(0, 7);
+    let checkedHead;
+    const claims = await verifyClaims(`Cursor ACCEPT head=${prefix}\nPR READY head=${prefix}`, {
+      sent_at: "2026-10-09T10:00:00.000Z",
+      done: "pr:whelp99-code/jm-omo#83",
+    }, {
+      slackHasHead: async (head) => {
+        checkedHead = head;
+        return differentHead.startsWith(head);
+      },
+      getPrHead: async () => mergedHead,
+    });
+    expect(checkedHead).toBe(mergedHead);
+    expect(claims.find((claim) => claim.kind === "cursor-accept")).toMatchObject({ ok: false, actualHead: mergedHead });
   });
 
   it("compares PR READY with the actual PR head", async () => {
@@ -939,6 +1104,33 @@ describe("fleet watch sent-unconfirmed recheck", () => {
   });
 });
 describe("fleet usage and Bugbot alerts", () => {
+  it("monitors tracked tasks in the watcher and board before completion", async () => {
+    const options = {
+      catTask: "TRACKED-PR",
+      taskStatus: "tracked-unconfirmed",
+      prDone: "pr:whelp99-code/jm-omo#77",
+      paneScreen: "Working (2s)\n❯",
+      checkRuns: [{
+        name: "Cursor Bugbot",
+        status: "completed",
+        conclusion: "neutral",
+        output: {
+          title: "Bugbot couldn't run - usage limit reached",
+          summary: "Bugbot couldn't run - usage limit reached",
+          text: "",
+        },
+      }],
+    };
+    const watch = await runWatchCycle(options);
+    expect(watch.output).toContain("FLEET_TASK_STARTED crm TRACKED-PR");
+    expect(watch.taskStatus).toBe("working");
+    expect(watch.output).toContain("FLEET_BUGBOT_LIMIT TRACKED-PR");
+
+    const board = await runFleetBoard(options);
+    expect(board.output).toContain("#77 OPEN draft");
+    expect(board.output).toContain("Cursor Bugbot=USAGE_LIMIT");
+  });
+
   it("reconciles a visibly working send-failed-unconfirmed task", async () => {
     const result = await runWatchCycle({
       catTask: "SEND-FAILED",
@@ -1004,6 +1196,20 @@ describe("fleet usage and Bugbot alerts", () => {
 });
 
 describe("fleet question policy", () => {
+  it("retries an allowlisted answer after a transient send failure", async () => {
+    const result = await runFleetCommand({
+      catTask: "Q-RETRY",
+      paneScreen: "Question pending\nMay I use Jaemin's password or OTP now?\n❯",
+      failFirstQuestionAnswer: true,
+      waitForOutput: "FLEET_QUESTION_ANSWERED",
+      command: ["watch", "0"],
+    });
+    expect(result.output).toContain("FLEET_QUESTION_SEND_FAILED crm Q-RETRY");
+    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-RETRY");
+    expect(result.herdrWrites.filter((line) => line.startsWith("pane send-text"))).toHaveLength(2);
+    expect(result.herdrWrites.at(-1)).toBe("pane send-keys w6:p1 Enter");
+  });
+
   it("does not answer when the same pane now shows a different question", async () => {
     const calls = [];
     const answered = await answerPaneQuestion("w6:p1", "May I use the production account?", "Do not use it.", async (argv) => {
@@ -1130,8 +1336,8 @@ describe("fleet review-stall request correlation", () => {
     const requests = [
       { ts: "100.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 head=abcdef012345 TASK-REQ-A" },
       { ts: "200.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 head=abcdef012345 TASK-REQ-B" },
-      { ts: "300.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청" },
-      { ts: "310.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청" },
+      { ts: "360.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청" },
+      { ts: "370.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청" },
     ];
     const replies = [
       { ts: "250.000001", thread_ts: "90.000001", user: "U0B81F5GR6V", text: "PR #42 head=abcdef012345 TASK-REQ-B" },
@@ -1141,8 +1347,26 @@ describe("fleet review-stall request correlation", () => {
     ];
     expect([...pairReviewReplies(requests, replies)]).toEqual([
       ["200.000001", "250.000001"],
-      ["300.000001", "350.000001"],
+      ["100.000001", "350.000001"],
     ]);
+  });
+
+  it("pairs an identifier-free reply only when one request is eligible in its thread", () => {
+    const request = {
+      ts: "600.000001",
+      thread_ts: "590.000001",
+      user: "UOTHER",
+      text: "Cursor 검수 요청 PR #94 TASK-REQ-ONLY",
+    };
+    const reply = { ts: "700.000001", thread_ts: "590.000001", app_id: "A08SKDT6QUW", text: "확인했어" };
+    expect([...pairReviewReplies([request], [reply])]).toEqual([["600.000001", "700.000001"]]);
+
+    const ambiguous = [
+      request,
+      { ...request, ts: "650.000001", text: "Cursor 검수 요청 PR #95 TASK-REQ-OTHER" },
+    ];
+    expect([...pairReviewReplies(ambiguous, [reply])]).toEqual([]);
+    expect([...pairReviewReplies([request], [{ ...reply, text: "PR #999 TASK-UNRELATED" }])]).toEqual([]);
   });
 
   it("alerts each unanswered request at its own 45-minute deadline", () => {
