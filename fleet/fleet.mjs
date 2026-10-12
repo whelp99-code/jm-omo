@@ -156,12 +156,17 @@ export function classify(screen) {
 
 export function completionBelongsToDispatchAttempt(task, marker) {
   if (!task || ["closed", "done-claimed", "verified-done"].includes(task.status) || task.completion_claimed) return false;
-  if (!task.dispatch_attempt || marker?.attempt !== task.dispatch_attempt || !task.send_attempted) return false;
   const history = JSON.parse(task.history || "[]");
+  if (!task.dispatch_attempt) {
+    if (!["tracked-unconfirmed", "working"].includes(task.status)) return false;
+    const tracked = history.findLast((event) => event.ev === "tracked");
+    const trackAt = Date.parse(tracked?.at ?? "");
+    const sentAt = Date.parse(task.sent_at ?? "");
+    return Boolean(tracked && Number.isFinite(trackAt) && Number.isFinite(sentAt) && sentAt >= trackAt);
+  }
+  if (marker?.attempt !== task.dispatch_attempt || !task.send_attempted) return false;
   const sent = history.findLast((event) => event.ev === "send-attempted" && event.attempt === task.dispatch_attempt);
-  const sendAt = Date.parse(sent?.at ?? "");
-  const completedAt = Date.parse(task.sent_at ?? "");
-  return Boolean(sent && Number.isFinite(sendAt) && Number.isFinite(completedAt) && completedAt >= sendAt);
+  return Boolean(sent);
 }
 
 function responseBlock(screen) {
@@ -288,9 +293,9 @@ export async function markTaskClosed(key, reason, runCommand = executeSignalComm
     if (closeReservation && closeToken) releaseReservationRecovery(db, closeReservation, closeToken);
   };
   if (["dispatching", "send-failed-unconfirmed"].includes(current.status)) {
-    const pane = configuredCatPane(current.cat, current.pane);
-    if (!pane || pane === "-") return `FLEET_TASK_CLOSE_ERROR ${key} pane_unavailable`;
     closeReservation = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key=?").get(key) ?? null;
+    const pane = closeReservation?.pane ?? configuredCatPane(current.cat, current.pane);
+    if (!pane || pane === "-") return `FLEET_TASK_CLOSE_ERROR ${key} pane_unavailable`;
     if (closeReservation) {
       closeToken = crypto.randomUUID();
       const claimed = db.query(`UPDATE dispatch_reservations SET recovery_token=?,recovery_started_at=?
@@ -542,7 +547,8 @@ export async function recoverInterruptedDispatches(dbHandle, paneRows, nowMs = D
       if (initial.exitCode !== 0 || !initial.stdout.trim()) continue;
       const snapshot = classify(initial.stdout);
       let state = snapshot.state;
-      if (state === "idle" && snapshot.done?.key === reservation.key && reservation.status !== "dispatch-error") continue;
+      if (state === "idle" && snapshot.done?.key === reservation.key && snapshot.done.attempt === reservation.attempt
+        && reservation.status !== "dispatch-error") continue;
       if (state === "model-picker" || reservation.status === "dispatch-error") {
         if (reservation.status === "dispatch-error" && !["idle", "model-picker"].includes(state)) continue;
         recoveryToken = claimPickerRecoveryImmediatelyBeforeEscape(dbHandle, reservation, nowMs);
@@ -1376,7 +1382,9 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
       const screen = await paneRead();
       const state = screen.exitCode === 0 ? classify(screen.stdout).state : "unknown";
       if (state === "working") {
-        db.query("UPDATE tasks SET status='working',started_at=? WHERE key=?").run(now(), key);
+        const observedAt = now();
+        db.query("UPDATE tasks SET status='working',started_at=?,sent_at=? WHERE key=? AND dispatch_attempt=?")
+          .run(observedAt, observedAt, key, attempt);
         log(key, { ev: "started", attempt });
         return `DISPATCH_OK ${catId} ${key} started (${modelNote})`;
       }
@@ -1396,7 +1404,9 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
           const screen = await paneRead();
           const state = screen.exitCode === 0 && screen.stdout.trim() ? classify(screen.stdout).state : "unknown";
           if (state === "working") {
-            db.query("UPDATE tasks SET status='working',started_at=? WHERE key=?").run(now(), key);
+            const observedAt = now();
+            db.query("UPDATE tasks SET status='working',started_at=?,sent_at=? WHERE key=? AND dispatch_attempt=?")
+              .run(observedAt, observedAt, key, attempt);
             log(key, { ev: "started-after-enter-error", attempt });
             return `DISPATCH_OK ${catId} ${key} started after Enter error`;
           }
@@ -1605,6 +1615,8 @@ export async function track(key, cat, done, title) {
       return `TRACK_HOLD ${key}: prior-task-unresolved`;
     }
     db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,?,?,?,'tracked-unconfirmed',?)").run(key, cat, title || key, done || "", now());
+    appendHistoryInTransaction(db, key, { ev: "tracked" });
+    db.query("UPDATE tasks SET sent_at=? WHERE key=?").run(now(), key);
     db.query("UPDATE cats SET task=? WHERE id=?").run(key, cat);
     return `TRACKED_UNCONFIRMED ${key} on ${cat}`;
   }).immediate();
@@ -1784,6 +1796,25 @@ async function board() {
   ].join("\n");
 }
 
+function markTaskObservedWorking(dbHandle, key) {
+  const task = dbHandle.query("SELECT status,started_at,sent_at,history,dispatch_attempt,send_attempted FROM tasks WHERE key=?").get(key);
+  if (!task || !["dispatching", "sent-unconfirmed", "send-failed-unconfirmed", "tracked-unconfirmed", "working"].includes(task.status)) return false;
+  const sent = task.dispatch_attempt && task.send_attempted
+    ? JSON.parse(task.history || "[]").findLast((event) => event.ev === "send-attempted" && event.attempt === task.dispatch_attempt)
+    : null;
+  const sendAt = Date.parse(sent?.at ?? "");
+  const sentAt = Date.parse(task.sent_at ?? "");
+  const refreshSentAt = Boolean(task.dispatch_attempt && task.send_attempted
+    && (!task.started_at || (Number.isFinite(sendAt) && (!Number.isFinite(sentAt) || sentAt < sendAt))));
+  const newlyWorking = task.status !== "working" || !task.started_at;
+  if (!newlyWorking && !refreshSentAt) return false;
+  const observedAt = now();
+  dbHandle.query(`UPDATE tasks SET status='working',started_at=COALESCE(started_at,?),
+    sent_at=CASE WHEN ? THEN ? ELSE sent_at END WHERE key=?`)
+    .run(observedAt, refreshSentAt ? 1 : 0, observedAt, key);
+  return newlyWorking;
+}
+
 // Watch: emits only transitions. Gajae: surface recovery_hold / speech suppressed with reason.
 async function watch(intervalSec = 30) {
   const last = new Map();
@@ -1801,6 +1832,7 @@ async function watch(intervalSec = 30) {
         const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
         if (!previous || last.get(r.id) !== sig) {
           if (previous && r.state !== previous.state && r.id !== "omonyang") console.log(`FLEET_STATE ${r.id} ${previous.state} -> ${r.state}`);
+          if (r.task && r.state === "working" && markTaskObservedWorking(db, r.task)) console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
           const doneTask = r.done ? db.query("SELECT cat,status,sent_at,history,dispatch_attempt,send_attempted,completion_claimed FROM tasks WHERE key=?").get(r.done.key) : null;
           const doneChanged = r.id !== "omonyang" && r.done
             && (!previous || r.done.key !== previous.doneKey || r.done.kind !== previous.doneKind || r.done.attempt !== previous.doneAttempt)
@@ -1863,10 +1895,6 @@ async function watch(intervalSec = 30) {
         if (!retryQuestion) last.set(r.id, sig);
         if (r.task) {
           const t = db.query("SELECT status,sent_at FROM tasks WHERE key=?").get(r.task);
-          if (["sent-unconfirmed", "send-failed-unconfirmed", "tracked-unconfirmed"].includes(t?.status) && r.state === "working") {
-            db.query("UPDATE tasks SET status='working', started_at=? WHERE key=?").run(now(), r.task);
-            console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
-          }
           if (["sent", "sent-unconfirmed", "send-failed-unconfirmed", "working"].includes(t?.status)) {
             if (r.state === "compaction-failed") { markTaskPromptLost(r.task); console.log(`FLEET_PROMPT_LOST ${r.id} ${r.task}`); }
           }

@@ -7,7 +7,7 @@ import { join } from "node:path";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
+const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -182,12 +182,13 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const taskKey = catTask || (prDone ? "PR-TASK" : "");
   if (taskKey) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at,history) VALUES(?,'crm',?,?,?,?,?)")
     .run(taskKey, taskKey, prDone, taskStatus, new Date().toISOString(), JSON.stringify(taskHistory));
+  if (taskKey && taskSentAt) db.query("UPDATE tasks SET sent_at=? WHERE key=?").run(taskSentAt, taskKey);
   if (taskKey && dispatchAttempt) db.query("UPDATE tasks SET dispatch_attempt=?,send_attempted=1,sent_at=? WHERE key=?")
     .run(dispatchAttempt, taskSentAt || new Date(Date.now() + 1000).toISOString(), taskKey);
   db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture',?,?)").run(catState, taskKey || null);
   if (reservation && taskKey) {
-    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES('w6:p1',?,'fixture-attempt',?)")
-      .run(taskKey, new Date(Date.now() - reservationAgeMs).toISOString());
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES('w6:p1',?,?,?)")
+      .run(taskKey, dispatchAttempt || "fixture-attempt", new Date(Date.now() - reservationAgeMs).toISOString());
   }
   db.close();
   writeFileSync(join(usageDir, "usage-watch.log"), usageTick ? `${usageTick}\n` : "");
@@ -265,10 +266,9 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     proc = undefined;
     const herdrCalls = existsSync(herdrLog) ? readFileSync(herdrLog, "utf8").trim().split("\n") : [];
     const stored = new Database(dbPath);
-    const storedTaskStatus = taskKey ? stored.query("SELECT status FROM tasks WHERE key=?").get(taskKey)?.status : null;
-    const storedTaskHistory = taskKey
-      ? JSON.parse(stored.query("SELECT history FROM tasks WHERE key=?").get(taskKey)?.history || "[]")
-      : [];
+    const storedTask = taskKey ? stored.query("SELECT status,sent_at,history FROM tasks WHERE key=?").get(taskKey) : null;
+    const storedTaskStatus = storedTask?.status ?? null;
+    const storedTaskHistory = JSON.parse(storedTask?.history || "[]");
     const storedCatPane = stored.query("SELECT pane FROM cats WHERE id='crm'").get()?.pane ?? null;
     const reservationLeft = taskKey ? Boolean(stored.query("SELECT key FROM dispatch_reservations WHERE key=?").get(taskKey)) : false;
     stored.close();
@@ -277,6 +277,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
       stderr,
       exitCode,
       taskStatus: storedTaskStatus,
+      taskSentAt: storedTask?.sent_at ?? null,
       taskHistory: storedTaskHistory,
       catPane: storedCatPane,
       reservationLeft,
@@ -737,6 +738,48 @@ describe("fleet dispatch reservations", () => {
     const stored = unitDb();
     expect(stored.query("SELECT status FROM tasks WHERE key='FAILED-ENTER'").get().status).toBe("send-failed-unconfirmed");
     expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-failed-enter:p1'").get()).toBeNull();
+    stored.close();
+  });
+
+  it("refreshes the current attempt send time when Enter fails but the pane starts", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "started-after-enter-error-prompt.txt");
+    const pane = "w-started-after-enter-error:p1";
+    const key = "TASK-STARTED-AFTER-ENTER-ERROR";
+    writeFileSync(prompt, "started after Enter failure fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('started-after-enter-error-cat','Started After Enter Error',?)").run(pane);
+    db.close();
+
+    let started = false;
+    let attempt = "";
+    const runCommand = async (argv) => {
+      if (argv[2] === "read") {
+        return {
+          exitCode: 0,
+          stdout: started
+            ? `Working (1s)\n⏺ Work completed\n${key}_DONE attempt=${attempt} finished\n\n❯`
+            : "Idle\n❯",
+        };
+      }
+      if (argv[2] === "send-text") attempt = argv[4].match(/\[attempt=([a-f0-9-]{36})\b/)?.[1] ?? "";
+      if (argv[2] === "send-keys" && argv[4] === "Enter") {
+        started = true;
+        return { exitCode: 1, stdout: "" };
+      }
+      return { exitCode: 0, stdout: "" };
+    };
+    expect(await dispatch("started-after-enter-error-cat", key, prompt, {
+      keepModel: true,
+      runCommand,
+      sleep: async () => {},
+    })).toContain(`DISPATCH_OK started-after-enter-error-cat ${key} started after Enter error`);
+
+    const stored = unitDb();
+    const task = stored.query("SELECT * FROM tasks WHERE key=?").get(key);
+    const send = JSON.parse(task.history).findLast((event) => event.ev === "send-attempted");
+    expect(task.dispatch_attempt).toBe(attempt);
+    expect(Date.parse(task.sent_at)).toBeGreaterThanOrEqual(Date.parse(send.at));
+    expect(completionBelongsToDispatchAttempt(task, classify(`Working (1s)\n⏺ Work completed\n${key}_DONE attempt=${attempt} finished\n\n❯`).done)).toBe(true);
     stored.close();
   });
 
@@ -1377,6 +1420,31 @@ describe("fleet dispatch reservations", () => {
     });
   }
 
+  it("clears the reservation pane rather than the current configured pane on close", async () => {
+    const db = unitDb();
+    const reservationPane = "w5:p1";
+    db.query(`INSERT INTO cats(id,name,pane,task) VALUES('omonyang','Captain','w3:p2','CLOSE-OLD-PANE')
+      ON CONFLICT(id) DO UPDATE SET pane=excluded.pane,task=excluded.task`).run();
+    db.query("INSERT INTO tasks(key,cat,status) VALUES('CLOSE-OLD-PANE','omonyang','dispatching')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,'CLOSE-OLD-PANE','old-pane-attempt')").run(reservationPane);
+    db.close();
+
+    let input = "/thinking xhigh";
+    const calls = [];
+    const runCommand = async (argv) => {
+      calls.push(argv);
+      if (argv[2] === "read") return { exitCode: 0, stdout: `Idle\n❯ ${input}` };
+      if (argv[2] === "send-keys" && argv[4] === "ctrl+u") input = "";
+      return { exitCode: 0, stdout: "" };
+    };
+    expect(await markTaskClosed("CLOSE-OLD-PANE", "owner cancelled pending task", runCommand))
+      .toBe("FLEET_TASK_CLOSED CLOSE-OLD-PANE reason=owner cancelled pending task");
+    expect(calls.every((argv) => argv[3] === reservationPane)).toBe(true);
+    const stored = unitDb();
+    expect(stored.query("SELECT key FROM dispatch_reservations WHERE key='CLOSE-OLD-PANE'").get()).toBeNull();
+    stored.close();
+  });
+
   it("keeps a pending close and reservation when empty input cannot be verified", async () => {
     const db = unitDb();
     const pane = "w-close-dirty:p1";
@@ -1429,9 +1497,12 @@ describe("fleet dispatch reservations", () => {
     const db = unitDb();
     db.query("INSERT INTO cats(id,name,pane) VALUES('closed-track-cat','Closed Track','w-closed-track:p1')").run();
     db.query("INSERT INTO tasks(key,cat,status,result) VALUES('CLOSED-TRACK-OLD','closed-track-cat','closed','owner closed it')").run();
-    expect(await track("AFTER-CLOSED-TRACK", "closed-track-cat", "cmd:true", "new work"))
-      .toBe("TRACKED_UNCONFIRMED AFTER-CLOSED-TRACK on closed-track-cat");
-    expect(db.query("SELECT status FROM tasks WHERE key='AFTER-CLOSED-TRACK'").get().status).toBe("tracked-unconfirmed");
+    expect(await track("TASK-AFTER-CLOSED-TRACK", "closed-track-cat", "cmd:true", "new work"))
+      .toBe("TRACKED_UNCONFIRMED TASK-AFTER-CLOSED-TRACK on closed-track-cat");
+    const tracked = db.query("SELECT * FROM tasks WHERE key='TASK-AFTER-CLOSED-TRACK'").get();
+    expect(tracked.status).toBe("tracked-unconfirmed");
+    expect(completionBelongsToDispatchAttempt(tracked, classify("⏺ Tracked work complete\nTASK-AFTER-CLOSED-TRACK_DONE finished\n\n❯").done)).toBe(true);
+    expect(JSON.parse(tracked.history).some((event) => event.ev === "tracked")).toBe(true);
     db.close();
   });
 
@@ -2479,6 +2550,26 @@ describe("fleet usage and Bugbot alerts", () => {
     expect(result.reservationLeft).toBe(true);
   });
 
+  it("recovers an idle reservation when the same-key DONE belongs to an older attempt", async () => {
+    const currentAttempt = "70000000-0000-4000-8000-000000000007";
+    const staleAttempt = "80000000-0000-4000-8000-000000000008";
+    const result = await runWatchCycle({
+      catTask: "TASK-STALE-DONE-RECOVERY",
+      taskStatus: "dispatching",
+      dispatchAttempt: currentAttempt,
+      taskHistory: [{ ev: "send-attempted", attempt: currentAttempt, at: "2026-10-12T00:00:00.000Z" }],
+      taskSentAt: "2026-10-12T00:00:01.000Z",
+      reservation: true,
+      reservationAgeMs: 10 * 60_000,
+      paneScreen: `⏺ Old response\nTASK-STALE-DONE-RECOVERY_DONE attempt=${staleAttempt} old result\n\n❯`,
+    });
+    expect(result.output).toContain("FLEET_SEND_FAILED_UNCONFIRMED TASK-STALE-DONE-RECOVERY");
+    expect(result.output).not.toContain("FLEET_TASK_DONE crm TASK-STALE-DONE-RECOVERY");
+    expect(result.taskStatus).toBe("send-failed-unconfirmed");
+    expect(result.reservationLeft).toBe(false);
+    expect(result.herdrWrites).toContain("pane send-keys w6:p1 ctrl+u");
+  });
+
   it("ignores a DONE marker from an earlier dispatch attempt after restart", async () => {
     const result = await runWatchCycle({
       catTask: "STALE-ATTEMPT-DONE",
@@ -2506,18 +2597,34 @@ describe("fleet usage and Bugbot alerts", () => {
     expect(result.taskStatus).toBe("working");
   });
 
-  it("ignores a matching attempt marker observed before that attempt's send time", async () => {
+  for (const kind of ["DONE", "BLOCKED"]) {
+    it(`accepts a ${kind} marker for a tracked task by key and track time`, async () => {
+      const key = `TASK-TRACKED-${kind}`;
+      const result = await runWatchCycle({
+        catTask: key,
+        taskStatus: "tracked-unconfirmed",
+        taskHistory: [{ ev: "tracked", at: "2026-10-12T00:00:00.000Z" }],
+        taskSentAt: "2026-10-12T00:00:01.000Z",
+        paneScreen: `Working (1s)\n⏺ Tracked response\n${key}_${kind} tracked result\n\n❯`,
+      });
+      expect(result.output).toContain(`FLEET_TASK_${kind} crm ${key} tracked result`);
+      expect(result.taskStatus).toBe(kind === "DONE" ? "done-claimed" : "blocked");
+    });
+  }
+
+  it("accepts a matching attempt after Enter fails when the pane is observed working", async () => {
     const attempt = "60000000-0000-4000-8000-000000000006";
     const result = await runWatchCycle({
-      catTask: "EARLY-DONE-MARKER",
-      taskStatus: "working",
+      catTask: "TASK-EARLY-DONE-MARKER",
+      taskStatus: "send-failed-unconfirmed",
       dispatchAttempt: attempt,
       taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-12T00:00:01.000Z" }],
       taskSentAt: "2026-10-12T00:00:00.000Z",
-      paneScreen: `⏺ Prior response\nEARLY-DONE-MARKER_DONE attempt=${attempt} finished\n\n❯`,
+      paneScreen: `Working (1s)\n⏺ Prior response\nTASK-EARLY-DONE-MARKER_DONE attempt=${attempt} finished\n\n❯`,
     });
-    expect(result.output).not.toContain("FLEET_TASK_DONE crm EARLY-DONE-MARKER");
-    expect(result.taskStatus).toBe("working");
+    expect(result.output).toContain("FLEET_TASK_DONE crm TASK-EARLY-DONE-MARKER finished");
+    expect(result.taskStatus).toBe("done-claimed");
+    expect(Date.parse(result.taskSentAt)).toBeGreaterThan(Date.parse("2026-10-12T00:00:01.000Z"));
   });
 
   it("keeps a closed task terminal when its prior DONE marker remains visible after restart", async () => {
