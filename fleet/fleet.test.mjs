@@ -1,13 +1,13 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch as watchFs, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { claimEvent, classify, cursorHeadMatches, dispatchQueuedDependencies, verifyClaims } = await import("./fleet.mjs");
+const { claimEvent, classify, cursorHeadMatches, dispatchWaitingTasks, isReviewRequest, pairReviewReplies, reviewRequestKeys, reviewStallDrafts, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -27,6 +27,228 @@ function dependencyDb(parentStatus) {
   return db;
 }
 
+async function runBlockedDispatch(paneScreen) {
+  const home = mkdtempSync(join(tmpdir(), `jm-omo-fleet-queue-${paneScreen.toLowerCase().replaceAll(" ", "-")}-`));
+  try {
+    const state = join(home, ".local", "state", "omonyang");
+    const bin = join(home, "bin");
+    mkdirSync(state, { recursive: true });
+    mkdirSync(bin);
+    const dbPath = join(state, "fleet.sqlite");
+    const prompt = join(home, "prompt.txt");
+    const herdrLog = join(home, "herdr.log");
+    const herdrPath = join(bin, "herdr");
+    const db = new Database(dbPath);
+    db.exec(`CREATE TABLE cats(
+      id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT,
+      state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT
+    );
+    CREATE TABLE tasks(
+      key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+      done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+    );`);
+    db.query("INSERT INTO cats(id,name,pane) VALUES('crm','CRM','w6:p1')").run();
+    db.close();
+    writeFileSync(prompt, "synthetic blocked-pane prompt\n");
+    writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf '%s\\n' \"$PANE_SCREEN\"; fi\n");
+    chmodSync(herdrPath, 0o755);
+    const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+    const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, HERDR_LOG: herdrLog, PANE_SCREEN: paneScreen };
+    const proc = Bun.spawn(["bun", fleetPath, "dispatch", "crm", "CHILD", prompt, "--keep-model"], {
+      cwd: new URL("..", import.meta.url).pathname,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    const stderr = await new Response(proc.stderr).text();
+    const stored = new Database(dbPath);
+    const row = stored.query("SELECT status,depends_on,prompt,dispatch_type,keep_model FROM tasks WHERE key='CHILD'").get();
+    stored.close();
+    const herdrCalls = readFileSync(herdrLog, "utf8").trim().split("\n");
+    return { home, stdout, stderr, exitCode, row, herdrCalls };
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+async function runRawUtf8Dispatch() {
+  const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-utf8-"));
+  let proc;
+  try {
+    const state = join(home, ".local", "state", "omonyang");
+    const bin = join(home, "bin");
+    mkdirSync(state, { recursive: true });
+    mkdirSync(bin);
+    const dbPath = join(state, "fleet.sqlite");
+    const prompt = join(home, "prompt.txt");
+    const herdrLog = join(home, "herdr.log");
+    const sentMark = join(home, "sent-mark");
+    const sendBytesPath = join(home, "send-text.bin");
+    const db = new Database(dbPath);
+    db.exec(`CREATE TABLE cats(
+      id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT,
+      state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT
+    );
+    CREATE TABLE tasks(
+      key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+      done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+    );`);
+    db.query("INSERT INTO cats(id,name,pane) VALUES('crm','CRM','w6:p1')").run();
+    db.close();
+    writeFileSync(prompt, "작업 지시문 UTF-8 fixture\n");
+    const herdrPath = join(bin, "herdr");
+    writeFileSync(herdrPath, [
+      "#!/bin/sh",
+      "printf '%s\\n' \"$*\" >> \"$HERDR_LOG\"",
+      "if [ \"$1\" = pane ] && [ \"$2\" = read ]; then",
+      "  if [ -f \"$SENT_MARK\" ]; then printf 'Working (1s)\\n❯'; else printf 'Idle\\n❯'; fi",
+      "elif [ \"$1\" = pane ] && [ \"$2\" = send-text ]; then",
+      "  printf '%s\\000' \"$4\" >> \"$HERDR_SEND_BYTES\"",
+      "  : > \"$SENT_MARK\"",
+      "fi",
+      "",
+    ].join("\n"));
+    chmodSync(herdrPath, 0o755);
+    const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+    const env = {
+      ...process.env,
+      HOME: home,
+      PATH: `${bin}:${process.env.PATH}`,
+      HERDR_LOG: herdrLog,
+      HERDR_SEND_BYTES: sendBytesPath,
+      SENT_MARK: sentMark,
+    };
+    proc = Bun.spawn(["bun", fleetPath, "dispatch", "crm", "UTF8-QA", prompt, "--keep-model"], {
+      cwd: new URL("..", import.meta.url).pathname,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    proc = undefined;
+    return {
+      prompt,
+      stdout,
+      stderr,
+      exitCode,
+      sendBytes: existsSync(sendBytesPath) ? readFileSync(sendBytesPath) : null,
+    };
+  } finally {
+    if (proc) {
+      proc.kill();
+      await proc.exited;
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", command = ["watch", "1"] } = {}) {
+  const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
+  const state = join(home, ".local", "state", "omonyang");
+  const bin = join(home, "bin");
+  const usageDir = join(home, ".omo", "omonyang");
+  mkdirSync(state, { recursive: true });
+  mkdirSync(bin);
+  mkdirSync(usageDir, { recursive: true });
+  const dbPath = join(state, "fleet.sqlite");
+  const herdrLog = join(home, "herdr.log");
+  const ghLog = join(home, "gh.log");
+  const db = new Database(dbPath);
+  db.exec(`CREATE TABLE cats(
+    id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT,
+    state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT
+  );
+  CREATE TABLE tasks(
+    key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+    done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+    result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+  );
+  CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);`);
+  const taskKey = catTask || (prDone ? "PR-TASK" : "");
+  if (taskKey) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,'crm',?,?,'working',?)").run(taskKey, taskKey, prDone, new Date().toISOString());
+  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture','unknown',?)").run(taskKey || null);
+  db.close();
+  writeFileSync(join(usageDir, "usage-watch.log"), usageTick ? `${usageTick}\n` : "");
+  const herdrPath = join(bin, "herdr");
+  const pgrepPath = join(bin, "pgrep");
+  const journalPath = join(bin, "journalctl");
+  const ghPath = join(bin, "gh");
+  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf '%s\\n' \"$PANE_SCREEN\"; fi\n");
+  writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
+  writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
+  writeFileSync(ghPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_LOG\"\ncase \"$1:$2:$3\" in\n  pr:view:2) printf '%s\\n' \"$GH_PR2_JSON\" ;;\n  pr:view:*) printf '%s\\n' \"$GH_PR_JSON\" ;;\n  pr:list:*) printf '%s\\n' \"$GH_PR_LIST_JSON\" ;;\n  api:*) printf '%s\\n' \"$GH_CHECK_RUNS_JSON\" ;;\n  *) exit 2 ;;\nesac\n");
+  for (const path of [herdrPath, pgrepPath, journalPath, ghPath]) chmodSync(path, 0o755);
+
+  const env = {
+    ...process.env,
+    HOME: home,
+    PATH: `${bin}:${process.env.PATH}`,
+    HERDR_LOG: herdrLog,
+    GH_LOG: ghLog,
+    PANE_SCREEN: paneScreen,
+    GH_PR_JSON: JSON.stringify({ number: 77, title: "Fixture review", state: "OPEN", isDraft: true, url: "https://github.com/whelp99-code/jm-omo/pull/77", headRefOid: "abcdef0123456789abcdef0123456789abcdef01", reviewDecision: "REVIEW_REQUIRED", statusCheckRollup: [] }),
+    GH_PR2_JSON: JSON.stringify({ number: 2, title: "Prior fleet work", state: "OPEN", isDraft: true, url: "https://github.com/whelp99-code/jm-omo/pull/2", headRefOid: "e2963141674beffb244e237b7a6e3cc29fb08f56", reviewDecision: "REVIEW_REQUIRED", statusCheckRollup: [] }),
+    GH_PR_LIST_JSON: "[]",
+    GH_CHECK_RUNS_JSON: JSON.stringify({ check_runs: checkRuns }),
+  };
+  let watcher;
+  let timeout;
+  let proc;
+  try {
+    let heartbeat;
+    if (command[0] === "watch") {
+      heartbeat = new Promise((resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("watch heartbeat timeout")), 5000);
+        watcher = watchFs(state, (_event, filename) => {
+          if (filename?.toString() === "captain-heartbeat.json") resolve();
+        });
+      });
+    }
+    const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+    proc = Bun.spawn(["bun", fleetPath, ...command], { cwd: new URL("..", import.meta.url).pathname, env, stdout: "pipe", stderr: "pipe" });
+    const outputPromise = new Response(proc.stdout).text();
+    const stderrPromise = new Response(proc.stderr).text();
+    if (heartbeat) {
+      await heartbeat;
+      proc.kill();
+    }
+    const [output, stderr, exitCode] = await Promise.all([outputPromise, stderrPromise, proc.exited]);
+    proc = undefined;
+    const herdrCalls = existsSync(herdrLog) ? readFileSync(herdrLog, "utf8").trim().split("\n") : [];
+    return {
+      output,
+      stderr,
+      exitCode,
+      ghCalls: existsSync(ghLog) ? readFileSync(ghLog, "utf8").trim().split("\n") : [],
+      herdrCalls,
+      herdrWrites: herdrCalls.filter((line) => /^pane send-(?:text|keys) /.test(line)),
+    };
+  } finally {
+    clearTimeout(timeout);
+    watcher?.close();
+    if (proc) {
+      proc.kill();
+      await proc.exited;
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+async function runWatchCycle(options = {}) {
+  return runFleetCommand({ ...options, command: ["watch", "1"] });
+}
+
+async function runFleetBoard(options = {}) {
+  return runFleetCommand({ ...options, command: ["board"] });
+}
+
 describe("fleet dependency dispatch", () => {
   it("waits for verified predecessor and idle pane, then dispatches exactly once", async () => {
     const db = dependencyDb("verified-done");
@@ -37,17 +259,17 @@ describe("fleet dependency dispatch", () => {
       return `DISPATCH_OK ${cat} ${key}`;
     };
 
-    expect(await dispatchQueuedDependencies(db, [{ id: "crm", state: "working" }], dispatchTask)).toEqual([]);
+    expect(await dispatchWaitingTasks(db, [{ id: "crm", state: "working" }], dispatchTask)).toEqual([]);
     expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("waiting");
     expect(calls).toHaveLength(0);
 
-    const events = await dispatchQueuedDependencies(db, [{ id: "crm", state: "idle" }], dispatchTask);
+    const events = await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], dispatchTask);
     expect(events).toEqual(["FLEET_DEPENDENCY_DISPATCH CHILD DISPATCH_OK crm CHILD"]);
     expect(calls).toHaveLength(1);
     expect(calls[0].options.after).toBe("PARENT");
     expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("sent");
 
-    await dispatchQueuedDependencies(db, [{ id: "crm", state: "idle" }], dispatchTask);
+    await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], dispatchTask);
     expect(calls).toHaveLength(1);
     db.close();
   });
@@ -55,10 +277,35 @@ describe("fleet dependency dispatch", () => {
   it("keeps the child queued until its predecessor is verified-done", async () => {
     const db = dependencyDb("working");
     const calls = [];
-    const events = await dispatchQueuedDependencies(db, [{ id: "crm", state: "idle" }], async (...args) => calls.push(args));
+    const events = await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], async (...args) => calls.push(args));
     expect(events).toEqual([]);
     expect(calls).toHaveLength(0);
     expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("waiting");
+    db.close();
+  });
+
+  it("resumes a pane-wait task once after the pane becomes idle", async () => {
+    const db = dependencyDb("working");
+    db.query("UPDATE tasks SET depends_on=NULL WHERE key='CHILD'").run();
+    const calls = [];
+    const dispatchTask = async (cat, key, prompt, options) => {
+      calls.push({ cat, key, prompt, options });
+      db.query("UPDATE tasks SET status='sent' WHERE key=?").run(key);
+      return `DISPATCH_OK ${cat} ${key}`;
+    };
+
+    expect(await dispatchWaitingTasks(db, [{ id: "crm", state: "compacting" }], dispatchTask)).toEqual([]);
+    expect(calls).toHaveLength(0);
+    expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("waiting");
+
+    expect(await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], dispatchTask))
+      .toEqual(["FLEET_DISPATCH_RESUMED CHILD DISPATCH_OK crm CHILD"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].options.after).toBeNull();
+    expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("sent");
+
+    await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], dispatchTask);
+    expect(calls).toHaveLength(1);
     db.close();
   });
 });
@@ -217,6 +464,21 @@ describe("fleet completion claim verification", () => {
 });
 
 describe("fleet dispatch CLI persistence", () => {
+  for (const paneScreen of ["Compacting", "Question pending"]) {
+    it(`queues a dispatch while the pane is ${paneScreen}`, async () => {
+      const result = await runBlockedDispatch(paneScreen);
+      expect(result.exitCode).toBe(0, result.stderr);
+      expect(result.row?.status).toBe("waiting");
+      expect(result.row?.prompt).toBe(join(result.home, "prompt.txt"));
+      expect(result.row?.dispatch_type).toBe("impl");
+      expect(result.row?.keep_model).toBe(1);
+      expect(result.herdrCalls).toHaveLength(1);
+      expect(result.herdrCalls[0]).toContain("pane read w6:p1");
+      expect(result.herdrCalls[0]).not.toMatch(/send-text|send-keys/);
+      expect(existsSync(result.home)).toBe(false);
+    });
+  }
+
   it("stores --after and leaves the child waiting while its pane is busy", async () => {
     const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-cli-"));
     const state = join(home, ".local", "state", "omonyang");
@@ -292,5 +554,229 @@ describe("fleet dispatch CLI persistence", () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+describe("fleet watch sent-unconfirmed recheck", () => {
+  it("marks a late Working pane as started without resending", async () => {
+    const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unconfirmed-"));
+    const state = join(home, ".local", "state", "omonyang");
+    const bin = join(home, "bin");
+    mkdirSync(state, { recursive: true });
+    mkdirSync(bin);
+    const dbPath = join(state, "fleet.sqlite");
+    const herdrLog = join(home, "herdr.log");
+    const db = new Database(dbPath);
+    db.exec(`CREATE TABLE cats(
+      id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT,
+      state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT
+    );
+    CREATE TABLE tasks(
+      key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+      done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+    );
+    CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);`);
+    db.query("INSERT INTO cats(id,name,kind,pane,task) VALUES('crm','CRM','pane','w6:p1','CHILD')").run();
+    db.query("INSERT INTO tasks(key,cat,status,sent_at) VALUES('CHILD','crm','sent-unconfirmed',?)").run(new Date().toISOString());
+    db.close();
+
+    try {
+      const herdrPath = join(bin, "herdr");
+      const pgrepPath = join(bin, "pgrep");
+      const journalPath = join(bin, "journalctl");
+      writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf 'Working (late start)\\n'; fi\n");
+      writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
+      writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
+      chmodSync(herdrPath, 0o755);
+      chmodSync(pgrepPath, 0o755);
+      chmodSync(journalPath, 0o755);
+      const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, HERDR_LOG: herdrLog };
+      const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const proc = Bun.spawn(["bun", fleetPath, "watch", "1"], {
+        cwd: new URL("..", import.meta.url).pathname,
+        env,
+        signal: controller.signal,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      const reader = proc.stdout.getReader();
+      let output = "";
+      const decoder = new TextDecoder();
+      try {
+        while (!output.includes("FLEET_TASK_STARTED crm CHILD")) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          output += decoder.decode(value, { stream: true });
+        }
+      } finally {
+        clearTimeout(timeout);
+        proc.kill();
+        await proc.exited;
+        reader.releaseLock();
+      }
+      expect(output).toContain("FLEET_TASK_STARTED crm CHILD");
+      const stored = new Database(dbPath);
+      const task = stored.query("SELECT status,started_at FROM tasks WHERE key='CHILD'").get();
+      stored.close();
+      expect(task.status).toBe("working");
+      expect(task.started_at).not.toBeNull();
+      expect(readFileSync(herdrLog, "utf8")).not.toMatch(/send-text|send-keys/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+describe("fleet usage and Bugbot alerts", () => {
+  it("emits one alert for each USAGE_TICK threshold without switching models", async () => {
+    const result = await runWatchCycle({ usageTick: "USAGE_TICK anthropic=60% chatgpt-subscription=80%" });
+    expect(result.output).toContain("FLEET_USAGE_LIMIT provider=anthropic used=60% remaining=40% threshold=60%");
+    expect(result.output).toContain("FLEET_USAGE_LIMIT provider=chatgpt-subscription used=80% remaining=20% threshold=80%");
+    expect(result.herdrWrites).toEqual([]);
+    expect(result.ghCalls).toEqual([]);
+  });
+
+  it("alerts on the Cursor Bugbot usage-limit check using read-only GitHub data", async () => {
+    const result = await runWatchCycle({
+      prDone: "pr:whelp99-code/jm-omo#77",
+      checkRuns: [{
+        name: "Cursor Bugbot",
+        status: "completed",
+        conclusion: "neutral",
+        output: {
+          title: "Bugbot couldn't run - usage limit reached",
+          summary: "Bugbot couldn't run - usage limit reached",
+          text: "",
+        },
+      }],
+    });
+    expect(result.output).toContain("FLEET_BUGBOT_LIMIT");
+    expect(result.output).toContain("usage_limit_reached");
+    expect(result.ghCalls).toContain("pr view 77 --repo whelp99-code/jm-omo --json headRefOid");
+    expect(result.ghCalls.some((line) => line.startsWith("api repos/whelp99-code/jm-omo/commits/"))).toBe(true);
+    expect(result.herdrWrites).toEqual([]);
+  });
+});
+
+describe("fleet question policy", () => {
+  it("defers personal password or OTP use and answers through the fake pane", async () => {
+    const result = await runWatchCycle({
+      catTask: "Q-PERSONAL",
+      paneScreen: "Question pending\nMay I use Jaemin's password or OTP now?\n❯",
+    });
+    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-PERSONAL policy=personal-credentials-defer");
+    expect(result.herdrWrites).toEqual([
+      "pane send-text w6:p1 재민의 비밀번호나 OTP는 사용하지 말고 내일로 미뤄.",
+      "pane send-keys w6:p1 Enter",
+    ]);
+  });
+
+  it("prohibits production authentication account use", async () => {
+    const result = await runWatchCycle({
+      catTask: "Q-PRODUCTION",
+      paneScreen: "Question pending\nShould we use the production auth account?\n❯",
+    });
+    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-PRODUCTION policy=production-auth-prohibited");
+    expect(result.herdrWrites).toEqual([
+      "pane send-text w6:p1 운영 인증 계정은 사용하지 마.",
+      "pane send-keys w6:p1 Enter",
+    ]);
+  });
+
+  it("notifies Omonyang and sends nothing for non-allowlisted questions", async () => {
+    const result = await runWatchCycle({
+      catTask: "Q-UNKNOWN",
+      paneScreen: "Question pending\nCan I use the staging account password?\n❯",
+    });
+    expect(result.output).toContain("FLEET_QUESTION_NOTIFY owner=omonyang crm Q-UNKNOWN");
+    expect(result.herdrWrites).toEqual([]);
+  });
+});
+
+describe("fleet text board", () => {
+  it("shows all roadmap items, live cats, PR review state, and unknown deployment evidence", async () => {
+    const result = await runFleetBoard({
+      catTask: "PR-TASK",
+      prDone: "pr:whelp99-code/jm-omo#77",
+      paneScreen: "Working (5s)\n❯",
+      checkRuns: [{ name: "Cursor Bugbot", status: "in_progress", conclusion: null, output: {} }],
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    for (let number = 1; number <= 8; number++) expect(result.output).toMatch(new RegExp(`^${number}\\.`, "m"));
+    expect(result.output).toContain("5. Usage inventory — NOT_STARTED");
+    expect(result.output).toContain("7. Pane context management — NOT_STARTED");
+    expect(result.output).toContain("CRM (crm, w6:p1): working");
+    expect(result.output).toContain("#2 OPEN draft");
+    expect(result.output).toContain("#77 OPEN draft");
+    expect(result.output).toContain("REVIEW_REQUIRED");
+    expect(result.output).toContain("Cursor Bugbot=IN_PROGRESS");
+    expect(result.output).toContain("Deployment: NOT_RUN");
+    expect(result.output).toContain("Production deployment: UNKNOWN");
+    expect(result.herdrWrites).toEqual([]);
+    expect(result.ghCalls.some((line) => line.startsWith("pr list "))).toBe(true);
+    expect(result.ghCalls.every((line) => !/--method\s+POST/i.test(line))).toBe(true);
+  });
+});
+
+describe("fleet UTF-8 dispatch and prompt isolation", () => {
+  it("sends the generated dispatch prompt as raw UTF-8 and ignores its prompt-only done example", async () => {
+    const result = await runRawUtf8Dispatch();
+    const expectedMessage = `UTF8-QA [skill:ulw]: 지시문 파일 ${result.prompt} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 UTF8-QA_DONE <한 줄 요약> 또는 UTF8-QA_BLOCKED reason=<한 줄>.`;
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("DISPATCH_OK crm UTF8-QA started (MODEL_KEPT)");
+    expect(result.sendBytes).toEqual(Buffer.concat([Buffer.from(expectedMessage, "utf8"), Buffer.from([0])]));
+    const promptOnly = result.sendBytes.subarray(0, result.sendBytes.length - 1).toString("utf8");
+    expect(classify(`❯ ${promptOnly}\n\n❯`).done).toBeNull();
+  }, 15_000);
+});
+
+describe("fleet review-stall request correlation", () => {
+  it("extracts request keys and recognizes the existing review-request wording", () => {
+    expect(reviewRequestKeys("서윤아, Cursor 검수 요청 PR #42 head=abcdef012345 TASK-OMO-IMPROVE-3-4-6-8"))
+      .toEqual(["pr:42", "head:abcdef01", "task:TASK-OMO-IMPROVE-3-4-6-8"]);
+    expect(isReviewRequest({ user: "UOTHER", text: "서윤아, Cursor 검수 요청: 확인 부탁해" })).toBe(true);
+    expect(isReviewRequest({ user: "U0B81F5GR6V", text: "Cursor 검수 요청 PR #42" })).toBe(false);
+    expect(isReviewRequest({ user: "UOTHER", text: "Cursor 검수 요청, 참조 키 없음" })).toBe(true);
+  });
+
+  it("pairs replies per request in the same thread without reusing one reply", () => {
+    const requests = [
+      { ts: "100.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 head=abcdef012345 TASK-REQ-A" },
+      { ts: "200.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 head=abcdef012345 TASK-REQ-B" },
+      { ts: "300.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청" },
+      { ts: "310.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청" },
+    ];
+    const replies = [
+      { ts: "250.000001", thread_ts: "90.000001", user: "U0B81F5GR6V", text: "PR #42 head=abcdef012345 TASK-REQ-B" },
+      { ts: "350.000001", thread_ts: "90.000001", app_id: "A08SKDT6QUW", text: "확인했어" },
+      { ts: "400.000001", thread_ts: "90.000001", user: "UOTHER", text: "TASK-REQ-A" },
+      { ts: "500.000001", thread_ts: "499.000001", user: "U0B81F5GR6V", text: "PR #42 head=abcdef012345 TASK-REQ-A" },
+    ];
+    expect([...pairReviewReplies(requests, replies)]).toEqual([
+      ["200.000001", "250.000001"],
+      ["300.000001", "350.000001"],
+    ]);
+  });
+
+  it("alerts each unanswered request at its own 45-minute deadline", () => {
+    const requests = [
+      { ts: "1000.000001", thread_ts: "1000.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 TASK-REQ-A" },
+      { ts: "1600.000001", thread_ts: "1600.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #43 TASK-REQ-B" },
+    ];
+    const replies = [
+      { ts: "1100.000001", thread_ts: "1000.000001", user: "U0B81F5GR6V", text: "PR #42 TASK-REQ-A 확인" },
+    ];
+    const alerted = new Set();
+    const firstDeadline = reviewStallDrafts(requests, replies, 1000_000 + 45 * 60_000, alerted);
+    expect(firstDeadline).toHaveLength(0);
+    const secondDeadline = reviewStallDrafts(requests, replies, 1600_000 + 45 * 60_000, alerted);
+    expect(secondDeadline).toHaveLength(1);
+    expect(secondDeadline[0]).toContain("FLEET_REVIEW_STALL_DRAFT owner=omonyang");
+    expect(secondDeadline[0]).toContain("TASK-REQ-B");
+    expect(secondDeadline[0]).toContain("p1600000001");
+    expect(reviewStallDrafts(requests, replies, 1700_000 + 45 * 60_000, alerted)).toEqual([]);
   });
 });
