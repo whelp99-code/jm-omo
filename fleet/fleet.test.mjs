@@ -153,7 +153,7 @@ async function runRawUtf8Dispatch() {
   }
 }
 
-async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], reservation = false, waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
   const state = join(home, ".local", "state", "omonyang");
   const bin = join(home, "bin");
@@ -180,8 +180,11 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const taskKey = catTask || (prDone ? "PR-TASK" : "");
   if (taskKey) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at,history) VALUES(?,'crm',?,?,?,?,?)")
     .run(taskKey, taskKey, prDone, taskStatus, new Date().toISOString(), JSON.stringify(taskHistory));
-  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture','unknown',?)").run(taskKey || null);
-  if (reservation && taskKey) db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('w6:p1',?,'fixture-attempt')").run(taskKey);
+  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture',?,?)").run(catState, taskKey || null);
+  if (reservation && taskKey) {
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES('w6:p1',?,'fixture-attempt',?)")
+      .run(taskKey, new Date(Date.now() - reservationAgeMs).toISOString());
+  }
   db.close();
   writeFileSync(join(usageDir, "usage-watch.log"), usageTick ? `${usageTick}\n` : "");
   const herdrPath = join(bin, "herdr");
@@ -189,7 +192,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const journalPath = join(bin, "journalctl");
   const ghPath = join(bin, "gh");
   const gitPath = join(bin, "git");
-  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf '%s\\n' \"$PANE_SCREEN\"; elif [ \"$1\" = pane ] && [ \"$2\" = send-text ] && [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n");
+  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1; printf '%s\\n' \"$PANE_SCREEN\"; elif [ \"$1\" = pane ] && [ \"$2\" = send-text ] && [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n");
   writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(gitPath, "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then printf 'https://github.com/whelp99-code/jm-omo.git\\n'; elif [ \"$1\" = branch ] && [ \"$2\" = --show-current ]; then printf 'fixture-branch\\n'; else exit 2; fi\n");
@@ -203,6 +206,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     HERDR_LOG: herdrLog,
     GH_LOG: ghLog,
     PANE_SCREEN: paneScreen,
+    PANE_READ_FAILURE: paneReadFailure ? "1" : "0",
     FAIL_FIRST_ANSWER: failFirstQuestionAnswer ? "1" : "0",
     FIRST_ANSWER_FAILED: firstAnswerFailedPath,
     GH_PR_JSON: JSON.stringify({ number: 77, title: "Fixture review", state: "OPEN", isDraft: true, url: "https://github.com/whelp99-code/jm-omo/pull/77", headRefOid: "abcdef0123456789abcdef0123456789abcdef01", reviewDecision: "REVIEW_REQUIRED", statusCheckRollup: [] }),
@@ -1052,9 +1056,12 @@ describe("fleet completion classification", () => {
 
 describe("fleet completion claim verification", () => {
   it("re-verifies not-done tasks with prior completion claims during watch polling", async () => {
-    const db = unitDb();
-    db.query("INSERT INTO tasks(key,cat,done,status,history,completion_claimed) VALUES('RETRY-PR','crm','pr:owner/repo#1','not-done','[]',1)").run();
-    db.query("INSERT INTO tasks(key,cat,done,status,history,completion_claimed) VALUES('NOT-A-CLAIM','crm','cmd:true','not-done','[]',1)").run();
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE tasks(key TEXT,done TEXT,status TEXT,completion_claimed INTEGER)");
+    db.query("INSERT INTO tasks(key,done,status,completion_claimed) VALUES('RETRY-PR-REAL','pr:owner/repo#1','not-done',1)").run();
+    db.query("INSERT INTO tasks(key,done,status,completion_claimed) VALUES('NOT-A-CLAIM','cmd:true','not-done',1)").run();
+    const storage = unitDb();
+    storage.query("INSERT INTO tasks(key,cat,done,status,history,completion_claimed) VALUES('RETRY-PR-REAL','crm','pr:owner/repo#1','not-done','[]',1)").run();
     const keys = [];
     const checked = [];
     const events = await retryNotDoneTasks(db, async (key) => {
@@ -1065,10 +1072,11 @@ describe("fleet completion claim verification", () => {
       });
     });
     expect(events).toHaveLength(1);
-    expect(events[0]).toContain("NOT_DONE RETRY-PR");
-    expect(keys).toEqual(["RETRY-PR"]);
+    expect(events[0]).toContain("NOT_DONE RETRY-PR-REAL");
+    expect(keys).toEqual(["RETRY-PR-REAL"]);
     expect(checked).toEqual(["pr:owner/repo#1"]);
     db.close();
+    storage.close();
   });
 
   it("keeps not-done PRs in active Bugbot polling", async () => {
@@ -1098,6 +1106,42 @@ describe("fleet completion claim verification", () => {
     })).toEqual(["VERIFY_RETRY NOT-DONE-PR"]);
     expect(retried).toEqual(["NOT-DONE-PR"]);
     db.close();
+  });
+
+  it("caps PR retries at three per cycle and rotates through the backlog", async () => {
+    const picker = new Database(":memory:");
+    picker.exec("CREATE TABLE tasks(key TEXT,done TEXT,status TEXT,completion_claimed INTEGER)");
+    const storage = unitDb();
+    const keys = Array.from({ length: 7 }, (_, index) => `ROTATING-PR-${index + 1}`);
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index];
+      const signal = `pr:owner/repo#${index + 1}`;
+      picker.query("INSERT INTO tasks(key,done,status,completion_claimed) VALUES(?,?,'not-done',1)").run(key, signal);
+      storage.query(`INSERT INTO tasks(key,cat,done,status,history,completion_claimed)
+        VALUES(?,'crm',?,'not-done','[]',1)`).run(key, signal);
+    }
+    const checked = [];
+    let active = 0;
+    let maximum = 0;
+    const verifyTask = async (key) => {
+      checked.push(key);
+      return verify(key, async () => {
+        active++;
+        maximum = Math.max(maximum, active);
+        await Promise.resolve();
+        active--;
+        return { ok: false, detail: "state=OPEN" };
+      });
+    };
+    const first = await retryNotDoneTasks(picker, verifyTask);
+    const second = await retryNotDoneTasks(picker, verifyTask);
+    const third = await retryNotDoneTasks(picker, verifyTask);
+    expect([first.length, second.length, third.length]).toEqual([3, 3, 3]);
+    expect(new Set(checked.slice(0, 7)).size).toBe(7);
+    expect(checked.slice(0, 7).sort()).toEqual(keys.slice().sort());
+    expect(maximum).toBe(3);
+    picker.close();
+    storage.close();
   });
 
   it("re-verifies after 45 failures and completes when durable ACCEPT evidence is present", async () => {
@@ -1134,6 +1178,48 @@ describe("fleet completion claim verification", () => {
     });
     const verified = await verify(key, async () => ({
       ok: true, detail: "merged", headRefOid: head, mergeCommit: "f".repeat(40),
+    }));
+    expect(verified).toContain(`VERIFIED_DONE ${key}`);
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("verified-done");
+    db.close();
+  });
+
+  it("matches bundled PR claims to every configured completion signal", async () => {
+    const db = unitDb();
+    const key = "VERIFY-MULTI-PR";
+    const signalOne = "pr:owner/one#11";
+    const signalTwo = "pr:owner/two#22";
+    const heads = {
+      [signalOne]: "1111111111111111111111111111111111111111",
+      [signalTwo]: "2222222222222222222222222222222222222222",
+    };
+    const task = {
+      key,
+      sent_at: "2026-10-12T10:00:00.000Z",
+      done: `${signalOne};${signalTwo}`,
+    };
+    db.query(`INSERT INTO tasks(key,cat,done,status,sent_at,history,completion_claimed,claim_evidence)
+      VALUES(?,?,?,'done-claimed',?,'[]',1,'{}')`)
+      .run(key, "reservation-cat", task.done, task.sent_at);
+    const claims = await verifyClaims([
+      `Cursor ACCEPT owner/two#22 head=${heads[signalTwo].slice(0, 8)}`,
+      `owner/two#22 PR READY head=${heads[signalTwo].slice(0, 8)}`,
+      `Cursor ACCEPT owner/one#11 head=${heads[signalOne].slice(0, 8)}`,
+      `owner/one#11 PR READY head=${heads[signalOne].slice(0, 8)}`,
+    ].join("\n"), task, {
+      getPrHead: async (signal) => heads[signal],
+      slackHasHead: async (head, sentAt, pr) => sentAt === task.sent_at
+        && head === heads[`pr:${pr.repo}#${pr.prNumber}`],
+    });
+    expect(claims.map(({ kind, signal, ok }) => ({ kind, signal, ok }))).toEqual([
+      { kind: "cursor-accept", signal: signalTwo, ok: true },
+      { kind: "cursor-accept", signal: signalOne, ok: true },
+      { kind: "pr-ready", signal: signalTwo, ok: true },
+      { kind: "pr-ready", signal: signalOne, ok: true },
+    ]);
+    for (const claim of claims) recordTaskClaimEvidence(db, key, claim);
+    const verified = await verify(key, async (signal) => ({
+      ok: true, detail: "merged", headRefOid: heads[signal], mergeCommit: "f".repeat(40),
     }));
     expect(verified).toContain(`VERIFIED_DONE ${key}`);
     expect(db.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("verified-done");
@@ -1413,6 +1499,20 @@ describe("fleet completion claim verification", () => {
     expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], accepted, { repo: "owner/mail", prNumber: "57" })).toBe(true);
   });
 
+  it("requires target PR identity on the ACCEPT line and rejects another owner shorthand", async () => {
+    const head = "0123456789abcdef0123456789abcdef01234567";
+    const messages = [
+      { user: "U0B81F5GR6V", text: `owner/jm-omo#5 ${head} REJECT\nother-owner/jm-omo#5 ${head} ACCEPT` },
+      { user: "U0B81F5GR6V", text: `TASK-BOUND-PR ${head} REJECT\nACCEPT head=${head}` },
+    ];
+    expect(await cursorHeadMatches(messages, head, {
+      repo: "owner/jm-omo", prNumber: "5", taskKey: "TASK-BOUND-PR",
+    })).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `other-jm-omo#5 ${head} ACCEPT` },
+    ], head, { repo: "owner/jm-omo", prNumber: "5" })).toBe(false);
+  });
+
   it("resolves a short claim through the PR and checks Slack against the full SHA", async () => {
     const fullHead = "abcdef0123456789abcdef0123456789abcdef01";
     const acceptedPrefix = fullHead.slice(0, 8);
@@ -1593,6 +1693,48 @@ describe("fleet completion claim verification", () => {
     });
     expect(claims).toEqual([{ kind: "tests-count", ok: false, detail: "tests_count_is_not_evidence" }]);
     expect(called).toBe(false);
+  });
+});
+
+describe("fleet startup schema migration", () => {
+  it("serializes additive migrations when multiple fleet processes start together", async () => {
+    const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-migration-race-"));
+    const state = join(home, ".local", "state", "omonyang");
+    mkdirSync(state, { recursive: true });
+    const dbPath = join(state, "fleet.sqlite");
+    const legacy = new Database(dbPath);
+    legacy.exec(`CREATE TABLE tasks(
+      key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+      done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+    );
+    CREATE TABLE dispatch_reservations(pane TEXT PRIMARY KEY,key TEXT UNIQUE NOT NULL,attempt TEXT NOT NULL);`);
+    legacy.close();
+
+    const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+    const env = { ...process.env, HOME: home };
+    try {
+      const processes = Array.from({ length: 6 }, () => Bun.spawn([
+        "bun", "-e", `await import(${JSON.stringify(fleetPath)});`,
+      ], { env, stdout: "pipe", stderr: "pipe" }));
+      const results = await Promise.all(processes.map(async (proc) => {
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        return { stdout, stderr, exitCode };
+      }));
+      expect(results.filter((result) => result.exitCode !== 0)).toEqual([]);
+      const migrated = new Database(dbPath);
+      const taskColumns = new Set(migrated.query("PRAGMA table_info(tasks)").all().map((column) => column.name));
+      const reservationColumns = new Set(migrated.query("PRAGMA table_info(dispatch_reservations)").all().map((column) => column.name));
+      expect(["completion_claimed", "send_attempted", "claim_evidence"].every((column) => taskColumns.has(column))).toBe(true);
+      expect(["reserved_at", "recovery_token", "recovery_started_at"].every((column) => reservationColumns.has(column))).toBe(true);
+      migrated.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1798,6 +1940,21 @@ describe("fleet working-task compaction recovery", () => {
 });
 
 describe("fleet usage and Bugbot alerts", () => {
+  it("honors an idle completion marker before reconciling an expired send reservation", async () => {
+    const result = await runWatchCycle({
+      catTask: "TASK-DONE-ON-RESTART",
+      taskStatus: "send-failed-unconfirmed",
+      taskHistory: [{ ev: "send-attempted", attempt: "fixture-attempt" }],
+      reservation: true,
+      reservationAgeMs: 10 * 60_000,
+      paneScreen: "⏺ The work is complete.\nTASK-DONE-ON-RESTART_DONE finished\n\n❯",
+    });
+    expect(result.output).toContain("FLEET_TASK_DONE crm TASK-DONE-ON-RESTART finished");
+    expect(result.taskStatus).toBe("done-claimed");
+    expect(result.herdrWrites).toEqual([]);
+    expect(result.reservationLeft).toBe(true);
+  });
+
   it("re-verifies not-done PR tasks during a watch cycle", async () => {
     const result = await runWatchCycle({
       catTask: "WATCH-RETRY-PR",
@@ -1954,6 +2111,25 @@ describe("fleet question policy", () => {
     expect(questionPolicy("May I use the production auth account?")?.id).toBe("production-auth-prohibited");
   });
 
+  it("keeps unanswered words inside the question instead of treating them as status markers", async () => {
+    const question = "May I use the production auth account for this unanswered issue?";
+    const classified = classify(`Question pending\n${question}\n❯`);
+    expect(classified.state).toBe("question");
+    expect(classified.questionText).toBe(question);
+    expect(questionPolicy(classified.questionText)?.id).toBe("production-auth-prohibited");
+
+    const result = await runWatchCycle({
+      catTask: "Q-UNANSWERED-WORD",
+      paneScreen: `Question pending\n${question}\n❯`,
+    });
+    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-UNANSWERED-WORD policy=production-auth-prohibited");
+    expect(result.herdrWrites).toEqual([
+      "pane send-text w6:p1 운영 인증 계정은 사용하지 마.",
+      "pane send-keys w6:p1 Enter",
+    ]);
+    expect(classify("This is still an unanswered issue\n❯").state).toBe("idle");
+  });
+
   it("retries an allowlisted answer after a transient send failure", async () => {
     const result = await runFleetCommand({
       catTask: "Q-RETRY",
@@ -2016,6 +2192,18 @@ describe("fleet question policy", () => {
 });
 
 describe("fleet text board", () => {
+  it("persists unknown cat state after a pane read failure", async () => {
+    const result = await runFleetCommand({
+      catState: "working",
+      paneReadFailure: true,
+      command: ["status"],
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toContain("unknown");
+    expect(result.output).not.toContain("working");
+    expect(result.output).toContain("FLEET_REFRESH_ERROR crm");
+  });
+
   it("shows all roadmap items, live cats, PR review state, and unknown deployment evidence", async () => {
     const result = await runFleetBoard({
       catTask: "PR-TASK",
@@ -2104,7 +2292,7 @@ describe("fleet review-stall request correlation", () => {
     expect(restartedPoll).toEqual([]);
     expect(db.query("SELECT ts FROM fleet_review_requests").get()).toBeNull();
     expect(db.query("SELECT value FROM fleet_state WHERE key='slack-review-cursor'").get().value)
-      .toBe(String((nowMs + 1_000) / 1000));
+      .toBe(requestTs);
     db.close();
   });
 

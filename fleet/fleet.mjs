@@ -16,40 +16,57 @@ CREATE TABLE IF NOT EXISTS dispatch_reservations(pane TEXT PRIMARY KEY, key TEXT
 CREATE TABLE IF NOT EXISTS fleet_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_alerts(key TEXT PRIMARY KEY, alerted_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_review_requests(ts TEXT PRIMARY KEY, channel TEXT, thread_ts TEXT, user TEXT, text TEXT NOT NULL);`);
-const taskColumns = new Set(db.query("PRAGMA table_info(tasks)").all().map((column) => column.name));
-for (const [name, definition] of [["depends_on", "TEXT"], ["dispatch_type", "TEXT DEFAULT 'impl'"], ["keep_model", "INTEGER DEFAULT 0"], ["completion_claimed", "INTEGER NOT NULL DEFAULT 0"], ["send_attempted", "INTEGER NOT NULL DEFAULT 0"], ["claim_evidence", "TEXT NOT NULL DEFAULT '{}'"]]) {
-  if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
-}
-for (const task of db.query("SELECT key,status,history,completion_claimed,send_attempted,claim_evidence FROM tasks WHERE completion_claimed=0 OR send_attempted=0 OR claim_evidence='{}'").all()) {
-  const history = JSON.parse(task.history || "[]");
-  const completionClaimed = task.completion_claimed || task.status === "done-claimed" || history.some((event) => event.ev === "done-claimed");
-  const sendAttempted = task.send_attempted || history.some((event) => event.ev === "send-attempted");
-  const claimEvidence = JSON.parse(task.claim_evidence || "{}");
-  for (const event of history) {
-    if (["cursor-accept", "pr-ready"].includes(event.claim)
-      && ["claim-ok", "claim-false"].includes(event.ev)) {
-      claimEvidence[event.claim] = {
-        ok: event.ev === "claim-ok",
-        head: event.head ?? null,
-        acceptedPrefix: event.acceptedPrefix ?? null,
-        actualHead: event.actualHead ?? null,
-        detail: event.detail ?? null,
-      };
+export function migrateFleetColumns(dbHandle) {
+  return dbHandle.transaction(() => {
+    const addMissing = (table, definitions) => {
+      const columns = new Set(dbHandle.query(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+      for (const [name, definition] of definitions) {
+        if (columns.has(name)) continue;
+        dbHandle.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+        columns.add(name);
+      }
+    };
+    addMissing("tasks", [
+      ["depends_on", "TEXT"],
+      ["dispatch_type", "TEXT DEFAULT 'impl'"],
+      ["keep_model", "INTEGER DEFAULT 0"],
+      ["completion_claimed", "INTEGER NOT NULL DEFAULT 0"],
+      ["send_attempted", "INTEGER NOT NULL DEFAULT 0"],
+      ["claim_evidence", "TEXT NOT NULL DEFAULT '{}'"],
+    ]);
+    addMissing("dispatch_reservations", [
+      ["reserved_at", "TEXT NOT NULL DEFAULT ''"],
+      ["recovery_token", "TEXT"],
+      ["recovery_started_at", "TEXT"],
+    ]);
+    dbHandle.query("UPDATE dispatch_reservations SET reserved_at=? WHERE reserved_at=''").run(new Date().toISOString());
+    for (const task of dbHandle.query("SELECT key,status,history,completion_claimed,send_attempted,claim_evidence FROM tasks WHERE completion_claimed=0 OR send_attempted=0 OR claim_evidence='{}'").all()) {
+      const history = JSON.parse(task.history || "[]");
+      const completionClaimed = task.completion_claimed || task.status === "done-claimed" || history.some((event) => event.ev === "done-claimed");
+      const sendAttempted = task.send_attempted || history.some((event) => event.ev === "send-attempted");
+      const claimEvidence = JSON.parse(task.claim_evidence || "{}");
+      for (const event of history) {
+        if (["cursor-accept", "pr-ready"].includes(event.claim)
+          && ["claim-ok", "claim-false"].includes(event.ev)) {
+          const signal = event.signal || "_legacy";
+          claimEvidence[signal] ??= {};
+          claimEvidence[signal][event.claim] = {
+            ok: event.ev === "claim-ok",
+            head: event.head ?? null,
+            acceptedPrefix: event.acceptedPrefix ?? null,
+            actualHead: event.actualHead ?? null,
+            detail: event.detail ?? null,
+          };
+        }
+      }
+      if (completionClaimed || sendAttempted || JSON.stringify(claimEvidence) !== task.claim_evidence) {
+        dbHandle.query("UPDATE tasks SET completion_claimed=?,send_attempted=?,claim_evidence=? WHERE key=?")
+          .run(completionClaimed ? 1 : 0, sendAttempted ? 1 : 0, JSON.stringify(claimEvidence), task.key);
+      }
     }
-  }
-  if (completionClaimed || sendAttempted || JSON.stringify(claimEvidence) !== task.claim_evidence) {
-    db.query("UPDATE tasks SET completion_claimed=?,send_attempted=?,claim_evidence=? WHERE key=?")
-      .run(completionClaimed ? 1 : 0, sendAttempted ? 1 : 0, JSON.stringify(claimEvidence), task.key);
-  }
+  }).immediate();
 }
-const reservationColumns = new Set(db.query("PRAGMA table_info(dispatch_reservations)").all().map((column) => column.name));
-if (!reservationColumns.has("reserved_at")) {
-  db.exec("ALTER TABLE dispatch_reservations ADD COLUMN reserved_at TEXT NOT NULL DEFAULT ''");
-  db.query("UPDATE dispatch_reservations SET reserved_at=? WHERE reserved_at=''").run(new Date().toISOString());
-}
-for (const [name, definition] of [["recovery_token", "TEXT"], ["recovery_started_at", "TEXT"]]) {
-  if (!reservationColumns.has(name)) db.exec(`ALTER TABLE dispatch_reservations ADD COLUMN ${name} ${definition}`);
-}
+migrateFleetColumns(db);
 
 const now = () => new Date().toISOString();
 const sh = async (cmd) => (await Bun.$`bash -c ${cmd}`.nothrow().quiet()).stdout.toString();
@@ -65,6 +82,10 @@ const DISPATCH_RESERVATION_TTL_MS = 2 * 60_000;
 const SLACK_THREAD_CONCURRENCY = 5;
 const SLACK_HISTORY_TIMEOUT_MS = 15_000;
 const SLACK_HISTORY_BOOTSTRAP_DAYS = 30;
+
+function isQuestionStatusLine(line) {
+  return /^\s*(?:Question pending|Unanswered)\s*$/i.test(String(line ?? ""));
+}
 
 const CATS = [
   ["omonyang", "오모냥", "대장: 계획·배분·확인", "captain", "w5:p1", "-"],
@@ -89,7 +110,7 @@ export function classify(screen) {
   if (/compaction did not complete/i.test(tail) && !/Working \(/.test(tail)) state = "compaction-failed";
   else if (/Compacting/i.test(tail)) state = "compacting";
   else if (/Working \(|Running eval|esc to interrupt/.test(tail)) state = "working";
-  else if (/Question pending|unanswered/i.test(tail)) state = "question";
+  else if (L.slice(-14).some(isQuestionStatusLine)) state = "question";
   else if (/Codex error|rate limit|usage limit|429|quota|Unable to verify/i.test(tail)) state = "provider-error";
   else if (/→\s+\S+\s+\[[^\]]+\]/.test(tail)) state = "model-picker";
   const output = responseBlock(screen);
@@ -103,10 +124,10 @@ export function classify(screen) {
   let questionText = "";
   if (state === "question") {
     const screenLines = screen.replace(/\r/g, "").split("\n");
-    const marker = screenLines.findLastIndex((line) => /Question pending|unanswered/i.test(line));
+    const marker = screenLines.findLastIndex(isQuestionStatusLine);
     const prompt = screenLines.findLastIndex((line) => /^\s*❯/.test(line));
     if (marker >= 0) questionText = screenLines.slice(marker + 1, prompt >= marker ? prompt : undefined).join("\n").trim().slice(-800);
-    else questionText = output.split("\n").filter((line) => !/Question pending|unanswered/i.test(line)).slice(-3).join("\n").trim().slice(-800);
+    else questionText = output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3).join("\n").trim().slice(-800);
   }
   return { state, model, done: done ? { key: done[1], kind: done[2], text: done[3].trim().slice(0, 200) } : null, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
 }
@@ -175,7 +196,9 @@ export function recordTaskClaimEvidence(dbHandle, taskKey, claim) {
     const task = dbHandle.query("SELECT claim_evidence FROM tasks WHERE key=?").get(taskKey);
     if (!task) return false;
     const evidence = JSON.parse(task.claim_evidence || "{}");
-    evidence[claim.kind] = {
+    const signal = claim.signal || "_legacy";
+    evidence[signal] ??= {};
+    evidence[signal][claim.kind] = {
       ok: Boolean(claim.ok),
       head: claim.head ?? null,
       acceptedPrefix: claim.acceptedPrefix ?? null,
@@ -185,6 +208,7 @@ export function recordTaskClaimEvidence(dbHandle, taskKey, claim) {
     dbHandle.query("UPDATE tasks SET claim_evidence=? WHERE key=?").run(JSON.stringify(evidence), taskKey);
     appendHistoryInTransaction(dbHandle, taskKey, {
       ev: claim.ok ? "claim-ok" : "claim-false",
+      signal: claim.signal,
       claim: claim.kind,
       head: claim.head,
       acceptedPrefix: claim.acceptedPrefix,
@@ -417,7 +441,9 @@ export async function recoverInterruptedDispatches(dbHandle, paneRows, nowMs = D
     try {
       const initial = await runCommand(["herdr", "pane", "read", reservation.pane, "--source", "visible", "--format", "text"]);
       if (initial.exitCode !== 0 || !initial.stdout.trim()) continue;
-      let state = classify(initial.stdout).state;
+      const snapshot = classify(initial.stdout);
+      let state = snapshot.state;
+      if (state === "idle" && snapshot.done?.key === reservation.key) continue;
       if (state === "model-picker") {
         recoveryToken = claimPickerRecoveryImmediatelyBeforeEscape(dbHandle, reservation, nowMs);
         if (!recoveryToken) continue;
@@ -488,6 +514,7 @@ async function refresh() {
       out.push({ ...c, ...s });
     } catch (error) {
       console.log(`FLEET_REFRESH_ERROR ${c.id} ${error?.message ?? error}`);
+      db.query("UPDATE cats SET state='unknown',model='' WHERE id=?").run(c.id);
       out.push({ ...c, state: "unknown", model: "", done: null, ready: null, readyLine: null, claimText: "", questionText: "" });
     }
   }
@@ -672,7 +699,8 @@ function referencesPullRequest(text, { repo, prNumber }) {
   const escapedRepo = repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const repoName = repo.split("/").at(-1);
   const escapedRepoName = repoName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:(?:${escapedRepo}|${escapedRepoName})\\s*#\\s*${prNumber}\\b|(?:${escapedRepo}|${escapedRepoName})\\s+PR\\s*#?\\s*${prNumber}\\b|https?://github\\.com/${escapedRepo}/pull/${prNumber}\\b)`, "i").test(source);
+  const repoReference = `(?<![\\w./-])(?:${escapedRepo}|${escapedRepoName})`;
+  return new RegExp(`(?:${repoReference}\\s*#\\s*${prNumber}\\b|${repoReference}\\s+PR\\s*#?\\s*${prNumber}\\b|https?://github\\.com/${escapedRepo}/pull/${prNumber}\\b)`, "i").test(source);
 }
 
 function referencesTask(text, taskKey) {
@@ -699,8 +727,8 @@ export async function cursorHeadMatches(messages, fullHead, pr, runCommand = exe
     for (const line of lines) {
       if (!/\b(?:ACCEPT|APPROVE)\b/i.test(line) || /\b(?:REJECT|REVISE)\b/i.test(line)) continue;
       const tokens = [...line.matchAll(/(?<![a-f0-9])[a-f0-9]{7,40}(?![a-f0-9])/gi)].map((match) => match[0].toLowerCase());
-      const hasReference = pr && referencesPullRequest(`${text}\n${line}`, pr);
-      const hasTaskReference = referencesTask(text, pr?.taskKey);
+      const hasReference = pr && referencesPullRequest(line, pr);
+      const hasTaskReference = referencesTask(line, pr?.taskKey);
       if (!hasReference && !hasTaskReference) continue;
       if (tokens.includes(want)) return true;
       if (!pr?.repo || !pr?.prNumber || !tokens.some((token) => token.length < 40 && want.startsWith(token))) continue;
@@ -840,7 +868,8 @@ export async function pollReviewStalls(dbHandle, nowMs = Date.now(), fetchMessag
       if (requestTs) dbHandle.query("INSERT OR IGNORE INTO fleet_alerts(key,alerted_at) VALUES(?,?)").run(requestTs, now());
     }
     const remaining = dbHandle.query("SELECT ts FROM fleet_review_requests ORDER BY ts LIMIT 1").get();
-    const latest = messages.reduce((max, message) => Number(message.ts) > Number(max) ? String(message.ts) : max, cursor);
+    const channelMessages = messages.filter((message) => !message.thread_ts || String(message.thread_ts) === String(message.ts));
+    const latest = channelMessages.reduce((max, message) => Number(message.ts) > Number(max) ? String(message.ts) : max, cursor);
     const nextCursor = remaining?.ts ?? latest;
     dbHandle.query(`INSERT INTO fleet_state(key,value) VALUES('slack-review-cursor',?)
       ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(String(nextCursor || cursor));
@@ -943,8 +972,10 @@ export async function bugbotLimitEvents(dbHandle, previous, getCheckRuns = pullR
 }
 
 function pullRequestSignal(text, task) {
-  const taskSignal = task?.done?.split(";").map((part) => part.trim()).find((part) => /^pr:[\w.-]+\/[\w.-]+#\d+$/.test(part));
-  if (taskSignal) return taskSignal;
+  const taskSignals = task?.done?.split(";").map((part) => part.trim()).filter((part) => parsePullRequestSignal(part)) ?? [];
+  const referencedSignal = taskSignals.find((signal) => referencesPullRequest(text, parsePullRequestSignal(signal)));
+  if (referencedSignal) return referencedSignal;
+  if (taskSignals.length) return taskSignals[0];
   const url = text.match(/\bhttps:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)\b/i);
   if (url) return `pr:${url[1]}#${url[2]}`;
   const reference = text.match(/\b([\w.-]+\/[\w.-]+)#(\d+)\b/);
@@ -956,20 +987,27 @@ export async function verifyClaims(text, task, checks = {}) {
   const results = [];
   const runCommand = checks.runCommand ?? executeSignalCommand;
   const getPrHead = checks.getPrHead ?? ((signal) => pullRequestHead(signal, AbortSignal.timeout(10000), runCommand));
-  const signal = pullRequestSignal(text, task);
-  const pr = { ...(signal ? parsePullRequestSignal(signal) : {}), taskKey: task?.key };
   const checkSlackHead = checks.slackHasHead
-    ?? ((head, sentAt) => slackHasHead(head, sentAt, pr, runCommand, checks.slackHistory ?? slackHistory));
-  let actualHead = null;
-  if (signal) {
+    ?? ((head, sentAt, pr) => slackHasHead(head, sentAt, pr, runCommand, checks.slackHistory ?? slackHistory));
+  const heads = new Map();
+  const actualHeadFor = async (signal) => {
+    if (!signal) return null;
+    if (heads.has(signal)) return heads.get(signal);
+    let actualHead = null;
     try {
       const head = await getPrHead(signal);
       if (typeof head === "string" && /^[a-f0-9]{40}$/i.test(head)) actualHead = head.toLowerCase();
     } catch {}
-  }
-  const cursor = text.match(/\bCursor\s+(ACCEPT|APPROVE)\b/i);
-  if (cursor) {
-    const claimLine = text.slice(cursor.index).split("\n", 1)[0];
+    heads.set(signal, actualHead);
+    return actualHead;
+  };
+  const contextFor = (signal) => ({ ...(signal ? parsePullRequestSignal(signal) : {}), taskKey: task?.key });
+  const acceptedLines = [...text.matchAll(/\bCursor\s+(?:ACCEPT|APPROVE)\b[^\n]*/gi)];
+  for (const accepted of acceptedLines) {
+    const claimLine = accepted[0];
+    const signal = pullRequestSignal(claimLine, task);
+    const actualHead = await actualHeadFor(signal);
+    const pr = contextFor(signal);
     const acceptedPrefix = claimLine.match(/\bhead\s*[:=]\s*([0-9a-f]{7,40})\b/i)?.[1]
       ?? claimLine.match(/\b(?:ACCEPT|APPROVE)\b[^\n]*?\b([0-9a-f]{7,40})\b/i)?.[1];
     const normalizedHead = acceptedPrefix
@@ -979,10 +1017,11 @@ export async function verifyClaims(text, task, checks = {}) {
       : null;
     let ok = false;
     if (normalizedHead && task?.sent_at) {
-      try { ok = await checkSlackHead(normalizedHead, task.sent_at); } catch {}
+      try { ok = await checkSlackHead(normalizedHead, task.sent_at, pr); } catch {}
     }
     results.push({
       kind: "cursor-accept",
+      signal,
       ok: Boolean(ok),
       head: normalizedHead,
       acceptedPrefix: acceptedPrefix?.toLowerCase() ?? null,
@@ -991,12 +1030,15 @@ export async function verifyClaims(text, task, checks = {}) {
     });
   }
 
-  const ready = text.match(/\bPR READY\s+head=([0-9a-f]{7,40})\b/i);
-  if (ready) {
+  const readyLines = [...text.matchAll(/[^\n]*\bPR READY\s+head=([0-9a-f]{7,40})\b[^\n]*/gi)];
+  for (const ready of readyLines) {
+    const signal = pullRequestSignal(ready[0], task);
+    const actualHead = await actualHeadFor(signal);
     const acceptedPrefix = ready[1].toLowerCase();
     const ok = Boolean(actualHead && headPrefixMatchesFull(actualHead, acceptedPrefix));
     results.push({
       kind: "pr-ready",
+      signal,
       ok,
       head: ok ? actualHead : null,
       acceptedPrefix,
@@ -1251,22 +1293,21 @@ export async function verify(key, check = checkSignal) {
   const res = [];
   for (const s of t.done.split(";").map((part) => part.trim()).filter(Boolean)) res.push({ s, ...(await check(s)) });
   const durableClaims = JSON.parse(t.claim_evidence || "{}");
-  const claims = [
-    ...history.filter((event) => event.ev === "claim-ok" || event.ev === "claim-false"),
-    ...Object.entries(durableClaims).map(([claim, event]) => ({
-      ...event,
-      claim,
-      ev: event.ok ? "claim-ok" : "claim-false",
-    })),
-  ];
   const prSignals = res.filter((result) => parsePullRequestSignal(result.s));
   const requiredClaims = prSignals.map((result) => {
     const headRefOid = /^[a-f0-9]{40}$/i.test(result.headRefOid || "") ? result.headRefOid.toLowerCase() : null;
-    const cursorAccept = headRefOid && claims.findLast((event) => event.ev === "claim-ok"
+    const signalClaims = [
+      ...history.filter((event) => (event.ev === "claim-ok" || event.ev === "claim-false")
+        && (event.signal === result.s || (!event.signal && (prSignals.length === 1 || result.s === prSignals[0].s)))),
+      ...Object.entries(durableClaims[result.s] ?? (result.s === prSignals[0].s ? durableClaims._legacy ?? durableClaims : {}))
+        .filter(([claim]) => ["cursor-accept", "pr-ready"].includes(claim))
+        .map(([claim, event]) => ({ ...event, claim, ev: event.ok ? "claim-ok" : "claim-false" })),
+    ];
+    const cursorAccept = headRefOid && signalClaims.findLast((event) => event.ev === "claim-ok"
       && event.claim === "cursor-accept"
       && event.head?.toLowerCase() === headRefOid
       && event.actualHead?.toLowerCase() === headRefOid);
-    const prReady = headRefOid && claims.findLast((event) => event.ev === "claim-ok"
+    const prReady = headRefOid && signalClaims.findLast((event) => event.ev === "claim-ok"
       && event.claim === "pr-ready"
       && event.head?.toLowerCase() === headRefOid
       && event.actualHead?.toLowerCase() === headRefOid
@@ -1308,20 +1349,26 @@ export async function verify(key, check = checkSignal) {
   return `${ok ? "VERIFIED_DONE" : "NOT_DONE"} ${key}: ${evidence}`;
 }
 
+let retryNotDoneCursor = null;
+
 export async function retryNotDoneTasks(dbHandle = db, verifyTask = verify) {
-  const tasks = dbHandle.query("SELECT key,done FROM tasks WHERE status='not-done' AND completion_claimed=1").all();
-  const events = [];
-  for (const task of tasks) {
+  const tasks = dbHandle.query("SELECT key,done FROM tasks WHERE status='not-done' AND completion_claimed=1 ORDER BY key").all();
+  if (!tasks.length) {
+    retryNotDoneCursor = null;
+    return [];
+  }
+  const start = retryNotDoneCursor === null ? 0 : Math.max(0, tasks.findIndex((task) => task.key > retryNotDoneCursor));
+  const batch = Array.from({ length: Math.min(3, tasks.length) }, (_, index) => tasks[(start + index) % tasks.length]);
+  retryNotDoneCursor = batch.at(-1).key;
+  return Promise.all(batch.map(async (task) => {
     try {
       const signals = task.done.split(";").map((signal) => signal.trim()).filter(Boolean);
-      if (!signals.length || !signals.every((signal) => /^pr:[\w.-]+\/[\w.-]+#\d+$/.test(signal))) continue;
-      const result = await verifyTask(task.key);
-      events.push(result);
+      if (!signals.length || !signals.every((signal) => /^pr:[\w.-]+\/[\w.-]+#\d+$/.test(signal))) return null;
+      return await verifyTask(task.key);
     } catch (error) {
-      events.push(`VERIFY_RETRY_ERROR ${task.key} ${String(error?.message ?? error).slice(0, 160)}`);
+      return `VERIFY_RETRY_ERROR ${task.key} ${String(error?.message ?? error).slice(0, 160)}`;
     }
-  }
-  return events;
+  })).then((events) => events.filter(Boolean));
 }
 
 export async function track(key, cat, done, title) {
@@ -1519,18 +1566,22 @@ async function watch(intervalSec = 30) {
         try {
         const sig = JSON.stringify({ state: r.state, doneKey: r.done?.key ?? "", doneKind: r.done?.kind ?? "", doneText: r.done?.text ?? "", readyLine: r.readyLine ?? "", readyHead: r.ready?.head ?? "", claimText: r.claimText ?? "", questionText: r.questionText ?? "" });
         const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
-        if (previous && last.get(r.id) !== sig) {
-          if (r.state !== previous.state && r.id !== "omonyang") console.log(`FLEET_STATE ${r.id} ${previous.state} -> ${r.state}`);
-          const doneChanged = r.id !== "omonyang" && r.done && (r.done.key !== previous.doneKey || r.done.kind !== previous.doneKind);
-          const readyChanged = r.ready && r.ready.head !== previous.readyHead;
-          const readyLineChanged = r.readyLine && r.readyLine !== previous.readyLine;
-          const claimTextChanged = r.claimText && r.claimText !== previous.claimText;
+        if (!previous || last.get(r.id) !== sig) {
+          if (previous && r.state !== previous.state && r.id !== "omonyang") console.log(`FLEET_STATE ${r.id} ${previous.state} -> ${r.state}`);
+          const doneChanged = r.id !== "omonyang" && r.done
+            && (!previous || r.done.key !== previous.doneKey || r.done.kind !== previous.doneKind);
+          const readyChanged = r.ready && (!previous || r.ready.head !== previous.readyHead);
+          const readyLineChanged = r.readyLine && (!previous || r.readyLine !== previous.readyLine);
+          const claimTextChanged = r.claimText && (!previous || r.claimText !== previous.claimText);
           if (doneChanged) {
             console.log(`FLEET_TASK_${r.done.kind} ${r.id} ${r.done.key} ${r.done.text}`);
             if (r.done.kind === "BLOCKED") markTaskBlocked(r.done.key, r.done.text);
             else {
-              db.query("UPDATE tasks SET status='done-claimed', result=?, completion_claimed=1 WHERE key=?").run(r.done.text, r.done.key);
-              log(r.done.key, { ev: "done-claimed", text: r.done.text });
+              const currentTask = db.query("SELECT status FROM tasks WHERE key=?").get(r.done.key);
+              if (currentTask?.status !== "verified-done") {
+                db.query("UPDATE tasks SET status='done-claimed', result=?, completion_claimed=1 WHERE key=?").run(r.done.text, r.done.key);
+                log(r.done.key, { ev: "done-claimed", text: r.done.text });
+              }
             }
           }
           if (doneChanged || readyChanged || readyLineChanged || claimTextChanged) {
