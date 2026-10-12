@@ -7,7 +7,7 @@ import { join } from "node:path";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, verify, verifyClaims } = await import("./fleet.mjs");
+const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -153,7 +153,7 @@ async function runRawUtf8Dispatch() {
   }
 }
 
-async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", fleetEnv = {}, waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
   const state = join(home, ".local", "state", "omonyang");
   const bin = join(home, "bin");
@@ -201,6 +201,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
 
   const env = {
     ...process.env,
+    ...fleetEnv,
     HOME: home,
     PATH: `${bin}:${process.env.PATH}`,
     HERDR_LOG: herdrLog,
@@ -260,6 +261,10 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     const herdrCalls = existsSync(herdrLog) ? readFileSync(herdrLog, "utf8").trim().split("\n") : [];
     const stored = new Database(dbPath);
     const storedTaskStatus = taskKey ? stored.query("SELECT status FROM tasks WHERE key=?").get(taskKey)?.status : null;
+    const storedTaskHistory = taskKey
+      ? JSON.parse(stored.query("SELECT history FROM tasks WHERE key=?").get(taskKey)?.history || "[]")
+      : [];
+    const storedCatPane = stored.query("SELECT pane FROM cats WHERE id='crm'").get()?.pane ?? null;
     const reservationLeft = taskKey ? Boolean(stored.query("SELECT key FROM dispatch_reservations WHERE key=?").get(taskKey)) : false;
     stored.close();
     return {
@@ -267,6 +272,8 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
       stderr,
       exitCode,
       taskStatus: storedTaskStatus,
+      taskHistory: storedTaskHistory,
+      catPane: storedCatPane,
       reservationLeft,
       ghCalls: existsSync(ghLog) ? readFileSync(ghLog, "utf8").trim().split("\n") : [],
       herdrCalls,
@@ -291,6 +298,89 @@ async function runWatchCycle(options = {}) {
 async function runFleetBoard(options = {}) {
   return runFleetCommand({ ...options, command: ["board"] });
 }
+
+describe("fleet configuration", () => {
+  it("loads pane defaults into init and applies the documented environment overrides", async () => {
+    const defaults = JSON.parse(readFileSync(new URL("./fleet.config.json", import.meta.url), "utf8"));
+    const config = resolveFleetConfig(defaults, {
+      FLEET_CAT_CRM_PANE: "w9:p4",
+      FLEET_SLACK_REVIEW_CHANNEL: "C_TEST",
+      FLEET_CURSOR_USER_ID: "U_TEST",
+      FLEET_REVIEW_REPLY_APP_ID: "A_TEST",
+      FLEET_AGENT_MESSENGER_CREDENTIAL_PATH: "/tmp/credential-manager.js",
+    });
+    expect(config.cats.find((cat) => cat.id === "crm").pane).toBe("w9:p4");
+    expect(config.slack).toEqual({
+      reviewChannel: "C_TEST",
+      cursorUserId: "U_TEST",
+      reviewReplyAppId: "A_TEST",
+    });
+    expect(config.agentMessengerCredentialPath).toBe("/tmp/credential-manager.js");
+    const panes = Object.fromEntries(defaults.cats.map((cat) => [cat.id, cat.pane]));
+    expect(panes).toMatchObject({
+      omonyang: "w3:p2",
+      gajae: "w2:p1",
+      jarvis: "w5:p1",
+      sb: "w5:p2",
+      price: "w5:p3",
+      crm: "w5:p4",
+      mail: "w5:p5",
+      omodev: "-",
+      jarvis2: "-",
+    });
+    expect(defaults.agentMessengerCredentialPath.startsWith("/")).toBe(true);
+
+    const initialized = await runFleetCommand({
+      command: ["init"],
+      fleetEnv: { FLEET_CAT_CRM_PANE: "w9:p4" },
+    });
+    expect(initialized.exitCode).toBe(0);
+    expect(initialized.catPane).toBe("w9:p4");
+  });
+});
+
+describe("fleet model-switch waits", () => {
+  it("advances only after the picker, catalog, and selected model appear", async () => {
+    let stage = 0;
+    const calls = [];
+    const screen = () => [
+      "Idle\n⚡ claude-haiku:off\n❯",
+      "Idle\n⚡ claude-haiku:off\n❯ /model",
+      "Select model\n→ claude-sonnet [anthropic]\n❯",
+      "Select model\n→ claude-sonnet [anthropic]\n❯",
+      "Idle\n⚡ claude-sonnet:high\n❯",
+    ][stage];
+    const runCommand = async (argv) => {
+      calls.push(argv);
+      if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
+      if (argv[2] === "send-text" && argv[4] === "/model") stage = 1;
+      else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 1) stage = 2;
+      else if (argv[2] === "send-text" && argv[4] === "claude-sonnet") stage = 3;
+      else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 3) stage = 4;
+      return { exitCode: 0, stdout: "" };
+    };
+    const result = await switchModel("w-model:p1", {
+      provider: "anthropic",
+      model: "claude-sonnet",
+      thinking: "high",
+    }, runCommand, 1000);
+    expect(result).toBe("MODEL_SWITCHED claude-haiku:off -> anthropic/claude-sonnet");
+    expect(calls.filter((argv) => argv[2] === "send-text").map((argv) => argv[4])).toEqual(["/model", "claude-sonnet"]);
+    expect(calls.filter((argv) => argv[2] === "send-keys").map((argv) => argv[4])).toEqual(["Enter", "Enter"]);
+  });
+
+  it("returns a distinct timeout when the picker screen never appears", async () => {
+    const result = await switchModel("w-timeout:p1", {
+      provider: "anthropic",
+      model: "claude-sonnet",
+      thinking: "high",
+    }, async (argv) => ({
+      exitCode: 0,
+      stdout: argv[2] === "read" ? "Idle\n⚡ claude-haiku:off\n❯" : "",
+    }), 0);
+    expect(result).toBe("MODEL_SWITCH_TIMEOUT w-timeout:p1 phase=picker-open");
+  });
+});
 
 describe("fleet dependency dispatch", () => {
   it("waits for verified predecessor and idle pane, then dispatches exactly once", async () => {
@@ -967,6 +1057,61 @@ describe("fleet dispatch reservations", () => {
     expect(result).toContain("DISPATCH_OK blocked-release-cat AFTER-BLOCKED");
   });
 
+  it("closes a task with a required reason and releases its active pane", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "closed-release-prompt.txt");
+    writeFileSync(prompt, "dispatch after a closed task\n");
+    db.query("INSERT INTO cats(id,name,pane,task) VALUES('closed-release-cat','Closed Release','w-closed:p1','CLOSED-OLD')").run();
+    db.query("INSERT INTO tasks(key,cat,status) VALUES('CLOSED-OLD','closed-release-cat','working')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('w-closed:p1','CLOSED-OLD','attempt-closed')").run();
+    db.close();
+
+    expect(markTaskClosed("CLOSED-OLD", "owner closed stale acloud task"))
+      .toBe("FLEET_TASK_CLOSED CLOSED-OLD reason=owner closed stale acloud task");
+    expect(markTaskClosed("CLOSED-OLD", "")).toBe("FLEET_TASK_CLOSE_ERROR CLOSED-OLD reason_required");
+    const stored = unitDb();
+    expect(stored.query("SELECT status,result FROM tasks WHERE key='CLOSED-OLD'").get())
+      .toEqual({ status: "closed", result: "owner closed stale acloud task" });
+    expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-closed:p1'").get()).toBeNull();
+    expect(stored.query("SELECT task FROM cats WHERE id='closed-release-cat'").get().task).toBeNull();
+    expect(JSON.parse(stored.query("SELECT history FROM tasks WHERE key='CLOSED-OLD'").get().history)
+      .some((event) => event.ev === "closed" && event.reason === "owner closed stale acloud task")).toBe(true);
+    stored.close();
+
+    let reads = 0;
+    const dispatched = await dispatch("closed-release-cat", "AFTER-CLOSED", prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async (argv) => ({
+        exitCode: 0,
+        stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+      }),
+    });
+    expect(dispatched).toContain("DISPATCH_OK closed-release-cat AFTER-CLOSED");
+  });
+
+  it("exposes manual close through the fleet command", async () => {
+    const result = await runFleetCommand({
+      catTask: "CLOSE-VIA-CLI",
+      taskStatus: "working",
+      command: ["close", "CLOSE-VIA-CLI", "owner", "closed", "stale", "task"],
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toContain("FLEET_TASK_CLOSED CLOSE-VIA-CLI reason=owner closed stale task");
+    expect(result.taskStatus).toBe("closed");
+    expect(result.taskHistory.some((event) => event.ev === "closed" && event.reason === "owner closed stale task")).toBe(true);
+  });
+
+  it("does not treat a closed task as a prior unresolved track", async () => {
+    const db = unitDb();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('closed-track-cat','Closed Track','w-closed-track:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,result) VALUES('CLOSED-TRACK-OLD','closed-track-cat','closed','owner closed it')").run();
+    expect(await track("AFTER-CLOSED-TRACK", "closed-track-cat", "cmd:true", "new work"))
+      .toBe("TRACKED_UNCONFIRMED AFTER-CLOSED-TRACK on closed-track-cat");
+    expect(db.query("SELECT status FROM tasks WHERE key='AFTER-CLOSED-TRACK'").get().status).toBe("tracked-unconfirmed");
+    db.close();
+  });
+
   it("releases a prompt-lost task reservation so the pane can take a new dispatch", async () => {
     const db = unitDb();
     const prompt = join(unitHome, "prompt-lost-release-prompt.txt");
@@ -1263,6 +1408,34 @@ describe("fleet completion claim verification", () => {
       stdout: JSON.stringify({ state: "MERGED", headRefOid: "short", mergeCommit: { oid: "short" } }),
     }));
     expect(failed).toMatchObject({ ok: false, headRefOid: undefined, mergeCommit: undefined });
+  });
+
+  it("records bounded, deduplicated context for swallowed PR and Slack errors", async () => {
+    const lines = [];
+    const originalLog = console.log;
+    const head = "abcdef0123456789abcdef0123456789abcdef01";
+    const task = {
+      key: "VERIFY-ERROR-LOG",
+      sent_at: "2026-10-12T10:00:00.000Z",
+      done: "pr:owner/repo#97",
+    };
+    console.log = (...args) => lines.push(args.join(" "));
+    try {
+      const failHead = async () => { throw new Error("g".repeat(200)); };
+      await verifyClaims(`Cursor ACCEPT head=${head.slice(0, 8)}`, task, { getPrHead: failHead });
+      await verifyClaims(`Cursor ACCEPT head=${head.slice(0, 8)}`, task, { getPrHead: failHead });
+      await verifyClaims(`Cursor ACCEPT head=${head.slice(0, 8)}`, task, {
+        getPrHead: async () => head,
+        slackHasHead: async () => { throw new Error("Slack request timeout"); },
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    const headErrors = lines.filter((line) => line.startsWith("FLEET_PR_HEAD_VERIFY_ERROR signal=pr:owner/repo#97 "));
+    expect(headErrors).toHaveLength(1);
+    const errorPrefix = "FLEET_PR_HEAD_VERIFY_ERROR signal=pr:owner/repo#97 ";
+    expect(headErrors[0].slice(errorPrefix.length)).toHaveLength(120);
+    expect(lines.some((line) => line === "FLEET_SLACK_ACCEPT_CHECK_ERROR signal=pr:owner/repo#97 Slack request timeout")).toBe(true);
   });
 
   it("rejects unsupported and credential-bearing curl URLs without executing them", async () => {
@@ -2109,25 +2282,34 @@ describe("fleet question policy", () => {
     expect(classified.questionText).toBe("Can I use the staging account password?");
     expect(questionPolicy(classified.questionText)).toBeNull();
     expect(questionPolicy("May I use the production auth account?")?.id).toBe("production-auth-prohibited");
+    expect(questionPolicy("Should we use the production auth account for this one?")).toBeNull();
+    expect(questionPolicy("May I use Jaemin's password or OTP now? before the release?")).toBeNull();
   });
 
-  it("keeps unanswered words inside the question instead of treating them as status markers", async () => {
+  it("keeps unanswered words inside a near-miss question and does not auto-answer it", async () => {
     const question = "May I use the production auth account for this unanswered issue?";
     const classified = classify(`Question pending\n${question}\n❯`);
     expect(classified.state).toBe("question");
     expect(classified.questionText).toBe(question);
-    expect(questionPolicy(classified.questionText)?.id).toBe("production-auth-prohibited");
+    expect(questionPolicy(classified.questionText)).toBeNull();
 
     const result = await runWatchCycle({
       catTask: "Q-UNANSWERED-WORD",
       paneScreen: `Question pending\n${question}\n❯`,
     });
-    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-UNANSWERED-WORD policy=production-auth-prohibited");
-    expect(result.herdrWrites).toEqual([
-      "pane send-text w6:p1 운영 인증 계정은 사용하지 마.",
-      "pane send-keys w6:p1 Enter",
-    ]);
+    expect(result.output).toContain("FLEET_QUESTION_NOTIFY owner=omonyang crm Q-UNANSWERED-WORD");
+    expect(result.herdrWrites).toEqual([]);
     expect(classify("This is still an unanswered issue\n❯").state).toBe("idle");
+  });
+
+  it("does not answer an exact allowlisted prompt unless the pane is in question state", async () => {
+    const calls = [];
+    const answered = await answerPaneQuestion("w6:p1", "Should we use the production auth account?", "Do not use it.", async (argv) => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: "Should we use the production auth account?\n❯" };
+    });
+    expect(answered).toBe(false);
+    expect(calls).toEqual([["herdr", "pane", "read", "w6:p1", "--source", "visible", "--format", "text"]]);
   });
 
   it("retries an allowlisted answer after a transient send failure", async () => {
@@ -2157,6 +2339,18 @@ describe("fleet question policy", () => {
     expect(calls).toEqual([["herdr", "pane", "read", "w6:p1", "--source", "visible", "--format", "text"]]);
   });
 
+  it("does not auto-answer near-miss policy prompts", async () => {
+    const question = "Should we use the production auth account for this unanswered issue?";
+    expect(questionPolicy(question)).toBeNull();
+    const result = await runWatchCycle({
+      catTask: "Q-NEAR-MISS",
+      paneScreen: `Question pending\n${question}\n❯`,
+    });
+    expect(result.output).toContain("FLEET_QUESTION_NOTIFY owner=omonyang crm Q-NEAR-MISS");
+    expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
+    expect(result.herdrWrites).toEqual([]);
+  });
+
   it("defers personal password or OTP use and answers through the fake pane", async () => {
     const result = await runWatchCycle({
       catTask: "Q-PERSONAL",
@@ -2175,6 +2369,10 @@ describe("fleet question policy", () => {
       paneScreen: "Question pending\nShould we use the production auth account?\n❯",
     });
     expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-PRODUCTION policy=production-auth-prohibited");
+    expect(result.output).toContain("FLEET_AUTO_ANSWER crm Q-PRODUCTION policy=production-auth-prohibited");
+    expect(result.taskHistory.some((event) => event.ev === "question-auto-answer" && event.policy === "production-auth-prohibited")).toBe(true);
+    expect(result.output).toContain("FLEET_AUTO_ANSWER crm Q-PRODUCTION policy=production-auth-prohibited");
+    expect(result.taskHistory.some((event) => event.ev === "question-auto-answer" && event.policy === "production-auth-prohibited")).toBe(true);
     expect(result.herdrWrites).toEqual([
       "pane send-text w6:p1 운영 인증 계정은 사용하지 마.",
       "pane send-keys w6:p1 Enter",
@@ -2192,6 +2390,17 @@ describe("fleet question policy", () => {
 });
 
 describe("fleet text board", () => {
+  it("omits closed PR tasks from active board review lists", async () => {
+    const board = await runFleetBoard({
+      catTask: "CLOSED-PR",
+      taskStatus: "closed",
+      prDone: "pr:whelp99-code/jm-omo#78",
+    });
+    expect(board.exitCode).toBe(0);
+    expect(board.output).not.toContain("#78 OPEN draft");
+    expect(board.output).not.toContain("FLEET_BUGBOT_LIMIT CLOSED-PR");
+  });
+
   it("persists unknown cat state after a pane read failure", async () => {
     const result = await runFleetCommand({
       catState: "working",

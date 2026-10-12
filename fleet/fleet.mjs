@@ -69,13 +69,40 @@ export function migrateFleetColumns(dbHandle) {
 migrateFleetColumns(db);
 
 const now = () => new Date().toISOString();
+const reportedFleetErrors = new Set();
+function fleetError(kind, context, error) {
+  const message = String(error?.message ?? error ?? "unknown error").replace(/\s+/g, " ").slice(0, 120);
+  const line = `FLEET_${kind}_ERROR ${context} ${message || "unknown error"}`;
+  if (reportedFleetErrors.has(line)) return;
+  reportedFleetErrors.add(line);
+  console.log(line);
+}
+
 const sh = async (cmd) => (await Bun.$`bash -c ${cmd}`.nothrow().quiet()).stdout.toString();
 const read = (pane) => sh(`herdr pane read ${pane} --source visible --format text 2>/dev/null`);
 const readPaneResult = (pane) => executeSignalCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
 const ROUTES = JSON.parse(await Bun.file(new URL("./routes.json", import.meta.url)).text());
-const CURSOR_USER_ID = "U0B81F5GR6V";
-const SLACK_REVIEW_CHANNEL = "C0C6HJM0BV5";
-const REVIEW_REPLY_APP_ID = "A08SKDT6QUW";
+export function resolveFleetConfig(config, env = process.env) {
+  return {
+    ...config,
+    cats: config.cats.map((cat) => {
+      const envKey = `FLEET_CAT_${cat.id.replace(/[^a-z0-9]/gi, "_").toUpperCase()}_PANE`;
+      return { ...cat, pane: env[envKey] || cat.pane };
+    }),
+    slack: {
+      ...config.slack,
+      reviewChannel: env.FLEET_SLACK_REVIEW_CHANNEL || config.slack.reviewChannel,
+      cursorUserId: env.FLEET_CURSOR_USER_ID || config.slack.cursorUserId,
+      reviewReplyAppId: env.FLEET_REVIEW_REPLY_APP_ID || config.slack.reviewReplyAppId,
+    },
+    agentMessengerCredentialPath: env.FLEET_AGENT_MESSENGER_CREDENTIAL_PATH
+      || config.agentMessengerCredentialPath,
+  };
+}
+const CONFIG = resolveFleetConfig(JSON.parse(await Bun.file(new URL("./fleet.config.json", import.meta.url)).text()));
+const CURSOR_USER_ID = CONFIG.slack.cursorUserId;
+const SLACK_REVIEW_CHANNEL = CONFIG.slack.reviewChannel;
+const REVIEW_REPLY_APP_ID = CONFIG.slack.reviewReplyAppId;
 const REVIEW_STALL_MS = 45 * 60 * 1000;
 const USAGE_ALERT_THRESHOLDS = { anthropic: 60, "chatgpt-subscription": 80 };
 const DISPATCH_RESERVATION_TTL_MS = 2 * 60_000;
@@ -87,19 +114,7 @@ function isQuestionStatusLine(line) {
   return /^\s*(?:Question pending|Unanswered)\s*$/i.test(String(line ?? ""));
 }
 
-const CATS = [
-  ["omonyang", "오모냥", "대장: 계획·배분·확인", "captain", "w3:p2", "-"],
-  ["nahee", "나희", "부대장: 대장 대행, 지원", "vice", "-", "-"],
-  ["seoyun", "서윤", "감시·Cursor 검수 전달", "bot", "-", "-"],
-  ["cursor", "Cursor 봇", "독립 검수(ACCEPT/REVISE)", "bot", "-", "-"],
-  ["gajae", "가재", "서버 이전·인프라 실행", "bot", "w2:p1", "-"],
-  ["jarvis", "JARVIS 냥", "JARVIS 개발", "pane", "-", "Orca-JARVIS"],
-  ["sb", "SB 냥", "Second Brain 개발", "pane", "-", "second-brain-app"],
-  ["crm", "CRM 냥", "CRM(core5) 개발", "pane", "-", "ai-crm-project-manager"],
-  ["price", "Price 냥", "Price 개발", "pane", "-", "price-ai-tax"],
-  ["mail", "Mail 냥", "Mail 개발", "pane", "-", "mail-intelligence"],
-  ["jarvis2", "JARVIS 보조 냥", "JARVIS 보조(압축 문제로 휴식)", "pane", "-", "Orca-JARVIS"],
-];
+const CATS = CONFIG.cats.map(({ id, name, role, kind, pane, product }) => [id, name, role, kind, pane, product]);
 
 export function classify(screen) {
   const L = screen.split("\n");
@@ -150,12 +165,12 @@ function responseBlock(screen) {
 const QUESTION_POLICIES = [
   {
     id: "personal-credentials-defer",
-    matches: /(?:재민|jae[\s-]?min)[\s\S]{0,60}(?:비밀번호|password|otp)|(?:비밀번호|password|otp)[\s\S]{0,60}(?:재민|jae[\s-]?min)/i,
+    matches: /^\s*(?:May I use|Can I use) Jaemin's password or OTP now\?\s*$/i,
     answer: "재민의 비밀번호나 OTP는 사용하지 말고 내일로 미뤄.",
   },
   {
     id: "production-auth-prohibited",
-    matches: /(?:운영|production)[\s\S]{0,40}(?:인증|auth(?:entication)?)[\s\S]{0,40}(?:계정|account)|(?:계정|account)[\s\S]{0,40}(?:운영|production)[\s\S]{0,40}(?:인증|auth(?:entication)?)/i,
+    matches: /^\s*(?:Should we use|May I use) the production auth account\?\s*$/i,
     answer: "운영 인증 계정은 사용하지 마.",
   },
 ];
@@ -236,6 +251,21 @@ export function markTaskBlocked(key, result) {
     db.query("UPDATE tasks SET status='blocked',result=? WHERE key=?").run(result, key);
     db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
     appendHistoryInTransaction(db, key, { ev: "blocked", text: result });
+  }).immediate();
+}
+
+export function markTaskClosed(key, reason) {
+  const detail = String(reason ?? "").trim();
+  if (!detail) return `FLEET_TASK_CLOSE_ERROR ${key || "-"} reason_required`;
+  return db.transaction(() => {
+    const task = db.query("SELECT status FROM tasks WHERE key=?").get(key);
+    if (!task) return `FLEET_TASK_CLOSE_ERROR ${key} task_not_found`;
+    if (task.status === "verified-done") return `FLEET_TASK_CLOSE_HOLD ${key} already_verified`;
+    db.query("UPDATE tasks SET status='closed',result=?,ended_at=? WHERE key=?").run(detail, now(), key);
+    db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
+    db.query("UPDATE cats SET task=NULL WHERE task=?").run(key);
+    appendHistoryInTransaction(db, key, { ev: "closed", reason: detail });
+    return `FLEET_TASK_CLOSED ${key} reason=${detail}`;
   }).immediate();
 }
 
@@ -521,7 +551,7 @@ async function refresh() {
   return out;
 }
 
-// Owner C0C6HJM0BV5:1791553182.735709: watch Claude/Codex usage so limits never stop development.
+// Owner via the configured review channel: watch Claude/Codex usage so limits never stop development.
 // Claude quota is shared with the captain, so cats only fall back to it while it is low.
 export function parseUsageTick(text) {
   const tick = String(text).split("\n").filter((line) => /\bUSAGE_TICK\b/.test(line)).at(-1);
@@ -548,7 +578,10 @@ export function usageLimitEvents(tick, previous = new Map()) {
 }
 
 async function usageTick() {
-  const usageText = await Bun.file(`${process.env.HOME}/.omo/omonyang/usage-watch.log`).text().catch(() => "");
+  const usageText = await Bun.file(`${process.env.HOME}/.omo/omonyang/usage-watch.log`).text().catch((error) => {
+    fleetError("USAGE_READ", "usage-watch.log", error);
+    return "";
+  });
   return parseUsageTick(usageText);
 }
 
@@ -567,38 +600,104 @@ async function pickModel(type) {
   return { ...ROUTES.cursorFallback, usage: u };
 }
 
-async function switchModel(pane, want) {
-  const before = classify(await read(pane)).model;
+function promptLineContains(screen, text) {
+  const input = String(screen).replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
+  return Boolean(input?.includes(text));
+}
+
+export async function waitForPaneScreen(pane, predicate, runCommand = executeSignalCommand, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const remaining = deadline - Date.now();
+    let result;
+    try {
+      result = await runCommand(
+        ["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"],
+        AbortSignal.timeout(Math.max(1, remaining)),
+      );
+    } catch (error) {
+      fleetError("PANE_WAIT", `pane=${pane}`, error);
+      return null;
+    }
+    if (result.exitCode === 0 && result.stdout.trim() && predicate(result.stdout)) return result.stdout;
+    if (Date.now() >= deadline) break;
+    await Bun.sleep(Math.max(0, Math.min(50, deadline - Date.now())));
+  }
+  return null;
+}
+
+export async function switchModel(pane, want, runCommand = executeSignalCommand, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  const initial = await runCommand(
+    ["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"],
+    AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+  );
+  if (initial.exitCode !== 0 || !initial.stdout.trim()) {
+    fleetError("MODEL_SWITCH_READ", `pane=${pane}`, `exit ${initial.exitCode}`);
+    return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (pane read failed)`;
+  }
+  const before = classify(initial.stdout).model;
   if (before.startsWith(want.model)) return `MODEL_OK ${want.model}`;
-  // Verified sequence: open the picker, wait for the catalog, type the bare model name, pick the first match.
-  await Bun.$`herdr pane send-text ${pane} /model`.nothrow().quiet();
-  await Bun.sleep(700);
-  await Bun.$`herdr pane send-keys ${pane} Enter`.nothrow().quiet();
-  await Bun.sleep(3500);
-  await Bun.$`herdr pane send-text ${pane} ${want.model}`.nothrow().quiet();
-  await Bun.sleep(1500);
-  const pick = await read(pane);
-  if (!new RegExp(`\u2192\\s+${want.model.replace(/\./g, "\\.")} \\[${want.provider}\\]`).test(pick)) {
-    await Bun.$`herdr pane send-keys ${pane} Escape`.nothrow().quiet();
-    return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (not first in picker)`;
+  const send = async (step, argv) => {
+    try {
+      const result = await runCommand(argv, AbortSignal.timeout(Math.max(1, deadline - Date.now())));
+      if (result.exitCode === 0) return true;
+      fleetError("MODEL_SWITCH_COMMAND", `pane=${pane} step=${step}`, `exit ${result.exitCode}`);
+      return false;
+    } catch (error) {
+      fleetError("MODEL_SWITCH_COMMAND", `pane=${pane} step=${step}`, error);
+      return false;
+    }
+  };
+  const wait = (predicate) => waitForPaneScreen(pane, predicate, runCommand, Math.max(0, deadline - Date.now()));
+  const timeout = (phase) => {
+    fleetError("MODEL_SWITCH_TIMEOUT", `pane=${pane} phase=${phase}`, "screen predicate not reached");
+    return `MODEL_SWITCH_TIMEOUT ${pane} phase=${phase}`;
+  };
+  const clearPickerInput = async () => {
+    await send("escape", ["herdr", "pane", "send-keys", pane, "Escape"]);
+    await send("clear", ["herdr", "pane", "send-keys", pane, "ctrl+u"]);
+  };
+  if (!await send("open-picker", ["herdr", "pane", "send-text", pane, "/model"])) {
+    return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (picker command failed)`;
   }
-  await Bun.$`herdr pane send-keys ${pane} Enter`.nothrow().quiet();
-  let after = "";
-  for (let i = 0; i < 8; i++) {
-    await Bun.sleep(2000);
-    after = classify(await read(pane)).model;
-    if (after.startsWith(want.model)) break;
+  if (!await wait((screen) => promptLineContains(screen, "/model"))) {
+    await clearPickerInput();
+    return timeout("picker-open");
   }
-  if (!after.startsWith(want.model)) {
-    await Bun.$`herdr pane send-keys ${pane} Escape`.nothrow().quiet();
-    await Bun.sleep(300);
-    await Bun.$`herdr pane send-keys ${pane} ctrl+u`.nothrow().quiet();
-    return `MODEL_SWITCH_FAILED ${pane} want=${want.model} now=${after}`;
+  if (!await send("submit-picker-command", ["herdr", "pane", "send-keys", pane, "Enter"])) {
+    await clearPickerInput();
+    return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (picker submit failed)`;
   }
-  if (want.thinking && !after.endsWith(`:${want.thinking}`)) {
-    await Bun.$`herdr pane send-text ${pane} ${`/thinking ${want.thinking}`}`.nothrow().quiet();
-    await Bun.sleep(700);
-    await Bun.$`herdr pane send-keys ${pane} Enter`.nothrow().quiet();
+  if (!await wait((screen) => classify(screen).state === "model-picker")) {
+    await clearPickerInput();
+    return timeout("catalog");
+  }
+  if (!await send("filter-model", ["herdr", "pane", "send-text", pane, want.model])) {
+    await clearPickerInput();
+    return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (model filter failed)`;
+  }
+  const pick = await wait((screen) => screen.split(/\r?\n/).some((line) =>
+    line.includes(want.model) && line.includes(`[${want.provider}]`)));
+  if (!pick) {
+    await clearPickerInput();
+    return timeout("model-row");
+  }
+  if (!await send("select-model", ["herdr", "pane", "send-keys", pane, "Enter"])) {
+    return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (model selection failed)`;
+  }
+  let after = await wait((screen) => classify(screen).model.startsWith(want.model));
+  if (!after) return timeout("model-change");
+  if (want.thinking && !classify(after).model.endsWith(`:${want.thinking}`)) {
+    if (!await send("set-thinking", ["herdr", "pane", "send-text", pane, `/thinking ${want.thinking}`])) {
+      return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (thinking command failed)`;
+    }
+    if (!await wait((screen) => promptLineContains(screen, `/thinking ${want.thinking}`))) return timeout("thinking-command");
+    if (!await send("submit-thinking", ["herdr", "pane", "send-keys", pane, "Enter"])) {
+      return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (thinking submit failed)`;
+    }
+    after = await wait((screen) => classify(screen).model.endsWith(`:${want.thinking}`));
+    if (!after) return timeout("thinking-change");
   }
   return `MODEL_SWITCHED ${before} -> ${want.provider}/${want.model}`;
 }
@@ -608,7 +707,10 @@ export async function fetchSlackThreadReplies(roots, fetchThread, signal, concur
   for (let offset = 0; offset < roots.length; offset += concurrency) {
     if (signal.aborted) return null;
     const batch = await Promise.all(roots.slice(offset, offset + concurrency).map(async (root) => {
-      try { return await fetchThread(root, signal); } catch { return null; }
+      try { return await fetchThread(root, signal); } catch (error) {
+        fleetError("SLACK_THREAD", `root=${root.ts}`, error);
+        return null;
+      }
     }));
     if (batch.some((thread) => thread === null)) return null;
     replies.push(...batch.flat());
@@ -626,9 +728,8 @@ export function slackHistoryParams(since) {
 
 async function slackHistory(since) {
   const deadline = AbortSignal.timeout(SLACK_HISTORY_TIMEOUT_MS);
-  const nodeRoot = await commandOutput("npm", ["root", "-g"], process.cwd(), deadline);
-  if (!nodeRoot || deadline.aborted) return null;
-  const credentialPath = join(nodeRoot, "agent-messenger/dist/src/platforms/slackbot/credential-manager.js");
+  const credentialPath = CONFIG.agentMessengerCredentialPath;
+  if (!credentialPath || deadline.aborted) return null;
   const { SlackBotCredentialManager } = await import(credentialPath);
   const credentials = new SlackBotCredentialManager().getCredentials();
   const creds = await Promise.race([
@@ -832,7 +933,8 @@ export async function reviewStallEvents(nowMs, alerted, fetchMessages = slackHis
   let messages;
   try {
     messages = await fetchMessages(since);
-  } catch {
+  } catch (error) {
+    fleetError("SLACK_REVIEW_STALL", `since=${since}`, error);
     return [];
   }
   if (!messages) return [];
@@ -848,7 +950,10 @@ export async function pollReviewStalls(dbHandle, nowMs = Date.now(), fetchMessag
   const cursor = dbHandle.query("SELECT value FROM fleet_state WHERE key='slack-review-cursor'").get()?.value
     ?? ((nowMs - SLACK_HISTORY_BOOTSTRAP_DAYS * 24 * 60 * 60_000) / 1000).toFixed(6);
   let messages;
-  try { messages = await fetchMessages(cursor); } catch { return []; }
+  try { messages = await fetchMessages(cursor); } catch (error) {
+    fleetError("SLACK_REVIEW_POLL", `cursor=${cursor}`, error);
+    return [];
+  }
   if (!messages) return [];
   const requests = messages.filter(isReviewRequest);
   for (const request of requests) {
@@ -895,9 +1000,13 @@ async function pullRequestHead(prSignal, abortSignal = AbortSignal.timeout(10000
   if (!pr) return null;
   try {
     const result = await runCommand(["gh", "pr", "view", pr.prNumber, "--repo", pr.repo, "--json", "headRefOid"], abortSignal);
-    if (result.exitCode !== 0) return null;
+    if (result.exitCode !== 0) {
+      fleetError("PR_HEAD", `signal=${prSignal}`, `gh exited ${result.exitCode}`);
+      return null;
+    }
     return JSON.parse(result.stdout).headRefOid ?? null;
-  } catch {
+  } catch (error) {
+    fleetError("PR_HEAD", `signal=${prSignal}`, error);
     return null;
   }
 }
@@ -911,10 +1020,14 @@ async function checkRunsForHead(repo, head, abortSignal = AbortSignal.timeout(10
       signal: abortSignal,
     });
     const [text, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    if (exitCode !== 0) return null;
+    if (exitCode !== 0) {
+      fleetError("PR_CHECK_RUNS", `repo=${repo} head=${head.slice(0, 12)}`, `gh exited ${exitCode}`);
+      return null;
+    }
     const data = JSON.parse(text);
     return Array.isArray(data.check_runs) ? data.check_runs : [];
-  } catch {
+  } catch (error) {
+    fleetError("PR_CHECK_RUNS", `repo=${repo} head=${head.slice(0, 12)}`, error);
     return null;
   }
 }
@@ -945,7 +1058,9 @@ export async function bugbotLimitEvents(dbHandle, previous, getCheckRuns = pullR
       for (const signal of task.done.split(";").map((part) => part.trim())) {
         if (parsePullRequestSignal(signal) && !targets.has(signal)) targets.set(signal, task.key);
       }
-    } catch {}
+    } catch (error) {
+      fleetError("BUGBOT_TASK", `task=${task.key}`, error);
+    }
   }
   const events = [];
   const entries = [...targets];
@@ -962,7 +1077,8 @@ export async function bugbotLimitEvents(dbHandle, previous, getCheckRuns = pullR
         return limited && !wasLimited
           ? `FLEET_BUGBOT_LIMIT ${taskKey} ${signal.slice(3)} head=${result.head.slice(0, 7)} reason=usage_limit_reached`
           : null;
-      } catch {
+      } catch (error) {
+        fleetError("BUGBOT_LOOKUP", `task=${taskKey} signal=${signal}`, error);
         return null;
       }
     }));
@@ -997,7 +1113,9 @@ export async function verifyClaims(text, task, checks = {}) {
     try {
       const head = await getPrHead(signal);
       if (typeof head === "string" && /^[a-f0-9]{40}$/i.test(head)) actualHead = head.toLowerCase();
-    } catch {}
+    } catch (error) {
+      fleetError("PR_HEAD_VERIFY", `signal=${signal}`, error);
+    }
     heads.set(signal, actualHead);
     return actualHead;
   };
@@ -1017,7 +1135,9 @@ export async function verifyClaims(text, task, checks = {}) {
       : null;
     let ok = false;
     if (normalizedHead && task?.sent_at) {
-      try { ok = await checkSlackHead(normalizedHead, task.sent_at, pr); } catch {}
+      try { ok = await checkSlackHead(normalizedHead, task.sent_at, pr); } catch (error) {
+        fleetError("SLACK_ACCEPT_CHECK", `signal=${signal ?? "unknown"}`, error);
+      }
     }
     results.push({
       kind: "cursor-accept",
@@ -1069,10 +1189,11 @@ function queueDispatch(catId, key, prompt, options, reason) {
 }
 
 // Verified send (Dori panes.ts idea): only into an idle agent prompt, one send, then confirm the agent actually started.
-export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after = "", runCommand = executeSignalCommand, sleep = Bun.sleep, switchPaneModel = switchModel } = {}) {
+export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after = "", runCommand = executeSignalCommand, sleep = Bun.sleep, switchPaneModel } = {}) {
   if (typeof key !== "string" || !key.trim()) throw new Error("INVALID_TASK_KEY");
   const c = db.query("SELECT * FROM cats WHERE id=?").get(catId);
   if (!c || c.pane === "-") throw new Error(`cat ${catId} has no pane`);
+  const applyPaneModel = switchPaneModel ?? ((pane, want) => switchModel(pane, want, runCommand));
   const paneRead = async () => runCommand(["herdr", "pane", "read", c.pane, "--source", "visible", "--format", "text"]);
   let existing = db.query("SELECT cat,status FROM tasks WHERE key=?").get(key);
   if (existing?.status === "dispatching") {
@@ -1098,7 +1219,7 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     if (existing && (existing.cat !== catId || !["waiting", "dispatch-interrupted", "dispatch-error", "dispatch-held", "dispatch-failed-before-send"].includes(existing.status))) return { hold: "duplicate-key" };
     if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)) return { hold: "pane-reserved" };
     const active = db.query(`SELECT t.key FROM tasks t JOIN cats c ON c.id=t.cat
-      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
+      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','closed','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
     if (active) return { hold: "prior-task-unresolved" };
     const attempt = crypto.randomUUID();
     const model = want ? `${want.provider}/${want.model}:${want.thinking}` : "kept";
@@ -1132,11 +1253,13 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
       try {
         db.query("UPDATE dispatch_reservations SET reserved_at=? WHERE pane=? AND key=? AND attempt=? AND recovery_token IS NULL")
           .run(now(), c.pane, key, attempt);
-      } catch {}
+      } catch (error) {
+        fleetError("DISPATCH_LEASE_HEARTBEAT", `task=${key} attempt=${attempt}`, error);
+      }
     }, 30_000);
     leaseHeartbeat.unref?.();
-    const modelNote = keepModel ? "MODEL_KEPT" : await switchPaneModel(c.pane, want);
-    if (modelNote.startsWith("MODEL_SWITCH_FAILED")) {
+    const modelNote = keepModel ? "MODEL_KEPT" : await applyPaneModel(c.pane, want);
+    if (modelNote.startsWith("MODEL_SWITCH_FAILED") || modelNote.startsWith("MODEL_SWITCH_TIMEOUT")) {
       if (!releaseUnsent("dispatch-held")) return `DISPATCH_HOLD ${catId} reservation-expired; not sent`;
       return modelNote;
     }
@@ -1174,7 +1297,8 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     }
     log(key, { ev: "unconfirmed", attempt });
     return `DISPATCH_UNCONFIRMED ${catId} ${key}: no Working within 60s (watch keeps checking)`;
-  } catch {
+  } catch (error) {
+    fleetError("DISPATCH", `task=${key} attempt=${attempt}`, error);
     if (sendAttempted) {
       if (enterAttempted) {
         for (let i = 0; i < 12; i++) {
@@ -1192,7 +1316,10 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
           if (i < 11) await sleep(5000);
         }
       }
-      const released = await reconcileFailedDispatch(db, { pane: c.pane, key, attempt }, paneRead, runCommand).catch(() => false);
+      const released = await reconcileFailedDispatch(db, { pane: c.pane, key, attempt }, paneRead, runCommand).catch((error) => {
+        fleetError("DISPATCH_RECONCILE", `task=${key} attempt=${attempt}`, error);
+        return false;
+      });
       if (!released) {
         db.query("UPDATE tasks SET status='send-failed-unconfirmed' WHERE key=?").run(key);
         log(key, { ev: "send-failed-unconfirmed", attempt });
@@ -1232,7 +1359,9 @@ export async function dispatchWaitingTasks(dbHandle, paneRows, dispatchTask = di
         const current = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(task.key);
         const status = current?.status === "waiting" ? "dispatch-error" : "send-failed-unconfirmed";
         dbHandle.query("UPDATE tasks SET status=?,result=? WHERE key=?").run(status, detail, task.key);
-        try { logOn(dbHandle, task.key, { ev: status, detail }); } catch {}
+        try { logOn(dbHandle, task.key, { ev: status, detail }); } catch (error) {
+          fleetError("DISPATCH_HISTORY", `task=${task.key}`, error);
+        }
         events.push(`FLEET_DISPATCH_ERROR ${task.key} ${detail}`);
       } catch (recordError) {
         events.push(`FLEET_DISPATCH_ERROR ${task.key} ${detail}; record failed: ${String(recordError?.message ?? recordError).slice(0, 100)}`);
@@ -1259,7 +1388,10 @@ export async function checkSignal(sig, runCommand = executeSignalCommand) {
   if ((m = sig.match(/^pr:([\w.-]+\/[\w.-]+)#(\d+)$/))) {
     const command = await runCommand(["gh", "pr", "view", m[2], "--repo", m[1], "--json", "state,mergeCommit,headRefOid"]);
     let j = {};
-    try { j = JSON.parse(command.stdout || "{}"); } catch {}
+    // Malformed GitHub JSON intentionally falls back to {} and fails the MERGED check below.
+    try { j = JSON.parse(command.stdout || "{}"); } catch (error) {
+      fleetError("PR_SIGNAL_JSON", `signal=${sig}`, error);
+    }
     return {
       ok: command.exitCode === 0 && j.state === "MERGED",
       detail: command.exitCode !== 0 ? `exit ${command.exitCode}` : j.state === "MERGED" ? `merged ${j.mergeCommit?.oid?.slice(0, 8)}` : `state=${j.state ?? "unknown"}`,
@@ -1377,7 +1509,7 @@ export async function track(key, cat, done, title) {
     const c = db.query("SELECT * FROM cats WHERE id=?").get(cat);
     if (!c) throw new Error("NO_CAT");
     if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)
-      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
+      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','closed','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
       return `TRACK_HOLD ${key}: prior-task-unresolved`;
     }
     db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,?,?,?,'tracked-unconfirmed',?)").run(key, cat, title || key, done || "", now());
@@ -1412,7 +1544,8 @@ async function commandOutput(command, args, cwd, signal = AbortSignal.timeout(10
     });
     const [text, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
     return exitCode === 0 ? text.trim() : null;
-  } catch {
+  } catch (error) {
+    fleetError("COMMAND", `${command} ${args[0] ?? ""}`, error);
     return null;
   }
 }
@@ -1426,7 +1559,10 @@ async function pullRequestInfo(repo, number, repoRoot) {
   const fields = "number,title,url,state,isDraft,headRefOid,reviewDecision,statusCheckRollup";
   const text = await commandOutput("gh", ["pr", "view", String(number), "--repo", repo, "--json", fields], repoRoot);
   if (!text) return null;
-  try { return JSON.parse(text); } catch { return null; }
+  try { return JSON.parse(text); } catch (error) {
+    fleetError("PR_INFO_JSON", `repo=${repo} number=${number}`, error);
+    return null;
+  }
 }
 
 async function pullRequestsForBranch(repo, branch, repoRoot) {
@@ -1436,7 +1572,8 @@ async function pullRequestsForBranch(repo, branch, repoRoot) {
   try {
     const data = JSON.parse(text);
     return Array.isArray(data) ? data : null;
-  } catch {
+  } catch (error) {
+    fleetError("PR_LIST_JSON", `repo=${repo} branch=${branch}`, error);
     return null;
   }
 }
@@ -1478,7 +1615,9 @@ async function board() {
       for (const signal of task.done.split(";").map((part) => part.trim())) {
         if (parsePullRequestSignal(signal) && !signals.has(signal)) signals.set(signal, task.key);
       }
-    } catch {}
+    } catch (error) {
+      fleetError("BOARD_TASK", `task=${task.key}`, error);
+    }
   }
 
   const pullRequests = [];
@@ -1488,7 +1627,9 @@ async function board() {
       const info = await pullRequestInfo(target.repo, target.prNumber, repoRoot);
       const checkRuns = info?.headRefOid ? await checkRunsForHead(target.repo, info.headRefOid) : null;
       pullRequests.push({ target, source, info, checkRuns });
-    } catch {}
+    } catch (error) {
+      fleetError("BOARD_PR", `signal=${signal}`, error);
+    }
   }
   const bySignal = new Map(pullRequests.map((pr) => [`pr:${pr.target.repo}#${pr.target.prNumber}`, pr]));
   const prior = repo ? bySignal.get(`pr:${repo}#2`) : null;
@@ -1606,8 +1747,13 @@ async function watch(intervalSec = 30) {
           const policy = questionPolicy(r.questionText || "");
           if (policy) {
             let answered = false;
-            try { answered = await answerPaneQuestion(r.pane, r.questionText, policy.answer); } catch {}
+            try {
+              answered = await answerPaneQuestion(r.pane, r.questionText, policy.answer);
+            } catch (error) {
+              fleetError("AUTO_ANSWER", `cat=${r.id} task=${taskKey} policy=${policy.id}`, error);
+            }
             if (answered) {
+              console.log(`FLEET_AUTO_ANSWER ${r.id} ${taskKey} policy=${policy.id}`);
               console.log(`FLEET_QUESTION_ANSWERED ${r.id} ${taskKey} policy=${policy.id}`);
               if (taskKey !== "-") log(taskKey, { ev: "question-auto-answer", policy: policy.id });
             } else {
@@ -1670,11 +1816,12 @@ if (import.meta.main) {
     status, report, board,
     dispatch: () => dispatch(a[0], a[1], a[2], { type: opt("type"), skill: opt("skill"), done: opt("done"), title: opt("title"), keepModel: a.includes("--keep-model"), after: opt("after") }),
     track: () => track(a[0], a[1], opt("done"), opt("title")),
+    close: () => markTaskClosed(a[0], a.slice(1).join(" ")),
     verify: () => verify(a[0]),
     tasks: async () => db.query("SELECT key,cat,status,depends_on,skill,model,done,evidence FROM tasks ORDER BY sent_at DESC LIMIT 20").all().map((t) => JSON.stringify(t)).join("\n"),
     beat: async () => JSON.stringify(db.query("SELECT * FROM beats").all()),
     routes: async () => JSON.stringify(ROUTES, null, 1),
     watch: () => watch(Number(a[0] || 30)),
-  }[cmd] ?? (async () => "usage: fleet init|status|report|board|dispatch <cat> <KEY> <prompt> [--after <KEY>] [--type plan|impl|review|secure|quick] [--skill ulw|ulw-loop|mass-ulw|ulw-plan|ulw-execute|ulw-research] [--done 'pr:o/r#N;url:..=200;cmd:..'] [--keep-model]|track <KEY> <cat> --done ..|verify <KEY>|tasks|beat|routes|watch [sec]"))();
+  }[cmd] ?? (async () => "usage: fleet init|status|report|board|dispatch <cat> <KEY> <prompt> [--after <KEY>] [--type plan|impl|review|secure|quick] [--skill ulw|ulw-loop|mass-ulw|ulw-plan|ulw-execute|ulw-research] [--done 'pr:o/r#N;url:..=200;cmd:..'] [--keep-model]|track <KEY> <cat> --done ..|close <KEY> <reason>|verify <KEY>|tasks|beat|routes|watch [sec]"))();
   if (out !== undefined) console.log(out);
 }
