@@ -158,15 +158,13 @@ export function completionBelongsToDispatchAttempt(task, marker) {
   if (!task || ["closed", "done-claimed", "verified-done"].includes(task.status) || task.completion_claimed) return false;
   const history = JSON.parse(task.history || "[]");
   if (!task.dispatch_attempt) {
-    if (!["tracked-unconfirmed", "working"].includes(task.status)) return false;
+    if (!["tracked-unconfirmed", "working"].includes(task.status) || task.send_attempted) return false;
     const tracked = history.findLast((event) => event.ev === "tracked");
-    const trackAt = Date.parse(tracked?.at ?? "");
+    const trackAt = Date.parse(tracked?.at ?? task.sent_at ?? "");
     const sentAt = Date.parse(task.sent_at ?? "");
-    return Boolean(tracked && Number.isFinite(trackAt) && Number.isFinite(sentAt) && sentAt >= trackAt);
+    return Number.isFinite(trackAt) && Number.isFinite(sentAt) && sentAt >= trackAt;
   }
-  if (marker?.attempt !== task.dispatch_attempt || !task.send_attempted) return false;
-  const sent = history.findLast((event) => event.ev === "send-attempted" && event.attempt === task.dispatch_attempt);
-  return Boolean(sent);
+  return marker?.attempt === task.dispatch_attempt && Boolean(task.send_attempted);
 }
 
 function responseBlock(screen) {

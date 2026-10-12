@@ -2603,7 +2603,7 @@ describe("fleet usage and Bugbot alerts", () => {
       const result = await runWatchCycle({
         catTask: key,
         taskStatus: "tracked-unconfirmed",
-        taskHistory: [{ ev: "tracked", at: "2026-10-12T00:00:00.000Z" }],
+        taskHistory: kind === "DONE" ? [] : [{ ev: "tracked", at: "2026-10-12T00:00:00.000Z" }],
         taskSentAt: "2026-10-12T00:00:01.000Z",
         paneScreen: `Working (1s)\n⏺ Tracked response\n${key}_${kind} tracked result\n\n❯`,
       });
