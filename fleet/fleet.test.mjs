@@ -7,7 +7,7 @@ import { join } from "node:path";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, verify, verifyClaims } = await import("./fleet.mjs");
+const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -459,23 +459,29 @@ describe("fleet dispatch reservations", () => {
     db.close();
   });
 
-  it("allows only one recovery owner to clear pending pane input", async () => {
+  it("allows only one of two recovery watchers to clear pending pane input", async () => {
     const db = unitDb();
     const pane = "w-exclusive-clear:p1";
-    const reservation = { pane, key: "EXCLUSIVE-CLEAR", attempt: "exclusive-attempt" };
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
     db.query("INSERT INTO cats(id,name,pane) VALUES('exclusive-clear-cat','Exclusive Clear',?)").run(pane);
-    db.query("INSERT INTO tasks(key,cat,status,history,send_attempted) VALUES(?,'exclusive-clear-cat','send-failed-unconfirmed',?,1)")
-      .run(reservation.key, JSON.stringify([{ ev: "send-attempted", attempt: reservation.attempt }]));
-    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,?,?)").run(pane, reservation.key, reservation.attempt);
-    let releases = 0;
-    const paneRead = async () => ({ exitCode: 0, stdout: "Idle\n❯" });
-    const runCommand = async () => { releases++; return { exitCode: 0, stdout: "" }; };
+    db.query(`INSERT INTO tasks(key,cat,status,history,send_attempted)
+      VALUES('EXCLUSIVE-CLEAR','exclusive-clear-cat','send-failed-unconfirmed',?,1)`)
+      .run(JSON.stringify([{ ev: "send-attempted", attempt: "exclusive-attempt" }]));
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run(pane, "EXCLUSIVE-CLEAR", "exclusive-attempt", reservedAt);
+    const mutations = [];
+    const runCommand = async (argv) => {
+      if (argv[2] === "send-keys") mutations.push(argv);
+      return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+    };
+    const nowMs = Date.parse(reservedAt) + 11 * 60_000;
+    const runWatcher = () => recoverInterruptedDispatches(db, [{ id: "exclusive-clear-cat", state: "idle" }], nowMs, runCommand);
     const results = await Promise.all([
-      reconcileFailedDispatch(db, reservation, paneRead, runCommand),
-      reconcileFailedDispatch(db, reservation, paneRead, runCommand),
+      runWatcher(),
+      runWatcher(),
     ]);
-    expect(results.filter(Boolean)).toHaveLength(1);
-    expect(releases).toBe(1);
+    expect(results.flat()).toEqual(["FLEET_SEND_FAILED_UNCONFIRMED EXCLUSIVE-CLEAR pane=w-exclusive-clear:p1 reservation_released"]);
+    expect(mutations).toEqual([["herdr", "pane", "send-keys", pane, "ctrl+u"]]);
     expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(pane)).toBeNull();
     db.close();
   });
@@ -640,6 +646,31 @@ describe("fleet dispatch reservations", () => {
     expect(recoverDispatchReservation(db, reservation, "idle", Date.parse(reservedAt) + 11 * 60_000)).toBeNull();
     expect(db.query("SELECT status FROM tasks WHERE key=?").get("DURABLE-SEND").status).toBe("dispatching");
     expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get("w-durable-send:p1").key).toBe("DURABLE-SEND");
+    db.close();
+  });
+
+  it("does not grow duplicate recovery history across 50 question-state cycles", async () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    const history = JSON.stringify(Array.from({ length: 40 }, (_, index) => ({ ev: "noise", index })));
+    db.query("INSERT INTO cats(id,name,pane) VALUES('question-recovery-cat','Question Recovery','w-question-recovery:p1')").run();
+    db.query(`INSERT INTO tasks(key,cat,status,history,completion_claimed,send_attempted)
+      VALUES('QUESTION-RECOVERY','question-recovery-cat','dispatching',?,1,1)`).run(history);
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-question-recovery:p1", "QUESTION-RECOVERY", "question-recovery-attempt", reservedAt);
+    const nowMs = Date.parse(reservedAt) + 11 * 60_000;
+    for (let cycle = 0; cycle < 50; cycle++) {
+      expect(await recoverInterruptedDispatches(db, [{ id: "question-recovery-cat", state: "question" }], nowMs,
+        async () => ({ exitCode: 0, stdout: "Question pending\nNeed confirmation\n❯" }))).toEqual([]);
+    }
+    const task = db.query("SELECT status,history,completion_claimed,send_attempted FROM tasks WHERE key='QUESTION-RECOVERY'").get();
+    const events = JSON.parse(task.history);
+    expect(task.status).toBe("send-failed-unconfirmed");
+    expect(task.completion_claimed).toBe(1);
+    expect(task.send_attempted).toBe(1);
+    expect(events).toHaveLength(40);
+    expect(events.filter((event) => event.ev === "send-failed-unconfirmed")).toHaveLength(1);
+    expect(events.some((event) => event.ev === "send-attempted" || event.ev === "done-claimed")).toBe(false);
     db.close();
   });
 
@@ -1021,15 +1052,22 @@ describe("fleet completion classification", () => {
 
 describe("fleet completion claim verification", () => {
   it("re-verifies not-done tasks with prior completion claims during watch polling", async () => {
-    const db = new Database(":memory:");
-    db.exec("CREATE TABLE tasks(key TEXT,cat TEXT,done TEXT,status TEXT,history TEXT,completion_claimed INTEGER)");
-    db.query("INSERT INTO tasks(key,cat,done,status,history,completion_claimed) VALUES('RETRY-PR','crm','pr:owner/repo#1','not-done',?,1)")
-      .run(JSON.stringify(Array.from({ length: 40 }, (_, index) => ({ ev: "not-done", detail: `retry-${index}` }))));
+    const db = unitDb();
+    db.query("INSERT INTO tasks(key,cat,done,status,history,completion_claimed) VALUES('RETRY-PR','crm','pr:owner/repo#1','not-done','[]',1)").run();
     db.query("INSERT INTO tasks(key,cat,done,status,history,completion_claimed) VALUES('NOT-A-CLAIM','crm','cmd:true','not-done','[]',1)").run();
     const keys = [];
-    const events = await retryNotDoneTasks(db, async (key) => { keys.push(key); return `VERIFY ${key}`; });
-    expect(events).toEqual(["VERIFY RETRY-PR"]);
+    const checked = [];
+    const events = await retryNotDoneTasks(db, async (key) => {
+      keys.push(key);
+      return verify(key, async (signal) => {
+        checked.push(signal);
+        return { ok: false, detail: "state=OPEN" };
+      });
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toContain("NOT_DONE RETRY-PR");
     expect(keys).toEqual(["RETRY-PR"]);
+    expect(checked).toEqual(["pr:owner/repo#1"]);
     db.close();
   });
 
@@ -1059,6 +1097,46 @@ describe("fleet completion claim verification", () => {
       return `VERIFY_RETRY ${key}`;
     })).toEqual(["VERIFY_RETRY NOT-DONE-PR"]);
     expect(retried).toEqual(["NOT-DONE-PR"]);
+    db.close();
+  });
+
+  it("re-verifies after 45 failures and completes when durable ACCEPT evidence is present", async () => {
+    const db = unitDb();
+    const key = "VERIFY-45-FAILURES";
+    const head = "0123456789abcdef0123456789abcdef01234567";
+    const history = [
+      { ev: "done-claimed", text: "ready" },
+      ...Array.from({ length: 38 }, (_, index) => ({ ev: "not-done", detail: `prior-${index}` })),
+    ];
+    db.query(`INSERT INTO tasks(key,cat,done,status,history,completion_claimed,claim_evidence)
+      VALUES(?,?,?,'not-done',?,1,'{}')`)
+      .run(key, "reservation-cat", "pr:owner/repo#1", JSON.stringify(history));
+    let failedChecks = 0;
+    const failedCheck = async () => {
+      failedChecks++;
+      return { ok: false, detail: `state=OPEN attempt=${failedChecks}`, headRefOid: head };
+    };
+    for (let attempt = 0; attempt < 45; attempt++) {
+      expect(await verify(key, failedCheck)).toContain(`NOT_DONE ${key}`);
+    }
+    expect(failedChecks).toBe(45);
+    const capped = db.query("SELECT history,completion_claimed,claim_evidence FROM tasks WHERE key=?").get(key);
+    expect(JSON.parse(capped.history)).toHaveLength(40);
+    expect(JSON.parse(capped.history).some((event) => event.ev === "done-claimed" || event.ev === "claim-ok")).toBe(false);
+    expect(capped.completion_claimed).toBe(1);
+    expect(JSON.parse(capped.claim_evidence)).toEqual({});
+
+    recordTaskClaimEvidence(db, key, {
+      kind: "cursor-accept", ok: true, head, acceptedPrefix: head.slice(0, 8), actualHead: head, detail: "slack_author_full_head_match",
+    });
+    recordTaskClaimEvidence(db, key, {
+      kind: "pr-ready", ok: true, head, acceptedPrefix: head.slice(0, 10), actualHead: head, detail: "pr_head_match",
+    });
+    const verified = await verify(key, async () => ({
+      ok: true, detail: "merged", headRefOid: head, mergeCommit: "f".repeat(40),
+    }));
+    expect(verified).toContain(`VERIFIED_DONE ${key}`);
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("verified-done");
     db.close();
   });
 
@@ -1156,7 +1234,7 @@ describe("fleet completion claim verification", () => {
     const key = "VERIFY-OLD-HEAD";
     const headA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const headB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history,completion_claimed) VALUES(?,?,?,'done-claimed','finished',?,1)")
       .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#79", JSON.stringify([
         { ev: "claim-ok", claim: "cursor-accept", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "slack_author_full_head_match" },
         { ev: "claim-ok", claim: "pr-ready", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "pr_head_match" },
@@ -1213,7 +1291,7 @@ describe("fleet completion claim verification", () => {
     const headA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const headB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const done = "pr:whelp99-code/jm-omo#80";
-    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history,completion_claimed) VALUES(?,?,?,'done-claimed','finished',?,1)")
       .run(key, "reservation-cat", done, JSON.stringify([
         { ev: "done-claimed", text: "finished" },
         { ev: "claim-ok", claim: "cursor-accept", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "slack_author_full_head_match" },
@@ -1234,7 +1312,7 @@ describe("fleet completion claim verification", () => {
     const db = unitDb();
     const key = "VERIFY-EMPTY-RESULT";
     const head = "abcdef0123456789abcdef0123456789abcdef01";
-    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'not-done','',?)")
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history,completion_claimed) VALUES(?,?,?,'not-done','',?,1)")
       .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#82", JSON.stringify([
         { ev: "done-claimed", text: "" },
         { ev: "claim-ok", claim: "cursor-accept", head, acceptedPrefix: head.slice(0, 8), actualHead: head, detail: "slack_author_full_head_match" },
@@ -1988,6 +2066,7 @@ describe("fleet review-stall request correlation", () => {
       ts: requestTs,
       thread_ts: requestTs,
       channel: "C0C6HJM0BV5",
+      reply_count: 1,
       user: "UOTHER",
       text: "Cursor 검수 요청 PR #98 TASK-OLD-REVIEW",
     };
@@ -2014,6 +2093,14 @@ describe("fleet review-stall request correlation", () => {
       ];
     });
     expect(since).toBe(requestTs);
+    expect(slackHistoryParams(since).get("inclusive")).toBe("true");
+    const refetchedRoots = reviewRequestThreadRoots([request]);
+    const refetchedThreadRoots = [];
+    await fetchSlackThreadReplies(refetchedRoots, async (root) => {
+      refetchedThreadRoots.push(root.ts);
+      return [{ ts: String(Number(root.ts) + 1), thread_ts: root.ts, app_id: "A08SKDT6QUW", text: "prior review reply" }];
+    }, new AbortController().signal);
+    expect(refetchedThreadRoots).toEqual([requestTs]);
     expect(restartedPoll).toEqual([]);
     expect(db.query("SELECT ts FROM fleet_review_requests").get()).toBeNull();
     expect(db.query("SELECT value FROM fleet_state WHERE key='slack-review-cursor'").get().value)

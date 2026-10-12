@@ -10,23 +10,36 @@ mkdirSync(STATE, { recursive: true });
 const db = new Database(`${STATE}/fleet.sqlite`);
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;
 CREATE TABLE IF NOT EXISTS cats(id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT, state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT);
-CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT, done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT, result TEXT, evidence TEXT, history TEXT DEFAULT '[]', depends_on TEXT, dispatch_type TEXT DEFAULT 'impl', keep_model INTEGER DEFAULT 0, completion_claimed INTEGER NOT NULL DEFAULT 0, send_attempted INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT, done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT, result TEXT, evidence TEXT, history TEXT DEFAULT '[]', depends_on TEXT, dispatch_type TEXT DEFAULT 'impl', keep_model INTEGER DEFAULT 0, completion_claimed INTEGER NOT NULL DEFAULT 0, send_attempted INTEGER NOT NULL DEFAULT 0, claim_evidence TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS dispatch_reservations(pane TEXT PRIMARY KEY, key TEXT UNIQUE NOT NULL, attempt TEXT NOT NULL, reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, recovery_token TEXT, recovery_started_at TEXT);
 CREATE TABLE IF NOT EXISTS fleet_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_alerts(key TEXT PRIMARY KEY, alerted_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_review_requests(ts TEXT PRIMARY KEY, channel TEXT, thread_ts TEXT, user TEXT, text TEXT NOT NULL);`);
 const taskColumns = new Set(db.query("PRAGMA table_info(tasks)").all().map((column) => column.name));
-for (const [name, definition] of [["depends_on", "TEXT"], ["dispatch_type", "TEXT DEFAULT 'impl'"], ["keep_model", "INTEGER DEFAULT 0"], ["completion_claimed", "INTEGER NOT NULL DEFAULT 0"], ["send_attempted", "INTEGER NOT NULL DEFAULT 0"]]) {
+for (const [name, definition] of [["depends_on", "TEXT"], ["dispatch_type", "TEXT DEFAULT 'impl'"], ["keep_model", "INTEGER DEFAULT 0"], ["completion_claimed", "INTEGER NOT NULL DEFAULT 0"], ["send_attempted", "INTEGER NOT NULL DEFAULT 0"], ["claim_evidence", "TEXT NOT NULL DEFAULT '{}'"]]) {
   if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
 }
-for (const task of db.query("SELECT key,status,history,completion_claimed,send_attempted FROM tasks WHERE completion_claimed=0 OR send_attempted=0").all()) {
+for (const task of db.query("SELECT key,status,history,completion_claimed,send_attempted,claim_evidence FROM tasks WHERE completion_claimed=0 OR send_attempted=0 OR claim_evidence='{}'").all()) {
   const history = JSON.parse(task.history || "[]");
   const completionClaimed = task.completion_claimed || task.status === "done-claimed" || history.some((event) => event.ev === "done-claimed");
   const sendAttempted = task.send_attempted || history.some((event) => event.ev === "send-attempted");
-  if (completionClaimed || sendAttempted) {
-    db.query("UPDATE tasks SET completion_claimed=?,send_attempted=? WHERE key=?")
-      .run(completionClaimed ? 1 : 0, sendAttempted ? 1 : 0, task.key);
+  const claimEvidence = JSON.parse(task.claim_evidence || "{}");
+  for (const event of history) {
+    if (["cursor-accept", "pr-ready"].includes(event.claim)
+      && ["claim-ok", "claim-false"].includes(event.ev)) {
+      claimEvidence[event.claim] = {
+        ok: event.ev === "claim-ok",
+        head: event.head ?? null,
+        acceptedPrefix: event.acceptedPrefix ?? null,
+        actualHead: event.actualHead ?? null,
+        detail: event.detail ?? null,
+      };
+    }
+  }
+  if (completionClaimed || sendAttempted || JSON.stringify(claimEvidence) !== task.claim_evidence) {
+    db.query("UPDATE tasks SET completion_claimed=?,send_attempted=?,claim_evidence=? WHERE key=?")
+      .run(completionClaimed ? 1 : 0, sendAttempted ? 1 : 0, JSON.stringify(claimEvidence), task.key);
   }
 }
 const reservationColumns = new Set(db.query("PRAGMA table_info(dispatch_reservations)").all().map((column) => column.name));
@@ -142,12 +155,44 @@ export async function answerPaneQuestion(pane, expectedQuestion, answer, runComm
 }
 
 function appendHistoryInTransaction(dbHandle, task, ev) {
+  const signature = (value) => JSON.stringify(Object.fromEntries(Object.keys(value).filter((key) => key !== "at").sort().map((key) => [key, value[key]])));
+  const history = JSON.parse(dbHandle.query("SELECT history FROM tasks WHERE key=?").get(task)?.history || "[]");
+  if (ev.ev === "done-claimed") dbHandle.query("UPDATE tasks SET completion_claimed=1 WHERE key=?").run(task);
+  if (ev.ev === "send-attempted") dbHandle.query("UPDATE tasks SET send_attempted=1 WHERE key=?").run(task);
+  if (history.some((event) => signature(event) === signature(ev))) return false;
   const event = JSON.stringify({ at: now(), ...ev });
   dbHandle.query(`UPDATE tasks SET history=CASE
     WHEN json_array_length(COALESCE(history,'[]')) >= 40
       THEN json_remove(json_insert(COALESCE(history,'[]'),'$[#]',json(?)),'$[0]')
     ELSE json_insert(COALESCE(history,'[]'),'$[#]',json(?))
     END WHERE key=?`).run(event, event, task);
+  return true;
+}
+
+export function recordTaskClaimEvidence(dbHandle, taskKey, claim) {
+  if (!["cursor-accept", "pr-ready"].includes(claim.kind)) return false;
+  return dbHandle.transaction(() => {
+    const task = dbHandle.query("SELECT claim_evidence FROM tasks WHERE key=?").get(taskKey);
+    if (!task) return false;
+    const evidence = JSON.parse(task.claim_evidence || "{}");
+    evidence[claim.kind] = {
+      ok: Boolean(claim.ok),
+      head: claim.head ?? null,
+      acceptedPrefix: claim.acceptedPrefix ?? null,
+      actualHead: claim.actualHead ?? null,
+      detail: claim.detail ?? null,
+    };
+    dbHandle.query("UPDATE tasks SET claim_evidence=? WHERE key=?").run(JSON.stringify(evidence), taskKey);
+    appendHistoryInTransaction(dbHandle, taskKey, {
+      ev: claim.ok ? "claim-ok" : "claim-false",
+      claim: claim.kind,
+      head: claim.head,
+      acceptedPrefix: claim.acceptedPrefix,
+      actualHead: claim.actualHead,
+      detail: claim.detail,
+    });
+    return true;
+  }).immediate();
 }
 
 export function appendTaskHistory(dbHandle, task, ev) {
@@ -195,13 +240,12 @@ export function claimExpiredReservationRecovery(dbHandle, reservation, nowMs = D
     const current = dbHandle.query(`SELECT reserved_at,recovery_token,recovery_started_at
       FROM dispatch_reservations WHERE pane=? AND key=? AND attempt=?`).get(reservation.pane, reservation.key, reservation.attempt);
     if (!current || current.reserved_at !== reservation.reserved_at) return null;
-    const task = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(reservation.key);
-    if (task?.status !== "dispatching") return null;
+    const task = dbHandle.query("SELECT status,send_attempted FROM tasks WHERE key=?").get(reservation.key);
+    if (task?.status !== "dispatching" || task.send_attempted) return null;
     const reservedAt = Date.parse(current.reserved_at);
     if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) return null;
     const recoveryStartedAt = Date.parse(current.recovery_started_at || "");
     if (current.recovery_token && Number.isFinite(recoveryStartedAt) && nowMs - recoveryStartedAt < DISPATCH_RESERVATION_TTL_MS) return null;
-    if (task.send_attempted) return null;
     const updated = dbHandle.query(`UPDATE dispatch_reservations
       SET recovery_token=?,recovery_started_at=?
       WHERE pane=? AND key=? AND attempt=? AND reserved_at=?
@@ -257,19 +301,21 @@ export function releaseReservationRecovery(dbHandle, reservation, token) {
 export function claimFailedSendRecovery(dbHandle, reservation, nowMs = Date.now()) {
   const token = crypto.randomUUID();
   return dbHandle.transaction(() => {
-    const current = dbHandle.query(`SELECT recovery_token,recovery_started_at
+    const current = dbHandle.query(`SELECT reserved_at,recovery_token,recovery_started_at
       FROM dispatch_reservations WHERE pane=? AND key=? AND attempt=?`).get(reservation.pane, reservation.key, reservation.attempt);
-    if (!current) return null;
+    if (!current || (reservation.reserved_at && current.reserved_at !== reservation.reserved_at)) return null;
     const task = dbHandle.query("SELECT status,send_attempted FROM tasks WHERE key=?").get(reservation.key);
     if (!["dispatching", "send-failed-unconfirmed"].includes(task?.status) || !task.send_attempted) return null;
     const startedAt = Date.parse(current.recovery_started_at || "");
+    if (reservation.recoveryToken && current.recovery_token !== reservation.recoveryToken) return null;
     if (current.recovery_token && Number.isFinite(startedAt) && nowMs - startedAt < DISPATCH_RESERVATION_TTL_MS) return null;
+    const claimToken = reservation.recoveryToken && current.recovery_token === reservation.recoveryToken ? reservation.recoveryToken : token;
     const changed = dbHandle.query(`UPDATE dispatch_reservations SET recovery_token=?,recovery_started_at=?
       WHERE pane=? AND key=? AND attempt=?
-        AND (recovery_token IS NULL OR recovery_started_at IS NULL OR recovery_started_at<=?)`)
-      .run(token, new Date(nowMs).toISOString(), reservation.pane, reservation.key, reservation.attempt,
-        new Date(nowMs - DISPATCH_RESERVATION_TTL_MS).toISOString()).changes;
-    return changed === 1 ? token : null;
+        AND (recovery_token IS NULL OR recovery_token=? OR recovery_started_at IS NULL OR recovery_started_at<=?)`)
+      .run(claimToken, new Date(nowMs).toISOString(), reservation.pane, reservation.key, reservation.attempt,
+        reservation.recoveryToken ?? null, new Date(nowMs - DISPATCH_RESERVATION_TTL_MS).toISOString()).changes;
+    return changed === 1 ? claimToken : null;
   }).immediate();
 }
 
@@ -305,8 +351,9 @@ export function recoverDispatchReservation(dbHandle, reservation, paneState, now
     const sendAttempted = Boolean(task.send_attempted) || history.some((event) => event.ev === "send-attempted" && event.attempt === reservation.attempt);
     if (paneState === "working" || paneState === "question" || paneState === "compacting" || paneState === "provider-error") {
       const status = sendAttempted ? "send-failed-unconfirmed" : "sent-unconfirmed";
-      dbHandle.query("UPDATE tasks SET status=? WHERE key=? AND status IN ('dispatching','send-failed-unconfirmed')").run(status, reservation.key);
-      appendHistoryInTransaction(dbHandle, reservation.key, { ev: status, attempt: reservation.attempt });
+      const changed = dbHandle.query("UPDATE tasks SET status=? WHERE key=? AND status IN ('dispatching','send-failed-unconfirmed') AND status!=?")
+        .run(status, reservation.key, status).changes;
+      if (changed) appendHistoryInTransaction(dbHandle, reservation.key, { ev: status, attempt: reservation.attempt });
       return null;
     }
     if (paneState === "compaction-failed") {
@@ -331,7 +378,7 @@ export function recoverDispatchReservation(dbHandle, reservation, paneState, now
 }
 
 export async function reconcileFailedDispatch(dbHandle, reservation, paneRead, runCommand = executeSignalCommand) {
-  const token = reservation.recoveryToken ?? claimFailedSendRecovery(dbHandle, reservation);
+  const token = claimFailedSendRecovery(dbHandle, reservation);
   if (!token) return false;
   const owned = { ...reservation, recoveryToken: token };
   let finished = false;
@@ -973,7 +1020,7 @@ function queueDispatch(catId, key, prompt, options, reason) {
   const { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after } = options;
   db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,done,status,sent_at,depends_on,dispatch_type,keep_model)
     VALUES(?,?,?,?,?,?,'waiting',?,?,?,?)
-    ON CONFLICT(key) DO UPDATE SET cat=excluded.cat, title=excluded.title, prompt=excluded.prompt, skill=excluded.skill, done=excluded.done, status='waiting', sent_at=excluded.sent_at, result=NULL, evidence=NULL, depends_on=excluded.depends_on, dispatch_type=excluded.dispatch_type, keep_model=excluded.keep_model`)
+    ON CONFLICT(key) DO UPDATE SET cat=excluded.cat, title=excluded.title, prompt=excluded.prompt, skill=excluded.skill, done=excluded.done, status='waiting', sent_at=excluded.sent_at, result=NULL, evidence=NULL, depends_on=excluded.depends_on, dispatch_type=excluded.dispatch_type, keep_model=excluded.keep_model, completion_claimed=0, send_attempted=0, claim_evidence='{}'`)
     .run(key, catId, title || key, prompt, skill, done, now(), after || null, type, keepModel ? 1 : 0);
   log(key, { ev: after ? "dependency-wait" : "dispatch-wait", after: after || null, reason });
   return after ? `FLEET_DEPENDENCY_WAIT ${key} after=${after} ${reason}` : `FLEET_DISPATCH_WAIT ${key} cat=${catId} ${reason}`;
@@ -1015,7 +1062,7 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     const model = want ? `${want.provider}/${want.model}:${want.thinking}` : "kept";
     if (existing) {
       db.query(`UPDATE tasks SET title=?,prompt=?,skill=?,model=?,done=?,status='dispatching',sent_at=?,started_at=NULL,ended_at=NULL,result=NULL,evidence=NULL,
-        depends_on=?,dispatch_type=?,keep_model=? WHERE key=?`)
+        depends_on=?,dispatch_type=?,keep_model=?,completion_claimed=0,send_attempted=0,claim_evidence='{}' WHERE key=?`)
         .run(title || key, prompt, skill, model, done, now(), after || null, type, keepModel ? 1 : 0, key);
     } else {
       db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,model,done,status,sent_at,depends_on,dispatch_type,keep_model,history)
@@ -1198,12 +1245,20 @@ export async function verify(key, check = checkSignal) {
   if (!t) throw new Error(`no task ${key}`);
   if (t.status === "verified-done") return `VERIFIED_DONE ${key}: already verified`;
   const history = JSON.parse(t.history || "[]");
-  const hasCompletionClaim = history.some((event) => event.ev === "done-claimed");
+  const hasCompletionClaim = Boolean(t.completion_claimed) || t.status === "done-claimed";
   if (t.status !== "done-claimed" && !(t.status === "not-done" && hasCompletionClaim)) return `VERIFY_UNCONFIRMED ${key}: worker completion claim missing`;
   if (!t.done) return `VERIFY_NO_SIGNAL ${key}: no Done= spec; cannot be verified-done`;
   const res = [];
   for (const s of t.done.split(";").map((part) => part.trim()).filter(Boolean)) res.push({ s, ...(await check(s)) });
-  const claims = history.filter((event) => event.ev === "claim-ok" || event.ev === "claim-false");
+  const durableClaims = JSON.parse(t.claim_evidence || "{}");
+  const claims = [
+    ...history.filter((event) => event.ev === "claim-ok" || event.ev === "claim-false"),
+    ...Object.entries(durableClaims).map(([claim, event]) => ({
+      ...event,
+      claim,
+      ev: event.ok ? "claim-ok" : "claim-false",
+    })),
+  ];
   const prSignals = res.filter((result) => parsePullRequestSignal(result.s));
   const requiredClaims = prSignals.map((result) => {
     const headRefOid = /^[a-f0-9]{40}$/i.test(result.headRefOid || "") ? result.headRefOid.toLowerCase() : null;
@@ -1484,7 +1539,7 @@ async function watch(intervalSec = 30) {
             const claims = await verifyClaims(r.claimText ?? "", task);
             for (const claim of claims) {
               console.log(claimEvent(r.id, taskKey ?? "-", claim));
-              if (taskKey) log(taskKey, { ev: claim.ok ? "claim-ok" : "claim-false", claim: claim.kind, head: claim.head, acceptedPrefix: claim.acceptedPrefix, actualHead: claim.actualHead, detail: claim.detail });
+              if (taskKey) recordTaskClaimEvidence(db, taskKey, claim);
             }
             if (readyChanged && claims.some((claim) => claim.kind === "pr-ready" && claim.ok)) {
               console.log(`FLEET_PR_READY ${r.id} ${r.ready.repo} ${r.ready.head}`);
