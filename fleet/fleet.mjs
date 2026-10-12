@@ -607,6 +607,11 @@ function promptLineContains(screen, text) {
   return Boolean(input?.includes(text));
 }
 
+function promptLineIsEmpty(screen) {
+  const input = String(screen).replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
+  return Boolean(input && /^\s*❯\s*$/.test(input));
+}
+
 export async function waitForPaneScreen(pane, predicate, runCommand = executeSignalCommand, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
@@ -701,6 +706,7 @@ export async function switchModel(pane, want, runCommand = executeSignalCommand,
     after = await wait((screen) => classify(screen).model.endsWith(`:${want.thinking}`));
     if (!after) return timeout("thinking-change");
   }
+  if (!await wait(promptLineIsEmpty)) return timeout("input-clear");
   return `MODEL_SWITCHED ${before} -> ${want.provider}/${want.model}`;
 }
 

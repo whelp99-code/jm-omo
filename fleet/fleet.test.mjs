@@ -380,6 +380,70 @@ describe("fleet model-switch waits", () => {
     }), 0);
     expect(result).toBe("MODEL_SWITCH_TIMEOUT w-timeout:p1 phase=picker-open");
   });
+
+  it("waits for an empty prompt after xhigh confirmation before sending the task", async () => {
+    const db = unitDb();
+    const pane = "w-mail-hardening:p1";
+    const prompt = join(unitHome, "mail-jarvis-reader-prompt.txt");
+    writeFileSync(prompt, "mail JARVIS reader fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('mail-hardening-cat','Mail Hardening',?)").run(pane);
+    db.close();
+
+    let phase = "initial";
+    let thinkingReads = 0;
+    const timeline = [];
+    const concatenatedInput = "/thinking xhighTASK-MAIL-JARVIS-READER-20261012 [attempt=fixture]:";
+    const runCommand = async (argv) => {
+      if (argv[2] === "read") {
+        let stdout;
+        if (phase === "initial") stdout = "Idle\n⚡ claude-haiku:off\n❯";
+        else if (phase === "model-command") stdout = "Idle\n⚡ claude-haiku:off\n❯ /model";
+        else if (phase === "catalog" || phase === "filtered") stdout = "Select model\n→ gpt-6-astra [chatgpt-subscription]\n❯";
+        else if (phase === "selected") stdout = "Idle\n⚡ gpt-6-astra:high\n❯";
+        else if (phase === "thinking-command") stdout = "Idle\n⚡ gpt-6-astra:high\n❯ /thinking xhigh";
+        else if (phase === "thinking-transition") {
+          thinkingReads++;
+          stdout = thinkingReads <= 2
+            ? `Error: Unknown thinking level "xhighTASK-MAIL-JARVIS-READER-20261012 [attempt=fixture]:"\nIdle\n⚡ gpt-6-astra:xhigh\n❯ ${concatenatedInput}`
+            : "Idle\n⚡ gpt-6-astra:xhigh\n❯";
+        } else stdout = "Working (1s)\n❯";
+        timeline.push({ kind: "read", stdout });
+        return { exitCode: 0, stdout };
+      }
+      if (argv[2] === "send-text") {
+        timeline.push({ kind: "send-text", text: argv[4] });
+        if (argv[4] === "/model") phase = "model-command";
+        else if (argv[4] === "gpt-6-astra") phase = "filtered";
+        else if (argv[4] === "/thinking xhigh") phase = "thinking-command";
+        else if (argv[4].startsWith("TASK-MAIL-JARVIS-READER-20261012 [attempt=")) phase = "task-sent";
+        return { exitCode: 0, stdout: "" };
+      }
+      if (argv[2] === "send-keys" && argv[4] === "Enter") {
+        if (phase === "model-command") phase = "catalog";
+        else if (phase === "filtered") phase = "selected";
+        else if (phase === "thinking-command") phase = "thinking-transition";
+        else if (phase === "task-sent") phase = "working";
+        timeline.push({ kind: "enter", phase });
+        return { exitCode: 0, stdout: "" };
+      }
+      throw new Error(`unexpected herdr command: ${argv.join(" ")}`);
+    };
+    const result = await dispatch("mail-hardening-cat", "TASK-MAIL-JARVIS-READER-20261012", prompt, {
+      type: "secure",
+      runCommand,
+      sleep: async () => {},
+      switchPaneModel: (targetPane, want) => switchModel(targetPane, want, runCommand, 1000),
+    });
+    const concatRead = timeline.findIndex((event) => event.kind === "read" && event.stdout.includes(concatenatedInput));
+    const emptyRead = timeline.findIndex((event, index) => index > concatRead
+      && event.kind === "read" && /❯\s*$/.test(event.stdout));
+    const taskSend = timeline.findIndex((event) => event.kind === "send-text"
+      && event.text.startsWith("TASK-MAIL-JARVIS-READER-20261012 [attempt="));
+    expect(result).toContain("DISPATCH_OK mail-hardening-cat TASK-MAIL-JARVIS-READER-20261012");
+    expect(concatRead).toBeGreaterThanOrEqual(0);
+    expect(emptyRead).toBeGreaterThan(concatRead);
+    expect(taskSend).toBeGreaterThan(emptyRead);
+  });
 });
 
 describe("fleet dependency dispatch", () => {
