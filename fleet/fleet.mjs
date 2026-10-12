@@ -560,13 +560,13 @@ async function slackHistory(since) {
   return messages;
 }
 
-async function slackHasHead(fullHead, sentAt) {
+async function slackHasHead(fullHead, sentAt, pr, runCommand = executeSignalCommand) {
   if (!/^[a-f0-9]{40}$/i.test(fullHead || "")) return false;
   const sentTime = Date.parse(sentAt);
   if (!Number.isFinite(sentTime)) return false;
   const messages = await slackHistory((sentTime / 1000).toFixed(6));
   if (!messages) return false;
-  return cursorHeadMatches(messages, fullHead);
+  return cursorHeadMatches(messages, fullHead, pr, runCommand);
 }
 
 /**
@@ -575,15 +575,43 @@ async function slackHasHead(fullHead, sentAt) {
  * REJECT/REVISE verdict. A bare SHA mention, or a table row that reads REJECT,
  * never counts as acceptance.
  */
-export function cursorHeadMatches(messages, fullHead) {
+function referencesPullRequest(text, { repo, prNumber }) {
+  const source = String(text ?? "");
+  const escapedRepo = repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:\\bPR\\s*#?${prNumber}\\b|#${prNumber}\\b|/pull/${prNumber}\\b|${escapedRepo}#${prNumber}\\b|\\b${escapedRepo}\\b)`, "i").test(source);
+}
+
+async function commitsForPullRequest(repo, prNumber, runCommand) {
+  const result = await runCommand(["gh", "api", `repos/${repo}/pulls/${prNumber}/commits`, "--paginate", "--jq", ".[].sha"]);
+  if (result.exitCode !== 0) return null;
+  const shas = result.stdout.match(/(?<![a-f0-9])[a-f0-9]{40}(?![a-f0-9])/gi) ?? [];
+  return shas.map((sha) => sha.toLowerCase());
+}
+
+export async function cursorHeadMatches(messages, fullHead, pr, runCommand = executeSignalCommand) {
   const want = String(fullHead).toLowerCase();
   if (!/^[a-f0-9]{40}$/.test(want)) return false;
-  return messages.some((message) => message.user === CURSOR_USER_ID
-    && String(message.text ?? "").split(/\n|(?<=\|)\s+(?=\|)/).some((line) => {
-      if (!/\b(?:ACCEPT|APPROVE)\b/i.test(line) || /\b(?:REJECT|REVISE)\b/i.test(line)) return false;
-      return [...line.matchAll(/(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])/gi)]
-        .some((match) => want.startsWith(match[0].toLowerCase()));
-    }));
+  let commits;
+  for (const message of messages) {
+    if (message.user !== CURSOR_USER_ID) continue;
+    const text = String(message.text ?? "");
+    const lines = text.split(/\n|(?<=\|)\s+(?=\|)/);
+    for (const line of lines) {
+      if (!/\b(?:ACCEPT|APPROVE)\b/i.test(line) || /\b(?:REJECT|REVISE)\b/i.test(line)) continue;
+      const tokens = [...line.matchAll(/(?<![a-f0-9])[a-f0-9]{7,40}(?![a-f0-9])/gi)].map((match) => match[0].toLowerCase());
+      if (tokens.includes(want)) return true;
+      if (!pr || !tokens.some((token) => token.length < 40 && want.startsWith(token))
+        || !referencesPullRequest(`${text}\n${line}`, pr)) continue;
+      commits ??= await commitsForPullRequest(pr.repo, pr.prNumber, runCommand);
+      if (!commits) continue;
+      for (const token of tokens) {
+        if (token.length === 40 || !want.startsWith(token)) continue;
+        const matches = commits.filter((sha) => sha.startsWith(token));
+        if (matches.length === 1 && matches[0] === want) return true;
+      }
+    }
+  }
+  return false;
 }
 
 function isReviewResponder(message) {
@@ -827,9 +855,12 @@ function pullRequestSignal(text, task) {
 
 export async function verifyClaims(text, task, checks = {}) {
   const results = [];
-  const checkSlackHead = checks.slackHasHead ?? slackHasHead;
   const getPrHead = checks.getPrHead ?? pullRequestHead;
   const signal = pullRequestSignal(text, task);
+  const pr = signal ? parsePullRequestSignal(signal) : null;
+  const runCommand = checks.runCommand ?? executeSignalCommand;
+  const checkSlackHead = checks.slackHasHead
+    ?? ((head, sentAt) => slackHasHead(head, sentAt, pr, runCommand));
   let actualHead = null;
   if (signal) {
     try {
@@ -1058,7 +1089,7 @@ export async function dispatchQueuedDependencies(dbHandle, paneRows, dispatchTas
 
 // Machine-checked done (Dori signals.ts idea). Spec: "pr:owner/repo#N" | "url:http://...=200" | "cmd:<shell>"; ';'-separated.
 async function executeSignalCommand(argv) {
-  const proc = Bun.spawn({ cmd: argv, stdout: "pipe", stderr: "ignore" });
+  const proc = Bun.spawn({ cmd: argv, stdout: "pipe", stderr: "ignore", signal: AbortSignal.timeout(10000) });
   const [exitCode, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
   return { exitCode, stdout };
 }

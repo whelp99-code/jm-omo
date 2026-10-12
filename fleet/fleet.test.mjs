@@ -1230,50 +1230,72 @@ describe("fleet completion claim verification", () => {
     stored.close();
   });
 
-  it("accepts only Cursor's same-line full SHA", () => {
+  it("accepts only Cursor's same-line full SHA", async () => {
     const head = "abcdef0123456789abcdef0123456789abcdef01";
-    expect(cursorHeadMatches([
+    expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: `ACCEPT head=${head}` },
       { user: "UOTHER", text: `ACCEPT head=${head}` },
     ], head)).toBe(true);
-    expect(cursorHeadMatches([
+    expect(await cursorHeadMatches([
       { user: "UOTHER", text: `ACCEPT head=${head}` },
       { user: "U0B81F5GR6V", text: `ACCEPT head=${head.slice(0, 8)}` },
-    ], head)).toBe(true);
-    expect(cursorHeadMatches([
+    ], head)).toBe(false);
+    expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: "ACCEPT head=ffffffff" },
     ], head)).toBe(false);
   });
 
-  it("does not treat a REJECT verdict that names the head as acceptance", () => {
+  it("requires PR context for short Slack SHA tokens but accepts an exact full SHA", async () => {
+    const head = "ce1cbb7b17d38b58c55e22e24963ca96afcbb0b3";
+    const options = {
+      repo: "whelp99-code/jm-omo",
+      prNumber: "5",
+    };
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT PR #5 head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(true);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `ACCEPT head=${head}` },
+    ], head)).toBe(true);
+  });
+
+  it("does not treat a REJECT verdict that names the head as acceptance", async () => {
     const head = "abcdef0123456789abcdef0123456789abcdef01";
-    expect(cursorHeadMatches([
+    expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: `REJECT head=${head}: claim check is wrong` },
     ], head)).toBe(false);
-    expect(cursorHeadMatches([
+    expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: `reviewed ${head}, needs changes` },
     ], head)).toBe(false);
   });
 
-  it("reads the verdict on the head's own table row", () => {
+  it("reads the verdict on the head's own table row", async () => {
     const rejected = `e2963141${"0".repeat(32)}`;
     const accepted = `14344f04${"0".repeat(32)}`;
     const table = `| 건 | head | 판정 | | --- | --- | --- | | Mail #57 | \`${accepted}\` | ACCEPT | | jm-omo #2 | \`${rejected}\` | REJECT |`;
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], rejected)).toBe(false);
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], accepted)).toBe(true);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], rejected)).toBe(false);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], accepted)).toBe(true);
     const lines = `jm-omo #2 ${rejected} REJECT\nMail #57 ${accepted} ACCEPT`;
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], rejected)).toBe(false);
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], accepted)).toBe(true);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], rejected)).toBe(false);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], accepted)).toBe(true);
   });
 
   it("resolves a short claim through the PR and checks Slack against the full SHA", async () => {
     const fullHead = "abcdef0123456789abcdef0123456789abcdef01";
     const acceptedPrefix = fullHead.slice(0, 8);
     const task = { sent_at: "2026-10-09T10:00:00.000Z", done: "pr:whelp99-code/jm-omo#1" };
-    const slackMessages = [{ user: "U0B81F5GR6V", text: `ACCEPT head=${acceptedPrefix}` }];
+    const slackMessages = [{ user: "U0B81F5GR6V", text: `ACCEPT PR #1 head=${acceptedPrefix}` }];
     let checkedHead;
     const verified = await verifyClaims(`Cursor ACCEPT head=${acceptedPrefix}`, task, {
-      slackHasHead: async (head, sentAt) => { checkedHead = head; return head === fullHead && sentAt === task.sent_at && cursorHeadMatches(slackMessages, head); },
+      slackHasHead: async (head, sentAt) => {
+        checkedHead = head;
+        return head === fullHead && sentAt === task.sent_at && await cursorHeadMatches(slackMessages, head,
+          { repo: "whelp99-code/jm-omo", prNumber: "1" },
+          async (argv) => ({ exitCode: 0, stdout: argv[1] === "api" ? `${fullHead}\n` : "" }));
+      },
       getPrHead: async () => fullHead,
     });
     expect(checkedHead).toBe(fullHead);
@@ -1282,7 +1304,9 @@ describe("fleet completion claim verification", () => {
 
     const differentPrefix = "ffffffff";
     const mismatchedSlack = await verifyClaims(`Cursor ACCEPT head=${acceptedPrefix}`, task, {
-      slackHasHead: async (head) => cursorHeadMatches([{ user: "U0B81F5GR6V", text: `ACCEPT head=${differentPrefix}` }], head),
+      slackHasHead: async (head) => cursorHeadMatches([{ user: "U0B81F5GR6V", text: `ACCEPT head=${differentPrefix} PR #1` }], head,
+        { repo: "whelp99-code/jm-omo", prNumber: "1" },
+        async () => ({ exitCode: 0, stdout: `${fullHead}\n` })),
       getPrHead: async () => fullHead,
     });
     expect(mismatchedSlack[0]).toMatchObject({ kind: "cursor-accept", ok: false, actualHead: fullHead });
@@ -1308,6 +1332,7 @@ describe("fleet completion claim verification", () => {
     const mergedHead = "efaf6d945ebb757ee0d349e3a65c5345cf882a8d";
     const differentHead = "efaf6d9a1234567890abcdef1234567890abcdef";
     const prefix = mergedHead.slice(0, 8);
+    const commitsCommand = async () => ({ exitCode: 0, stdout: `${mergedHead}\n${differentHead}\n` });
     let checkedHead;
     const claims = await verifyClaims(`Cursor ACCEPT head=${prefix}\nPR READY head=${prefix}`, {
       sent_at: "2026-10-09T10:00:00.000Z",
@@ -1315,12 +1340,48 @@ describe("fleet completion claim verification", () => {
     }, {
       slackHasHead: async (head) => {
         checkedHead = head;
-        return cursorHeadMatches([{ user: "U0B81F5GR6V", text: `ACCEPT head=${differentHead.slice(0, 8)}` }], head);
+        return cursorHeadMatches([{ user: "U0B81F5GR6V", text: `ACCEPT head=${differentHead.slice(0, 8)} PR #83` }], head,
+          { repo: "whelp99-code/jm-omo", prNumber: "83" }, commitsCommand);
       },
       getPrHead: async () => mergedHead,
     });
     expect(checkedHead).toBe(mergedHead);
     expect(claims.find((claim) => claim.kind === "cursor-accept")).toMatchObject({ ok: false, actualHead: mergedHead });
+  });
+
+  it("rejects an ambiguous prefix shared by current and prior PR commits", async () => {
+    const headA = "efaf6d9111111111111111111111111111111111";
+    const headB = "efaf6d9222222222222222222222222222222222";
+    const accepted = await cursorHeadMatches(
+      [{ user: "U0B81F5GR6V", text: "ACCEPT PR #84 head=efaf6d9" }],
+      headB,
+      { repo: "owner/repo", prNumber: "84" },
+      async () => ({ exitCode: 0, stdout: `${headA}\n${headB}\n` }),
+    );
+    expect(accepted).toBe(false);
+  });
+
+  it("accepts a prefix that uniquely identifies the current PR head", async () => {
+    const head = "efaf6d9222222222222222222222222222222222";
+    const accepted = await cursorHeadMatches(
+      [{ user: "U0B81F5GR6V", text: "ACCEPT PR #85 head=efaf6d92" }],
+      head,
+      { repo: "owner/repo", prNumber: "85" },
+      async () => ({ exitCode: 0, stdout: `${head}\n` }),
+    );
+    expect(accepted).toBe(true);
+  });
+
+  it("rejects a unique prefix that identifies an older PR commit", async () => {
+    const current = "efaf6d9222222222222222222222222222222222";
+    const previous = "efaf6d9111111111111111111111111111111111";
+    const accepted = await cursorHeadMatches(
+      [{ user: "U0B81F5GR6V", text: "ACCEPT PR #86 head=efaf6d91" }],
+      current,
+      { repo: "owner/repo", prNumber: "86" },
+      async () => ({ exitCode: 0, stdout: `${previous}\n${current}\n` }),
+    );
+    expect(accepted).toBe(false);
   });
 
   it("compares PR READY with the actual PR head", async () => {
