@@ -159,7 +159,9 @@ function responseBlock(screen) {
     return response < 0 ? "" : visibleLines.slice(response).join("\n").trimEnd();
   }
   const visible = visibleLines.join("\n").trimEnd();
-  return visible.split(/\n[ \t]*\n/).filter((block) => block.trim()).at(-1) ?? "";
+  return visible.split(/\n[ \t]*\n/)
+    .filter((block) => block.trim() && !/^\s*(?:TPS [\d.]+ tok\/s\b|[─━]+\s*$)/.test(block))
+    .at(-1) ?? "";
 }
 
 const QUESTION_POLICIES = [

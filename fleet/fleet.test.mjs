@@ -1179,6 +1179,27 @@ describe("fleet completion classification", () => {
     expect(classify(screen).done).toEqual({ key: "TASK-X", kind: "DONE", text: "finished" });
   });
 
+  it("finds a completion marker before Omo throughput and advances its task", async () => {
+    const screen = [
+      "⏺ Response block",
+      "",
+      "TASK-X-1_DONE summary",
+      "",
+      " TPS 35.3 tok/s. Cache hit 96.5%, 659.5s",
+      "",
+      "────",
+      "❯",
+    ].join("\n");
+    expect(classify(screen).done).toEqual({ key: "TASK-X-1", kind: "DONE", text: "summary" });
+    const result = await runWatchCycle({
+      catTask: "TASK-X-1",
+      taskStatus: "working",
+      paneScreen: screen,
+    });
+    expect(result.output).toContain("FLEET_TASK_DONE crm TASK-X-1 summary");
+    expect(result.taskStatus).toBe("done-claimed");
+  });
+
   it("keeps working-state classification and limits PR READY parsing to the latest response", () => {
     const screen = [
       "Earlier prompt: PR READY head=abcdef1234567",
