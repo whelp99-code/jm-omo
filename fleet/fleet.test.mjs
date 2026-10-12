@@ -589,7 +589,7 @@ describe("fleet PR automation", () => {
   });
 
   it("sends one REJECT follow-up to the task pane and returns it to working", async () => {
-    const db = prLoopDb({ key: "PRLOOP-REJECT", cat: "crm", done: signal, pane: "w5:p4" });
+    const db = prLoopDb({ key: "PRLOOP-REJECT", cat: "omonyang", done: signal, pane: "w5:p1" });
     db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,updated_at)
       VALUES('owner/repo','52',?,'PRLOOP-REJECT','awaiting-review','100','1')`).run(head);
     const sent = [];
@@ -607,7 +607,7 @@ describe("fleet PR automation", () => {
     await processPrLoopEvents(db, prLoopConfig, io);
     await processPrLoopEvents(db, prLoopConfig, io);
     expect(sent).toHaveLength(1);
-    expect(sent[0].pane).toBe("w5:p4");
+    expect(sent[0].pane).toBe("w3:p2");
     expect(sent[0].text).toContain(`owner/repo#52 head=${head}`);
     expect(db.query("SELECT status FROM tasks WHERE key='PRLOOP-REJECT'").get().status).toBe("working");
     expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)

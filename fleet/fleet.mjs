@@ -1486,11 +1486,12 @@ async function postPrLoopRequest(dbHandle, task, info, config, postMessage, even
 
 async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand) {
   const task = dbHandle.query("SELECT t.cat,c.pane FROM tasks t LEFT JOIN cats c ON c.id=t.cat WHERE t.key=?").get(row.task_key);
-  if (!task?.pane || task.pane === "-") throw new Error("task pane unavailable");
+  const pane = configuredCatPane(task?.cat, task?.pane);
+  if (!pane || pane === "-") throw new Error("task pane unavailable");
   const text = `Cursor REJECT for ${row.repo}#${row.pr_number} head=${row.head}:\n${verdict.text}`;
-  const sent = await runCommand(["herdr", "pane", "send-text", task.pane, text]);
+  const sent = await runCommand(["herdr", "pane", "send-text", pane, text]);
   if (sent.exitCode !== 0) throw new Error(`pane send-text exited ${sent.exitCode}`);
-  const enter = await runCommand(["herdr", "pane", "send-keys", task.pane, "Enter"]);
+  const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
   if (enter.exitCode !== 0) throw new Error(`pane Enter exited ${enter.exitCode}`);
   dbHandle.transaction(() => {
     dbHandle.query("UPDATE tasks SET status='working' WHERE key=?").run(row.task_key);
@@ -1700,14 +1701,15 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         if (claimed && verdict.kind === "reject") {
           try {
             const taskInfo = dbHandle.query("SELECT t.cat,c.pane FROM tasks t LEFT JOIN cats c ON c.id=t.cat WHERE t.key=?").get(row.task_key);
-            if (!taskInfo?.pane || taskInfo.pane === "-") throw new Error("task pane unavailable");
+            const pane = configuredCatPane(taskInfo?.cat, taskInfo?.pane);
+            if (!pane || pane === "-") throw new Error("task pane unavailable");
             const followup = `Cursor REJECT for ${row.repo}#${row.pr_number} head=${row.head}:\n${verdict.text}`;
             const sent = await (io.sendFollowup ?? (async (pane, text) => {
               const sentText = await runCommand(["herdr", "pane", "send-text", pane, text]);
               if (sentText.exitCode !== 0) return false;
               const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
               return enter.exitCode === 0;
-            }))(taskInfo.pane, followup, row);
+            }))(pane, followup, row);
             if (!sent) throw new Error("pane follow-up send failed");
             dbHandle.transaction(() => {
               dbHandle.query("UPDATE tasks SET status='working' WHERE key=?").run(row.task_key);
