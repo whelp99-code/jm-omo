@@ -1,17 +1,21 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch as watchFs, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { claimEvent, classify, cursorHeadMatches, dispatchQueuedDependencies, verifyClaims } = await import("./fleet.mjs");
+const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
 afterAll(() => rmSync(unitHome, { recursive: true, force: true }));
+
+function unitDb() {
+  return new Database(join(unitHome, ".local", "state", "omonyang", "fleet.sqlite"));
+}
 
 function dependencyDb(parentStatus) {
   const db = new Database(":memory:");
@@ -25,6 +29,262 @@ function dependencyDb(parentStatus) {
   db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,done,status,sent_at,depends_on,dispatch_type,keep_model)
     VALUES('CHILD','crm','child','/tmp/child.txt','ulw','', 'waiting', ?, 'PARENT','impl',0)`).run(new Date().toISOString());
   return db;
+}
+
+async function runBlockedDispatch(paneScreen) {
+  const home = mkdtempSync(join(tmpdir(), `jm-omo-fleet-queue-${paneScreen.toLowerCase().replaceAll(" ", "-")}-`));
+  try {
+    const state = join(home, ".local", "state", "omonyang");
+    const bin = join(home, "bin");
+    mkdirSync(state, { recursive: true });
+    mkdirSync(bin);
+    const dbPath = join(state, "fleet.sqlite");
+    const prompt = join(home, "prompt.txt");
+    const herdrLog = join(home, "herdr.log");
+    const herdrPath = join(bin, "herdr");
+    const db = new Database(dbPath);
+    db.exec(`CREATE TABLE cats(
+      id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT,
+      state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT
+    );
+    CREATE TABLE tasks(
+      key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+      done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+    );`);
+    db.query("INSERT INTO cats(id,name,pane) VALUES('crm','CRM','w6:p1')").run();
+    db.close();
+    writeFileSync(prompt, "synthetic blocked-pane prompt\n");
+    writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf '%s\\n' \"$PANE_SCREEN\"; fi\n");
+    chmodSync(herdrPath, 0o755);
+    const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+    const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, HERDR_LOG: herdrLog, PANE_SCREEN: paneScreen };
+    const proc = Bun.spawn(["bun", fleetPath, "dispatch", "crm", "CHILD", prompt, "--keep-model"], {
+      cwd: new URL("..", import.meta.url).pathname,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    const stderr = await new Response(proc.stderr).text();
+    const stored = new Database(dbPath);
+    const row = stored.query("SELECT status,depends_on,prompt,dispatch_type,keep_model FROM tasks WHERE key='CHILD'").get();
+    stored.close();
+    const herdrCalls = readFileSync(herdrLog, "utf8").trim().split("\n");
+    return { home, stdout, stderr, exitCode, row, herdrCalls };
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+async function runRawUtf8Dispatch() {
+  const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-utf8-"));
+  let proc;
+  try {
+    const state = join(home, ".local", "state", "omonyang");
+    const bin = join(home, "bin");
+    mkdirSync(state, { recursive: true });
+    mkdirSync(bin);
+    const dbPath = join(state, "fleet.sqlite");
+    const prompt = join(home, "prompt.txt");
+    const herdrLog = join(home, "herdr.log");
+    const sentMark = join(home, "sent-mark");
+    const sendBytesPath = join(home, "send-text.bin");
+    const db = new Database(dbPath);
+    db.exec(`CREATE TABLE cats(
+      id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT,
+      state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT
+    );
+    CREATE TABLE tasks(
+      key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+      done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+    );`);
+    db.query("INSERT INTO cats(id,name,pane) VALUES('crm','CRM','w6:p1')").run();
+    db.close();
+    writeFileSync(prompt, "작업 지시문 UTF-8 fixture\n");
+    const herdrPath = join(bin, "herdr");
+    writeFileSync(herdrPath, [
+      "#!/bin/sh",
+      "printf '%s\\n' \"$*\" >> \"$HERDR_LOG\"",
+      "if [ \"$1\" = pane ] && [ \"$2\" = read ]; then",
+      "  if [ -f \"$SENT_MARK\" ]; then printf 'Working (1s)\\n❯'; else printf 'Idle\\n❯'; fi",
+      "elif [ \"$1\" = pane ] && [ \"$2\" = send-text ]; then",
+      "  printf '%s\\000' \"$4\" >> \"$HERDR_SEND_BYTES\"",
+      "  : > \"$SENT_MARK\"",
+      "fi",
+      "",
+    ].join("\n"));
+    chmodSync(herdrPath, 0o755);
+    const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+    const env = {
+      ...process.env,
+      HOME: home,
+      PATH: `${bin}:${process.env.PATH}`,
+      HERDR_LOG: herdrLog,
+      HERDR_SEND_BYTES: sendBytesPath,
+      SENT_MARK: sentMark,
+    };
+    proc = Bun.spawn(["bun", fleetPath, "dispatch", "crm", "UTF8-QA", prompt, "--keep-model"], {
+      cwd: new URL("..", import.meta.url).pathname,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    proc = undefined;
+    return {
+      prompt,
+      stdout,
+      stderr,
+      exitCode,
+      sendBytes: existsSync(sendBytesPath) ? readFileSync(sendBytesPath) : null,
+    };
+  } finally {
+    if (proc) {
+      proc.kill();
+      await proc.exited;
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", reservation = false, waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
+  const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
+  const state = join(home, ".local", "state", "omonyang");
+  const bin = join(home, "bin");
+  const usageDir = join(home, ".omo", "omonyang");
+  mkdirSync(state, { recursive: true });
+  mkdirSync(bin);
+  mkdirSync(usageDir, { recursive: true });
+  const dbPath = join(state, "fleet.sqlite");
+  const herdrLog = join(home, "herdr.log");
+  const ghLog = join(home, "gh.log");
+  const firstAnswerFailedPath = join(home, "first-answer-failed");
+  const db = new Database(dbPath);
+  db.exec(`CREATE TABLE cats(
+    id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT,
+    state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT
+  );
+  CREATE TABLE tasks(
+    key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+    done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+    result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+  );
+  CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);
+  CREATE TABLE dispatch_reservations(pane TEXT PRIMARY KEY,key TEXT UNIQUE NOT NULL,attempt TEXT NOT NULL,reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
+  const taskKey = catTask || (prDone ? "PR-TASK" : "");
+  if (taskKey) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,'crm',?,?,?,?)").run(taskKey, taskKey, prDone, taskStatus, new Date().toISOString());
+  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture','unknown',?)").run(taskKey || null);
+  if (reservation && taskKey) db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('w6:p1',?,'fixture-attempt')").run(taskKey);
+  db.close();
+  writeFileSync(join(usageDir, "usage-watch.log"), usageTick ? `${usageTick}\n` : "");
+  const herdrPath = join(bin, "herdr");
+  const pgrepPath = join(bin, "pgrep");
+  const journalPath = join(bin, "journalctl");
+  const ghPath = join(bin, "gh");
+  const gitPath = join(bin, "git");
+  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf '%s\\n' \"$PANE_SCREEN\"; elif [ \"$1\" = pane ] && [ \"$2\" = send-text ] && [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n");
+  writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
+  writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
+  writeFileSync(gitPath, "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then printf 'https://github.com/whelp99-code/jm-omo.git\\n'; elif [ \"$1\" = branch ] && [ \"$2\" = --show-current ]; then printf 'fixture-branch\\n'; else exit 2; fi\n");
+  writeFileSync(ghPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_LOG\"\ncase \"$1:$2:$3\" in\n  pr:view:2) printf '%s\\n' \"$GH_PR2_JSON\" ;;\n  pr:view:*) printf '%s\\n' \"$GH_PR_JSON\" ;;\n  pr:list:*) printf '%s\\n' \"$GH_PR_LIST_JSON\" ;;\n  api:*) printf '%s\\n' \"$GH_CHECK_RUNS_JSON\" ;;\n  *) exit 2 ;;\nesac\n");
+  for (const path of [herdrPath, pgrepPath, journalPath, ghPath, gitPath]) chmodSync(path, 0o755);
+
+  const env = {
+    ...process.env,
+    HOME: home,
+    PATH: `${bin}:${process.env.PATH}`,
+    HERDR_LOG: herdrLog,
+    GH_LOG: ghLog,
+    PANE_SCREEN: paneScreen,
+    FAIL_FIRST_ANSWER: failFirstQuestionAnswer ? "1" : "0",
+    FIRST_ANSWER_FAILED: firstAnswerFailedPath,
+    GH_PR_JSON: JSON.stringify({ number: 77, title: "Fixture review", state: "OPEN", isDraft: true, url: "https://github.com/whelp99-code/jm-omo/pull/77", headRefOid: "abcdef0123456789abcdef0123456789abcdef01", reviewDecision: "REVIEW_REQUIRED", statusCheckRollup: [] }),
+    GH_PR2_JSON: JSON.stringify({ number: 2, title: "Prior fleet work", state: "OPEN", isDraft: true, url: "https://github.com/whelp99-code/jm-omo/pull/2", headRefOid: "e2963141674beffb244e237b7a6e3cc29fb08f56", reviewDecision: "REVIEW_REQUIRED", statusCheckRollup: [] }),
+    GH_PR_LIST_JSON: "[]",
+    GH_CHECK_RUNS_JSON: JSON.stringify({ check_runs: checkRuns }),
+  };
+  let watcher;
+  let heartbeatTimeout;
+  let outputTimeout;
+  let proc;
+  try {
+    let heartbeat;
+    if (command[0] === "watch") {
+      heartbeat = new Promise((resolve, reject) => {
+        heartbeatTimeout = setTimeout(() => reject(new Error("watch heartbeat timeout")), 5000);
+        watcher = watchFs(state, (_event, filename) => {
+          if (filename?.toString() === "captain-heartbeat.json") resolve();
+        });
+      });
+    }
+    const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+    proc = Bun.spawn(["bun", fleetPath, ...command], { cwd: new URL("..", import.meta.url).pathname, env, stdout: "pipe", stderr: "pipe" });
+    let outputPromise;
+    if (waitForOutput) {
+      const reader = proc.stdout.getReader();
+      const decoder = new TextDecoder();
+      outputPromise = (async () => {
+        let output = "";
+        while (!output.includes(waitForOutput)) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          output += decoder.decode(value, { stream: true });
+        }
+        reader.releaseLock();
+        return output;
+      })();
+      outputTimeout = setTimeout(() => proc?.kill(), 5000);
+    } else {
+      outputPromise = new Response(proc.stdout).text();
+    }
+    const stderrPromise = new Response(proc.stderr).text();
+    if (heartbeat) {
+      await heartbeat;
+      clearTimeout(heartbeatTimeout);
+      if (waitForOutput) await outputPromise;
+      proc.kill();
+    }
+    const [output, stderr, exitCode] = await Promise.all([outputPromise, stderrPromise, proc.exited]);
+    proc = undefined;
+    const herdrCalls = existsSync(herdrLog) ? readFileSync(herdrLog, "utf8").trim().split("\n") : [];
+    const stored = new Database(dbPath);
+    const storedTaskStatus = taskKey ? stored.query("SELECT status FROM tasks WHERE key=?").get(taskKey)?.status : null;
+    const reservationLeft = taskKey ? Boolean(stored.query("SELECT key FROM dispatch_reservations WHERE key=?").get(taskKey)) : false;
+    stored.close();
+    return {
+      output,
+      stderr,
+      exitCode,
+      taskStatus: storedTaskStatus,
+      reservationLeft,
+      ghCalls: existsSync(ghLog) ? readFileSync(ghLog, "utf8").trim().split("\n") : [],
+      herdrCalls,
+      herdrWrites: herdrCalls.filter((line) => /^pane send-(?:text|keys) /.test(line)),
+    };
+  } finally {
+    clearTimeout(heartbeatTimeout);
+    clearTimeout(outputTimeout);
+    watcher?.close();
+    if (proc) {
+      proc.kill();
+      await proc.exited;
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+async function runWatchCycle(options = {}) {
+  return runFleetCommand({ ...options, command: ["watch", "1"] });
+}
+
+async function runFleetBoard(options = {}) {
+  return runFleetCommand({ ...options, command: ["board"] });
 }
 
 describe("fleet dependency dispatch", () => {
@@ -41,13 +301,13 @@ describe("fleet dependency dispatch", () => {
     expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("waiting");
     expect(calls).toHaveLength(0);
 
-    const events = await dispatchQueuedDependencies(db, [{ id: "crm", state: "idle" }], dispatchTask);
+    const events = await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], dispatchTask);
     expect(events).toEqual(["FLEET_DEPENDENCY_DISPATCH CHILD DISPATCH_OK crm CHILD"]);
     expect(calls).toHaveLength(1);
     expect(calls[0].options.after).toBe("PARENT");
     expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("sent");
 
-    await dispatchQueuedDependencies(db, [{ id: "crm", state: "idle" }], dispatchTask);
+    await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], dispatchTask);
     expect(calls).toHaveLength(1);
     db.close();
   });
@@ -55,11 +315,371 @@ describe("fleet dependency dispatch", () => {
   it("keeps the child queued until its predecessor is verified-done", async () => {
     const db = dependencyDb("working");
     const calls = [];
-    const events = await dispatchQueuedDependencies(db, [{ id: "crm", state: "idle" }], async (...args) => calls.push(args));
+    const events = await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], async (...args) => calls.push(args));
     expect(events).toEqual([]);
     expect(calls).toHaveLength(0);
     expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("waiting");
     db.close();
+  });
+
+  it("resumes a pane-wait task once after the pane becomes idle", async () => {
+    const db = dependencyDb("working");
+    db.query("UPDATE tasks SET depends_on=NULL WHERE key='CHILD'").run();
+    const calls = [];
+    const dispatchTask = async (cat, key, prompt, options) => {
+      calls.push({ cat, key, prompt, options });
+      db.query("UPDATE tasks SET status='sent' WHERE key=?").run(key);
+      return `DISPATCH_OK ${cat} ${key}`;
+    };
+
+    expect(await dispatchWaitingTasks(db, [{ id: "crm", state: "compacting" }], dispatchTask)).toEqual([]);
+    expect(calls).toHaveLength(0);
+    expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("waiting");
+
+    expect(await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], dispatchTask))
+      .toEqual(["FLEET_DISPATCH_RESUMED CHILD DISPATCH_OK crm CHILD"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].options.after).toBeNull();
+    expect(db.query("SELECT status FROM tasks WHERE key='CHILD'").get().status).toBe("sent");
+
+    await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], dispatchTask);
+    expect(calls).toHaveLength(1);
+    db.close();
+  });
+
+  it("marks a bad queued task and continues dispatching later tasks", async () => {
+    const db = dependencyDb("verified-done");
+    db.query("DELETE FROM tasks WHERE key='CHILD'").run();
+    db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,done,status,sent_at,depends_on,dispatch_type,keep_model)
+      VALUES('BAD','crm','bad','/missing/prompt','ulw','','waiting','1',NULL,'impl',0)`).run();
+    db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,done,status,sent_at,depends_on,dispatch_type,keep_model)
+      VALUES('GOOD','crm','good','/tmp/good-prompt','ulw','','waiting','2',NULL,'impl',0)`).run();
+
+    const events = await dispatchWaitingTasks(db, [{ id: "crm", state: "idle" }], async (cat, key) => {
+      if (key === "BAD") throw new Error("PROMPT_FILE_MISSING");
+      db.query("UPDATE tasks SET status='sent' WHERE key=?").run(key);
+      return `DISPATCH_OK ${cat} ${key}`;
+    });
+    expect(events).toEqual([
+      "FLEET_DISPATCH_ERROR BAD dispatch failed: PROMPT_FILE_MISSING",
+      "FLEET_DISPATCH_RESUMED GOOD DISPATCH_OK crm GOOD",
+    ]);
+    expect(db.query("SELECT status,result FROM tasks WHERE key='BAD'").get())
+      .toEqual({ status: "dispatch-error", result: "dispatch failed: PROMPT_FILE_MISSING" });
+    expect(db.query("SELECT status FROM tasks WHERE key='GOOD'").get().status).toBe("sent");
+    db.close();
+  });
+});
+
+describe("fleet dispatch reservations", () => {
+  it("does not reclaim a refreshed send attempt or send after a reclaimed reservation", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "reservation-interleave-prompt.txt");
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    const refreshedAt = new Date().toISOString();
+    writeFileSync(prompt, "reservation interleave fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('interleave-cat','Interleave','w-interleave:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('INTERLEAVE-TASK','interleave-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-interleave:p1", "INTERLEAVE-TASK", "attempt-interleave", reservedAt);
+    const snapshot = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key='INTERLEAVE-TASK'").get();
+
+    db.query("UPDATE dispatch_reservations SET reserved_at=? WHERE key=?").run(refreshedAt, "INTERLEAVE-TASK");
+    expect(recordDispatchSendAttempt(db, snapshot.pane, snapshot.key, snapshot.attempt)).toBe(true);
+    expect(recoverDispatchReservation(db, snapshot, "idle", Date.parse(reservedAt) + 10 * 60_000)).toBeNull();
+    expect(db.query("SELECT key,reserved_at FROM dispatch_reservations WHERE key='INTERLEAVE-TASK'").get())
+      .toEqual({ key: "INTERLEAVE-TASK", reserved_at: refreshedAt });
+    db.query("INSERT INTO cats(id,name,pane) VALUES('reclaim-cat','Reclaim','w-reclaim:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('RECLAIMED-TASK','reclaim-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-reclaim:p1", "RECLAIMED-TASK", "attempt-reclaimed", reservedAt);
+    const reclaimedSnapshot = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key='RECLAIMED-TASK'").get();
+    expect(recoverDispatchReservation(db, reclaimedSnapshot, "idle", Date.parse(reservedAt) + 10 * 60_000))
+      .toBe("FLEET_DISPATCH_INTERRUPTED RECLAIMED-TASK pane=w-reclaim:p1 reservation_released");
+
+    let switchStarted;
+    let releaseSwitch;
+    const started = new Promise((resolve) => { switchStarted = resolve; });
+    const switchGate = new Promise((resolve) => { releaseSwitch = resolve; });
+    const sendCalls = [];
+    const runCommand = async (argv) => {
+      sendCalls.push(argv);
+      return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+    };
+    db.query("UPDATE tasks SET status='dispatch-interrupted',history='[]' WHERE key=?").run("RECLAIMED-TASK");
+    db.close();
+
+    const dispatching = dispatch("reclaim-cat", "RECLAIMED-TASK", prompt, {
+      runCommand,
+      sleep: async () => {},
+      switchPaneModel: async () => { switchStarted(); await switchGate; return "MODEL_SWITCHED fixture"; },
+    });
+    const switchOutcome = await Promise.race([
+      started.then(() => "switch-started"),
+      dispatching.then((result) => `returned:${result}`, (error) => `threw:${error?.message ?? error}`),
+    ]);
+    expect(switchOutcome).toBe("switch-started");
+    const staleDb = unitDb();
+    staleDb.query("UPDATE dispatch_reservations SET reserved_at=? WHERE key=?")
+      .run(reservedAt, "RECLAIMED-TASK");
+    expect(await recoverInterruptedDispatches(staleDb, [{ id: "reclaim-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000))
+      .toEqual(["FLEET_DISPATCH_INTERRUPTED RECLAIMED-TASK pane=w-reclaim:p1 reservation_released"]);
+    staleDb.close();
+    releaseSwitch();
+    expect(await dispatching).toBe("DISPATCH_HOLD reclaim-cat reservation-expired; not sent");
+    expect(sendCalls.some((argv) => argv[2] === "send-text")).toBe(false);
+  });
+
+  it("recovers an expired dispatch and allows its task key to be retried", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "interrupted-dispatch-prompt.txt");
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    writeFileSync(prompt, "interrupted dispatch fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('interrupted-cat','Interrupted','w-interrupted:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('INTERRUPTED-TASK','interrupted-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-interrupted:p1", "INTERRUPTED-TASK", "interrupted-attempt", reservedAt);
+    db.close();
+
+    const recovered = unitDb();
+    const events = await recoverInterruptedDispatches(recovered, [{ id: "interrupted-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000);
+    expect(events).toEqual(["FLEET_DISPATCH_INTERRUPTED INTERRUPTED-TASK pane=w-interrupted:p1 reservation_released"]);
+    expect(recovered.query("SELECT status FROM tasks WHERE key='INTERRUPTED-TASK'").get().status).toBe("dispatch-interrupted");
+    expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-interrupted:p1'").get()).toBeNull();
+    recovered.close();
+
+    let reads = 0;
+    const result = await dispatch("interrupted-cat", "INTERRUPTED-TASK", prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async (argv) => ({
+        exitCode: 0,
+        stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+      }),
+    });
+    expect(result).toContain("DISPATCH_OK interrupted-cat INTERRUPTED-TASK");
+  });
+
+  it("releases an expired send-failed reservation so the pane can accept new work", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "after-send-failed-prompt.txt");
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    writeFileSync(prompt, "after uncertain send fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('send-failed-recovery-cat','Send Failed','w-send-failed:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('SEND-ATTEMPTED-OLD','send-failed-recovery-cat','dispatching',?)")
+      .run(JSON.stringify([{ ev: "send-attempted", attempt: "attempt-send-failed" }]));
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-send-failed:p1", "SEND-ATTEMPTED-OLD", "attempt-send-failed", reservedAt);
+    const reservation = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key=?").get("SEND-ATTEMPTED-OLD");
+
+    const event = recoverDispatchReservation(db, reservation, "idle", Date.parse(reservedAt) + 10 * 60_000);
+    expect(event).toBe("FLEET_SEND_FAILED_UNCONFIRMED SEND-ATTEMPTED-OLD pane=w-send-failed:p1 reservation_released");
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get("SEND-ATTEMPTED-OLD").status).toBe("send-failed-unconfirmed");
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane='w-send-failed:p1'").get()).toBeNull();
+    db.close();
+
+    let reads = 0;
+    const result = await dispatch("send-failed-recovery-cat", "AFTER-SEND-FAILED", prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async (argv) => ({
+        exitCode: 0,
+        stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+      }),
+    });
+    expect(result).toContain("DISPATCH_OK send-failed-recovery-cat AFTER-SEND-FAILED");
+  });
+
+  it("escapes and confirms the prompt before reclaiming a stale model-picker reservation", async () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('picker-cat','Picker','w-picker:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('PICKER-TASK','picker-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-picker:p1", "PICKER-TASK", "picker-attempt", reservedAt);
+    db.close();
+
+    expect(classify("Select model\n→ claude-sonnet [anthropic]\n❯").state).toBe("model-picker");
+    const calls = [];
+    const recovered = unitDb();
+    const events = await recoverInterruptedDispatches(recovered, [{ id: "picker-cat", state: "model-picker" }], Date.parse(reservedAt) + 10 * 60_000, async (argv) => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+    });
+    expect(calls.map((argv) => argv.slice(1, 4))).toEqual([
+      ["pane", "send-keys", "w-picker:p1"],
+      ["pane", "read", "w-picker:p1"],
+    ]);
+    expect(events).toEqual(["FLEET_DISPATCH_INTERRUPTED PICKER-TASK pane=w-picker:p1 reservation_released"]);
+    expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-picker:p1'").get()).toBeNull();
+    recovered.close();
+  });
+
+  it("does not escape a model picker while its reservation is fresh", async () => {
+    const db = unitDb();
+    const reservedAt = new Date().toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('fresh-picker-cat','Fresh Picker','w-fresh-picker:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('FRESH-PICKER-TASK','fresh-picker-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-fresh-picker:p1", "FRESH-PICKER-TASK", "fresh-picker-attempt", reservedAt);
+    db.close();
+
+    const calls = [];
+    const recovered = unitDb();
+    expect(await recoverInterruptedDispatches(recovered, [{ id: "fresh-picker-cat", state: "model-picker" }], Date.now(), async (argv) => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: "Idle\n❯" };
+    })).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-fresh-picker:p1'").get().key)
+      .toBe("FRESH-PICKER-TASK");
+    recovered.close();
+  });
+
+  it("reserves the pane before either concurrent dispatch can switch its model", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "model-reservation-prompt.txt");
+    writeFileSync(prompt, "model reservation fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('model-reservation-cat','Model Reservation','w-model:p1')").run();
+    db.close();
+
+    let resolveSwitchGate;
+    let switchCalls = 0;
+    const switchCallbacks = [];
+    const firstSwitch = new Promise((resolve) => { switchCallbacks.push(resolve); });
+    const secondSwitch = new Promise((resolve) => { switchCallbacks.push(resolve); });
+    const switchGate = new Promise((resolve) => { resolveSwitchGate = resolve; });
+    const switchPaneModel = async () => {
+      switchCallbacks[switchCalls++]();
+      await switchGate;
+      return "MODEL_SWITCHED fixture";
+    };
+    const runCommand = async (argv) => ({
+      exitCode: 0,
+      stdout: argv[2] === "read" ? "Idle\n❯" : "",
+    });
+    let first;
+    let second;
+    try {
+      first = dispatch("model-reservation-cat", "MODEL-RESERVE-1", prompt, {
+        runCommand,
+        switchPaneModel,
+        sleep: async () => {},
+      });
+      await firstSwitch;
+      second = dispatch("model-reservation-cat", "MODEL-RESERVE-2", prompt, {
+        runCommand,
+        switchPaneModel,
+        sleep: async () => {},
+      });
+      const outcome = await Promise.race([
+        second.then((result) => ({ result })),
+        secondSwitch.then(() => ({ switchEntered: true })),
+      ]);
+      expect(outcome).toEqual({ result: "DISPATCH_HOLD model-reservation-cat pane-reserved; not sent" });
+      expect(switchCalls).toBe(1);
+    } finally {
+      resolveSwitchGate();
+      await Promise.allSettled([first, second].filter(Boolean));
+    }
+  });
+
+  it("holds a second dispatch on a pane while the first send is unresolved", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "reservation-prompt.txt");
+    writeFileSync(prompt, "reservation fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('reservation-cat','Reservation','w-res:p1')").run();
+    db.close();
+
+    let beginSend;
+    let releaseSend;
+    const sendStarted = new Promise((resolve) => { beginSend = resolve; });
+    const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+    const commands = [];
+    const runCommand = async (argv) => {
+      commands.push(argv);
+      if (argv[2] === "read") return { exitCode: 0, stdout: "Idle\n❯" };
+      if (argv[2] === "send-text") {
+        beginSend();
+        await sendGate;
+      }
+      return { exitCode: 0, stdout: "" };
+    };
+
+    const first = dispatch("reservation-cat", "RESERVATION-1", prompt, {
+      keepModel: true,
+      runCommand,
+      sleep: async () => {},
+    });
+    await sendStarted;
+    expect(await dispatch("reservation-cat", "RESERVATION-1", prompt, {
+      keepModel: true,
+      runCommand,
+      sleep: async () => {},
+    })).toBe("DISPATCH_HOLD reservation-cat duplicate-key; not sent");
+    const second = await dispatch("reservation-cat", "RESERVATION-2", prompt, {
+      keepModel: true,
+      runCommand,
+      sleep: async () => {},
+    });
+    expect(second).toBe("DISPATCH_HOLD reservation-cat pane-reserved; not sent");
+    expect(commands.find((argv) => argv[2] === "send-text")?.[4]).toContain("[attempt=");
+    releaseSend();
+    expect(await first).toContain("DISPATCH_UNCONFIRMED reservation-cat RESERVATION-1");
+  });
+
+  it("releases a blocked task reservation so the pane can take a new dispatch", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "blocked-release-prompt.txt");
+    writeFileSync(prompt, "after blocked fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('blocked-release-cat','Blocked Release','w-block:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status) VALUES('BLOCKED-OLD','blocked-release-cat','working')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('w-block:p1','BLOCKED-OLD','attempt-blocked')").run();
+    db.close();
+
+    markTaskBlocked("BLOCKED-OLD", "not proceeding");
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key='BLOCKED-OLD'").get().status).toBe("blocked");
+    expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-block:p1'").get()).toBeNull();
+    stored.close();
+
+    let reads = 0;
+    const result = await dispatch("blocked-release-cat", "AFTER-BLOCKED", prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async (argv) => ({
+        exitCode: 0,
+        stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+      }),
+    });
+    expect(result).toContain("DISPATCH_OK blocked-release-cat AFTER-BLOCKED");
+  });
+
+  it("releases a prompt-lost task reservation so the pane can take a new dispatch", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "prompt-lost-release-prompt.txt");
+    writeFileSync(prompt, "after prompt lost fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('prompt-lost-release-cat','Prompt Lost Release','w-lost:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status) VALUES('PROMPT-LOST-OLD','prompt-lost-release-cat','working')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('w-lost:p1','PROMPT-LOST-OLD','attempt-lost')").run();
+    db.close();
+
+    markTaskPromptLost("PROMPT-LOST-OLD");
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key='PROMPT-LOST-OLD'").get().status).toBe("prompt-lost");
+    expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-lost:p1'").get()).toBeNull();
+    stored.close();
+
+    let reads = 0;
+    const result = await dispatch("prompt-lost-release-cat", "AFTER-PROMPT-LOST", prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async (argv) => ({
+        exitCode: 0,
+        stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+      }),
+    });
+    expect(result).toContain("DISPATCH_OK prompt-lost-release-cat AFTER-PROMPT-LOST");
   });
 });
 
@@ -123,45 +743,264 @@ describe("fleet completion classification", () => {
 });
 
 describe("fleet completion claim verification", () => {
-  it("accepts only Cursor's message with the matching head prefix", () => {
+  it("preserves concurrent task history appends", async () => {
+    const db = unitDb();
+    const key = "HISTORY-CONCURRENT";
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES(?,'reservation-cat','working','[]')").run(key);
+    db.close();
+
+    const first = unitDb();
+    const second = unitDb();
+    await Promise.all([
+      Promise.resolve().then(() => appendTaskHistory(first, key, { ev: "done-claimed", text: "finished" })),
+      Promise.resolve().then(() => appendTaskHistory(second, key, { ev: "claim-ok", claim: "cursor-accept" })),
+    ]);
+    first.close();
+    second.close();
+
+    const stored = unitDb();
+    const history = JSON.parse(stored.query("SELECT history FROM tasks WHERE key=?").get(key).history);
+    expect(history.map((event) => event.ev)).toEqual(["done-claimed", "claim-ok"]);
+    stored.close();
+  });
+
+  it("checks PR signals using injected argv commands and validates full object IDs", async () => {
+    const calls = [];
+    const head = "0123456789abcdef0123456789abcdef01234567";
+    const merge = "abcdef0123456789abcdef0123456789abcdef01";
+    const result = await checkSignal("pr:whelp99-code/jm-omo#77", async (argv) => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: JSON.stringify({ state: "MERGED", headRefOid: head, mergeCommit: { oid: merge } }) };
+    });
+    expect(calls).toEqual([["gh", "pr", "view", "77", "--repo", "whelp99-code/jm-omo", "--json", "state,mergeCommit,headRefOid"]]);
+    expect(result).toMatchObject({ ok: true, headRefOid: head, mergeCommit: merge });
+
+    const failed = await checkSignal("pr:whelp99-code/jm-omo#77", async () => ({
+      exitCode: 1,
+      stdout: JSON.stringify({ state: "MERGED", headRefOid: "short", mergeCommit: { oid: "short" } }),
+    }));
+    expect(failed).toMatchObject({ ok: false, headRefOid: undefined, mergeCommit: undefined });
+  });
+
+  it("rejects unsupported and credential-bearing curl URLs without executing them", async () => {
+    const calls = [];
+    for (const signal of [
+      "url:ftp://example.com/status=200",
+      "url:https://user:password@example.com/status=200",
+    ]) {
+      expect(await checkSignal(signal, async (argv) => { calls.push(argv); return { exitCode: 0, stdout: "200" }; }))
+        .toMatchObject({ ok: false, detail: "unsupported URL" });
+    }
+    expect(calls).toHaveLength(0);
+
+    const accepted = await checkSignal("url:https://example.com/status=200", async (argv) => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: "200" };
+    });
+    expect(accepted).toMatchObject({ ok: true, httpCode: 200 });
+    expect(calls[0]).toEqual(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "6", "--", "https://example.com/status"]);
+  });
+
+  it("requires Cursor acceptance and an exact PR head before verified-done", async () => {
+    const db = unitDb();
+    const key = "VERIFY-CLAIMS";
+    const head = "0123456789abcdef0123456789abcdef01234567";
+    const history = [
+      { ev: "reserved", attempt: "attempt-123" },
+      { ev: "claim-ok", claim: "cursor-accept", head, acceptedPrefix: head, actualHead: head, detail: "slack_author_full_head_match" },
+      { ev: "claim-ok", claim: "pr-ready", head, acceptedPrefix: head, actualHead: head, detail: "pr_head_match" },
+    ];
+    db.query("INSERT INTO tasks(key,cat,done,status,history) VALUES(?,?,?,'done-claimed',?)")
+      .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#77", JSON.stringify(history));
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,?,?)")
+      .run("w-verify:p1", key, "attempt-123");
+    db.close();
+
+    const result = await verify(key, async () => ({
+      ok: true,
+      headRefOid: "0123456789abcdef0123456789abcdef01234567",
+      mergeCommit: "abcdef0123456789abcdef0123456789abcdef01",
+    }));
+    expect(result).toContain("VERIFIED_DONE VERIFY-CLAIMS");
+    const stored = unitDb();
+    const task = stored.query("SELECT status,evidence FROM tasks WHERE key=?").get(key);
+    expect(task.status).toBe("verified-done");
+    expect(JSON.parse(task.evidence)).toMatchObject({
+      attempt: "attempt-123",
+      claims: [{ headRefOid: head, cursorAccept: { headRefOid: head, acceptedPrefix: head, ok: true }, prReady: { headRefOid: head, acceptedPrefix: head, actualHead: head, ok: true } }],
+    });
+    stored.close();
+  });
+
+  it("rejects a merged head different from the recorded ACCEPT and PR READY heads", async () => {
+    const db = unitDb();
+    const key = "VERIFY-OLD-HEAD";
+    const headA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const headB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
+      .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#79", JSON.stringify([
+        { ev: "claim-ok", claim: "cursor-accept", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "slack_author_full_head_match" },
+        { ev: "claim-ok", claim: "pr-ready", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "pr_head_match" },
+      ]));
+    db.close();
+
+    const result = await verify(key, async () => ({ ok: true, headRefOid: headB, mergeCommit: "c".repeat(40) }));
+    expect(result).toContain("NOT_DONE VERIFY-OLD-HEAD");
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("not-done");
+    stored.close();
+  });
+
+  it("normalizes abbreviated accepted and PR READY heads to the full merged head", async () => {
+    const db = unitDb();
+    const key = "VERIFY-SHORT-HEAD";
+    const fullHead = "abcdef0123456789abcdef0123456789abcdef01";
+    const sentAt = "2026-10-12T00:00:00.000Z";
+    let slackHead;
+    const claims = await verifyClaims("Cursor ACCEPT head=abcdef01\nPR READY head=abcdef0123", {
+      sent_at: sentAt,
+      done: "pr:whelp99-code/jm-omo#81",
+    }, {
+      slackHasHead: async (head) => { slackHead = head; return head === fullHead; },
+      getPrHead: async () => fullHead,
+    });
+    expect(slackHead).toBe(fullHead);
+    expect(claims).toMatchObject([
+      { kind: "cursor-accept", ok: true, head: fullHead, acceptedPrefix: "abcdef01", actualHead: fullHead },
+      { kind: "pr-ready", ok: true, head: fullHead, acceptedPrefix: "abcdef0123", actualHead: fullHead },
+    ]);
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
+      .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#81", JSON.stringify([
+        ...claims.map((claim) => ({ ev: "claim-ok", claim: claim.kind, head: claim.head, acceptedPrefix: claim.acceptedPrefix, actualHead: claim.actualHead, detail: claim.detail })),
+      ]));
+    db.close();
+
+    const result = await verify(key, async () => ({ ok: true, headRefOid: fullHead, mergeCommit: "e".repeat(40) }));
+    expect(result).toContain("VERIFIED_DONE VERIFY-SHORT-HEAD");
+    const stored = unitDb();
+    const task = stored.query("SELECT status,evidence FROM tasks WHERE key=?").get(key);
+    expect(task.status).toBe("verified-done");
+    expect(JSON.parse(task.evidence).claims[0]).toMatchObject({
+      headRefOid: fullHead,
+      cursorAccept: { headRefOid: fullHead, acceptedPrefix: "abcdef01", ok: true },
+      prReady: { headRefOid: fullHead, acceptedPrefix: "abcdef0123", actualHead: fullHead, ok: true },
+    });
+    stored.close();
+  });
+
+  it("retries failed verification after matching claims arrive without changing DONE", async () => {
+    const db = unitDb();
+    const key = "VERIFY-RETRY";
+    const headA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const headB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const done = "pr:whelp99-code/jm-omo#80";
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
+      .run(key, "reservation-cat", done, JSON.stringify([
+        { ev: "done-claimed", text: "finished" },
+        { ev: "claim-ok", claim: "cursor-accept", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "slack_author_full_head_match" },
+        { ev: "claim-ok", claim: "pr-ready", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "pr_head_match" },
+      ]));
+    db.close();
+
+    const first = await verify(key, async () => ({ ok: false, headRefOid: headB }));
+    expect(first).toContain("NOT_DONE VERIFY-RETRY");
+    const second = await verify(key, async () => ({ ok: true, headRefOid: headA, mergeCommit: "d".repeat(40) }));
+    expect(second).toContain("VERIFIED_DONE VERIFY-RETRY");
+    const stored = unitDb();
+    expect(stored.query("SELECT status,done FROM tasks WHERE key=?").get(key)).toEqual({ status: "verified-done", done });
+    stored.close();
+  });
+
+  it("retries failed verification after a bare DONE claim with an empty result", async () => {
+    const db = unitDb();
+    const key = "VERIFY-EMPTY-RESULT";
+    const head = "abcdef0123456789abcdef0123456789abcdef01";
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'not-done','',?)")
+      .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#82", JSON.stringify([
+        { ev: "done-claimed", text: "" },
+        { ev: "claim-ok", claim: "cursor-accept", head, acceptedPrefix: head.slice(0, 8), actualHead: head, detail: "slack_author_full_head_match" },
+        { ev: "claim-ok", claim: "pr-ready", head, acceptedPrefix: head.slice(0, 10), actualHead: head, detail: "pr_head_match" },
+        { ev: "not-done", detail: "PR was not merged yet" },
+      ]));
+    db.close();
+
+    const result = await verify(key, async () => ({ ok: true, headRefOid: head, mergeCommit: "f".repeat(40) }));
+    expect(result).toContain("VERIFIED_DONE VERIFY-EMPTY-RESULT");
+    const stored = unitDb();
+    expect(stored.query("SELECT status,result FROM tasks WHERE key=?").get(key))
+      .toEqual({ status: "verified-done", result: "" });
+    stored.close();
+  });
+
+  it("retains an unverified PR task when Cursor claim evidence is missing", async () => {
+    const db = unitDb();
+    const key = "VERIFY-MISSING-CLAIM";
+    db.query("INSERT INTO tasks(key,cat,done,status,history) VALUES(?,?,?,'done-claimed',?)")
+      .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#78", JSON.stringify([
+        { ev: "claim-ok", claim: "pr-ready", detail: "pr_head_match" },
+      ]));
+    db.close();
+
+    const result = await verify(key, async () => ({ ok: true }));
+    expect(result).toContain("NOT_DONE VERIFY-MISSING-CLAIM");
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("not-done");
+    stored.close();
+  });
+
+  it("accepts only Cursor's same-line full SHA", () => {
+    const head = "abcdef0123456789abcdef0123456789abcdef01";
     expect(cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "ACCEPT head=abcdef123456" },
-      { user: "UOTHER", text: "ACCEPT head=abcdef123456" },
-    ], "abcdef1")).toBe(true);
+      { user: "U0B81F5GR6V", text: `ACCEPT head=${head}` },
+      { user: "UOTHER", text: `ACCEPT head=${head}` },
+    ], head)).toBe(true);
     expect(cursorHeadMatches([
-      { user: "UOTHER", text: "ACCEPT head=abcdef123456" },
-      { user: "U0B81F5GR6V", text: "ACCEPT head=1234567" },
-    ], "abcdef1")).toBe(false);
+      { user: "UOTHER", text: `ACCEPT head=${head}` },
+      { user: "U0B81F5GR6V", text: `ACCEPT head=${head.slice(0, 8)}` },
+    ], head)).toBe(true);
+    expect(cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT head=ffffffff" },
+    ], head)).toBe(false);
   });
 
   it("does not treat a REJECT verdict that names the head as acceptance", () => {
+    const head = "abcdef0123456789abcdef0123456789abcdef01";
     expect(cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "REJECT head=abcdef123456: claim check is wrong" },
-    ], "abcdef1")).toBe(false);
+      { user: "U0B81F5GR6V", text: `REJECT head=${head}: claim check is wrong` },
+    ], head)).toBe(false);
     expect(cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "reviewed abcdef123456, needs changes" },
-    ], "abcdef1")).toBe(false);
+      { user: "U0B81F5GR6V", text: `reviewed ${head}, needs changes` },
+    ], head)).toBe(false);
   });
 
   it("reads the verdict on the head's own table row", () => {
-    const table = "| 건 | head | 판정 | | --- | --- | --- | | Mail #57 | `14344f04` | ACCEPT | | jm-omo #2 | `e2963141` | REJECT |";
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], "e2963141")).toBe(false);
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], "14344f04")).toBe(true);
-    const lines = "jm-omo #2 e2963141 REJECT\nMail #57 14344f04 ACCEPT";
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], "e2963141")).toBe(false);
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], "14344f04")).toBe(true);
+    const rejected = `e2963141${"0".repeat(32)}`;
+    const accepted = `14344f04${"0".repeat(32)}`;
+    const table = `| 건 | head | 판정 | | --- | --- | --- | | Mail #57 | \`${accepted}\` | ACCEPT | | jm-omo #2 | \`${rejected}\` | REJECT |`;
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], rejected)).toBe(false);
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], accepted)).toBe(true);
+    const lines = `jm-omo #2 ${rejected} REJECT\nMail #57 ${accepted} ACCEPT`;
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], rejected)).toBe(false);
+    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], accepted)).toBe(true);
   });
 
-  it("requires the Cursor author and matching seven-character head", async () => {
-    const task = { sent_at: "2026-10-09T10:00:00.000Z" };
-    const verified = await verifyClaims("Cursor ACCEPT head=abcdef123456", task, {
-      slackHasHead: async (head, sentAt) => head === "abcdef1" && sentAt === task.sent_at,
+  it("resolves a short claim through the PR and checks Slack against the full SHA", async () => {
+    const fullHead = "abcdef0123456789abcdef0123456789abcdef01";
+    const acceptedPrefix = fullHead.slice(0, 8);
+    const task = { sent_at: "2026-10-09T10:00:00.000Z", done: "pr:whelp99-code/jm-omo#1" };
+    const slackMessages = [{ user: "U0B81F5GR6V", text: `ACCEPT head=${acceptedPrefix}` }];
+    let checkedHead;
+    const verified = await verifyClaims(`Cursor ACCEPT head=${acceptedPrefix}`, task, {
+      slackHasHead: async (head, sentAt) => { checkedHead = head; return head === fullHead && sentAt === task.sent_at && cursorHeadMatches(slackMessages, head); },
+      getPrHead: async () => fullHead,
     });
-    expect(verified[0]).toMatchObject({ kind: "cursor-accept", ok: true });
-    expect(claimEvent("crm", "TASK-X", verified[0])).toBe("FLEET_CLAIM_OK crm TASK-X cursor-accept slack_author_head_match");
+    expect(checkedHead).toBe(fullHead);
+    expect(verified[0]).toMatchObject({ kind: "cursor-accept", ok: true, head: fullHead, acceptedPrefix, actualHead: fullHead });
+    expect(claimEvent("crm", "TASK-X", verified[0])).toBe("FLEET_CLAIM_OK crm TASK-X cursor-accept slack_author_full_head_match");
 
-    const rejected = await verifyClaims("Cursor APPROVE head=abcdef123456", task, {
+    const rejected = await verifyClaims(`Cursor APPROVE head=${acceptedPrefix}`, task, {
       slackHasHead: async () => false,
+      getPrHead: async () => fullHead,
     });
     expect(rejected[0]).toMatchObject({ kind: "cursor-accept", ok: false });
     expect(claimEvent("crm", "TASK-X", rejected[0])).toStartWith("FLEET_CLAIM_FALSE ");
@@ -170,10 +1009,29 @@ describe("fleet completion claim verification", () => {
       sent_at: task.sent_at,
       done: "pr:whelp99-code/jm-omo#1",
     }, {
-      slackHasHead: async (head) => head === "abcdef1",
-      getPrHead: async () => "abcdef123456",
+      slackHasHead: async () => true,
+      getPrHead: async () => fullHead,
     });
-    expect(separateLine.find((claim) => claim.kind === "cursor-accept").ok).toBe(true);
+    expect(separateLine.find((claim) => claim.kind === "cursor-accept").ok).toBe(false);
+  });
+
+  it("rejects a Slack ACCEPT collision on the same seven-character prefix", async () => {
+    const mergedHead = "efaf6d945ebb757ee0d349e3a65c5345cf882a8d";
+    const differentHead = "efaf6d9a1234567890abcdef1234567890abcdef";
+    const prefix = mergedHead.slice(0, 7);
+    let checkedHead;
+    const claims = await verifyClaims(`Cursor ACCEPT head=${prefix}\nPR READY head=${prefix}`, {
+      sent_at: "2026-10-09T10:00:00.000Z",
+      done: "pr:whelp99-code/jm-omo#83",
+    }, {
+      slackHasHead: async (head) => {
+        checkedHead = head;
+        return cursorHeadMatches([{ user: "U0B81F5GR6V", text: `ACCEPT head=${differentHead.slice(0, 8)}` }], head);
+      },
+      getPrHead: async () => mergedHead,
+    });
+    expect(checkedHead).toBe(mergedHead);
+    expect(claims.find((claim) => claim.kind === "cursor-accept")).toMatchObject({ ok: false, actualHead: mergedHead });
   });
 
   it("compares PR READY with the actual PR head", async () => {
@@ -234,7 +1092,43 @@ describe("fleet completion claim verification", () => {
   });
 });
 
+describe("fleet Gajae event deduplication", () => {
+  it("evicts expired origins while retaining recent dedupe keys", () => {
+    const nowMs = 5_000_000;
+    const seen = new Map([
+      ["expired C0C6HJM0BV5:1.1", nowMs - 31 * 60_000],
+      ["recent C0C6HJM0BV5:2.2", nowMs - 20 * 60_000],
+    ]);
+    expect(shouldSuppressGajae(seen, "new C0C6HJM0BV5:3.3", nowMs)).toBe(false);
+    expect(seen.has("expired C0C6HJM0BV5:1.1")).toBe(false);
+    expect(seen.has("recent C0C6HJM0BV5:2.2")).toBe(true);
+    expect(seen.size).toBe(2);
+  });
+
+  it("suppresses the same reason and origin for thirty minutes", () => {
+    const seen = new Map();
+    expect(shouldSuppressGajae(seen, "recovery_hold C0C6HJM0BV5:123.456", 1_000_000)).toBe(false);
+    expect(shouldSuppressGajae(seen, "recovery_hold C0C6HJM0BV5:123.456", 1_000_000 + 29 * 60_000)).toBe(true);
+    expect(shouldSuppressGajae(seen, "recovery_hold C0C6HJM0BV5:123.456", 1_000_000 + 30 * 60_000)).toBe(false);
+  });
+});
+
 describe("fleet dispatch CLI persistence", () => {
+  for (const paneScreen of ["Compacting", "Question pending"]) {
+    it(`queues a dispatch while the pane is ${paneScreen}`, async () => {
+      const result = await runBlockedDispatch(paneScreen);
+      expect(result.exitCode).toBe(0, result.stderr);
+      expect(result.row?.status).toBe("waiting");
+      expect(result.row?.prompt).toBe(join(result.home, "prompt.txt"));
+      expect(result.row?.dispatch_type).toBe("impl");
+      expect(result.row?.keep_model).toBe(1);
+      expect(result.herdrCalls).toHaveLength(1);
+      expect(result.herdrCalls[0]).toContain("pane read w6:p1");
+      expect(result.herdrCalls[0]).not.toMatch(/send-text|send-keys/);
+      expect(existsSync(result.home)).toBe(false);
+    });
+  }
+
   it("stores --after and leaves the child waiting while its pane is busy", async () => {
     const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-cli-"));
     const state = join(home, ".local", "state", "omonyang");
@@ -310,5 +1204,408 @@ describe("fleet dispatch CLI persistence", () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+describe("fleet watch sent-unconfirmed recheck", () => {
+  it("marks a late Working pane as started without resending", async () => {
+    const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unconfirmed-"));
+    const state = join(home, ".local", "state", "omonyang");
+    const bin = join(home, "bin");
+    mkdirSync(state, { recursive: true });
+    mkdirSync(bin);
+    const dbPath = join(state, "fleet.sqlite");
+    const herdrLog = join(home, "herdr.log");
+    const db = new Database(dbPath);
+    db.exec(`CREATE TABLE cats(
+      id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT,
+      state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT
+    );
+    CREATE TABLE tasks(
+      key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+      done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+    );
+    CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);`);
+    db.query("INSERT INTO cats(id,name,kind,pane,task) VALUES('crm','CRM','pane','w6:p1','CHILD')").run();
+    db.query("INSERT INTO tasks(key,cat,status,sent_at) VALUES('CHILD','crm','sent-unconfirmed',?)").run(new Date().toISOString());
+    db.close();
+
+    try {
+      const herdrPath = join(bin, "herdr");
+      const pgrepPath = join(bin, "pgrep");
+      const journalPath = join(bin, "journalctl");
+      writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf 'Working (late start)\\n'; fi\n");
+      writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
+      writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
+      chmodSync(herdrPath, 0o755);
+      chmodSync(pgrepPath, 0o755);
+      chmodSync(journalPath, 0o755);
+      const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, HERDR_LOG: herdrLog };
+      const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const proc = Bun.spawn(["bun", fleetPath, "watch", "1"], {
+        cwd: new URL("..", import.meta.url).pathname,
+        env,
+        signal: controller.signal,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      const reader = proc.stdout.getReader();
+      let output = "";
+      const decoder = new TextDecoder();
+      try {
+        while (!output.includes("FLEET_TASK_STARTED crm CHILD")) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          output += decoder.decode(value, { stream: true });
+        }
+      } finally {
+        clearTimeout(timeout);
+        proc.kill();
+        await proc.exited;
+        reader.releaseLock();
+      }
+      expect(output).toContain("FLEET_TASK_STARTED crm CHILD");
+      const stored = new Database(dbPath);
+      const task = stored.query("SELECT status,started_at FROM tasks WHERE key='CHILD'").get();
+      stored.close();
+      expect(task.status).toBe("working");
+      expect(task.started_at).not.toBeNull();
+      expect(readFileSync(herdrLog, "utf8")).not.toMatch(/send-text|send-keys/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("fleet working-task compaction recovery", () => {
+  it("releases a working task reservation when compaction definitively fails", async () => {
+    const result = await runWatchCycle({
+      catTask: "WORKING-COMPACTION",
+      taskStatus: "working",
+      reservation: true,
+      paneScreen: "compaction did not complete\n❯",
+    });
+    expect(result.output).toContain("FLEET_PROMPT_LOST crm WORKING-COMPACTION");
+    expect(result.taskStatus).toBe("prompt-lost");
+    expect(result.reservationLeft).toBe(false);
+  });
+});
+
+describe("fleet usage and Bugbot alerts", () => {
+  it("monitors tracked tasks in the watcher and board before completion", async () => {
+    const options = {
+      catTask: "TRACKED-PR",
+      taskStatus: "tracked-unconfirmed",
+      prDone: "pr:whelp99-code/jm-omo#77",
+      paneScreen: "Working (2s)\n❯",
+      checkRuns: [{
+        name: "Cursor Bugbot",
+        status: "completed",
+        conclusion: "neutral",
+        output: {
+          title: "Bugbot couldn't run - usage limit reached",
+          summary: "Bugbot couldn't run - usage limit reached",
+          text: "",
+        },
+      }],
+    };
+    const watch = await runWatchCycle(options);
+    expect(watch.output).toContain("FLEET_TASK_STARTED crm TRACKED-PR");
+    expect(watch.taskStatus).toBe("working");
+    expect(watch.output).toContain("FLEET_BUGBOT_LIMIT TRACKED-PR");
+
+    const board = await runFleetBoard(options);
+    expect(board.output).toContain("#77 OPEN draft");
+    expect(board.output).toContain("Cursor Bugbot=USAGE_LIMIT");
+  });
+
+  it("reconciles a visibly working send-failed-unconfirmed task", async () => {
+    const result = await runWatchCycle({
+      catTask: "SEND-FAILED",
+      taskStatus: "send-failed-unconfirmed",
+      paneScreen: "Working (1s)\n❯",
+    });
+    expect(result.output).toContain("FLEET_TASK_STARTED crm SEND-FAILED");
+    expect(result.taskStatus).toBe("working");
+    expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("emits one alert for each USAGE_TICK threshold without switching models", async () => {
+    const result = await runWatchCycle({ usageTick: "USAGE_TICK anthropic=60% chatgpt-subscription=80%" });
+    expect(result.output).toContain("FLEET_USAGE_LIMIT provider=anthropic used=60% remaining=40% threshold=60%");
+    expect(result.output).toContain("FLEET_USAGE_LIMIT provider=chatgpt-subscription used=80% remaining=20% threshold=80%");
+    expect(result.herdrWrites).toEqual([]);
+    expect(result.ghCalls).toEqual([]);
+  });
+
+  it("alerts on the Cursor Bugbot usage-limit check using read-only GitHub data", async () => {
+    const result = await runWatchCycle({
+      prDone: "pr:whelp99-code/jm-omo#77",
+      checkRuns: [{
+        name: "Cursor Bugbot",
+        status: "completed",
+        conclusion: "neutral",
+        output: {
+          title: "Bugbot couldn't run - usage limit reached",
+          summary: "Bugbot couldn't run - usage limit reached",
+          text: "",
+        },
+      }],
+    });
+    expect(result.output).toContain("FLEET_BUGBOT_LIMIT");
+    expect(result.output).toContain("usage_limit_reached");
+    expect(result.ghCalls).toContain("pr view 77 --repo whelp99-code/jm-omo --json headRefOid");
+    expect(result.ghCalls.some((line) => line.startsWith("api repos/whelp99-code/jm-omo/commits/"))).toBe(true);
+    expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("bounds concurrent Bugbot lookups while polling many active PRs", async () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE tasks(key TEXT, done TEXT, status TEXT, sent_at TEXT)");
+    for (let i = 1; i <= 20; i++) {
+      db.query("INSERT INTO tasks(key,done,status,sent_at) VALUES(?,?,'working',?)").run(`BUGBOT-${i}`, `pr:owner/repo#${i}`, String(i));
+    }
+    let active = 0;
+    let maximum = 0;
+    const calls = [];
+    await bugbotLimitEvents(db, new Map(), async (signal, deadline) => {
+      calls.push(signal);
+      expect(deadline.aborted).toBe(false);
+      active++;
+      maximum = Math.max(maximum, active);
+      await Promise.resolve();
+      active--;
+      return null;
+    });
+    expect(calls).toHaveLength(20);
+    expect(maximum).toBeLessThanOrEqual(5);
+    db.close();
+  });
+});
+
+describe("fleet question policy", () => {
+  it("retries an allowlisted answer after a transient send failure", async () => {
+    const result = await runFleetCommand({
+      catTask: "Q-RETRY",
+      paneScreen: "Question pending\nMay I use Jaemin's password or OTP now?\n❯",
+      failFirstQuestionAnswer: true,
+      waitForOutput: "FLEET_QUESTION_ANSWERED",
+      command: ["watch", "0"],
+    });
+    expect(result.output).toContain("FLEET_QUESTION_SEND_FAILED crm Q-RETRY");
+    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-RETRY");
+    expect(result.herdrWrites.filter((line) => line.startsWith("pane send-text"))).toHaveLength(2);
+    expect(result.herdrWrites.at(-1)).toBe("pane send-keys w6:p1 Enter");
+  });
+
+  it("does not answer when the same pane now shows a different question", async () => {
+    const calls = [];
+    const answered = await answerPaneQuestion("w6:p1", "May I use the production account?", "Do not use it.", async (argv) => {
+      calls.push(argv);
+      return {
+        exitCode: 0,
+        stdout: argv[2] === "read" ? "Question pending\nA different question is now active.\n❯" : "",
+      };
+    });
+    expect(answered).toBe(false);
+    expect(calls).toEqual([["herdr", "pane", "read", "w6:p1", "--source", "visible", "--format", "text"]]);
+  });
+
+  it("defers personal password or OTP use and answers through the fake pane", async () => {
+    const result = await runWatchCycle({
+      catTask: "Q-PERSONAL",
+      paneScreen: "Question pending\nMay I use Jaemin's password or OTP now?\n❯",
+    });
+    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-PERSONAL policy=personal-credentials-defer");
+    expect(result.herdrWrites).toEqual([
+      "pane send-text w6:p1 재민의 비밀번호나 OTP는 사용하지 말고 내일로 미뤄.",
+      "pane send-keys w6:p1 Enter",
+    ]);
+  });
+
+  it("prohibits production authentication account use", async () => {
+    const result = await runWatchCycle({
+      catTask: "Q-PRODUCTION",
+      paneScreen: "Question pending\nShould we use the production auth account?\n❯",
+    });
+    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-PRODUCTION policy=production-auth-prohibited");
+    expect(result.herdrWrites).toEqual([
+      "pane send-text w6:p1 운영 인증 계정은 사용하지 마.",
+      "pane send-keys w6:p1 Enter",
+    ]);
+  });
+
+  it("notifies Omonyang and sends nothing for non-allowlisted questions", async () => {
+    const result = await runWatchCycle({
+      catTask: "Q-UNKNOWN",
+      paneScreen: "Question pending\nCan I use the staging account password?\n❯",
+    });
+    expect(result.output).toContain("FLEET_QUESTION_NOTIFY owner=omonyang crm Q-UNKNOWN");
+    expect(result.herdrWrites).toEqual([]);
+  });
+});
+
+describe("fleet text board", () => {
+  it("shows all roadmap items, live cats, PR review state, and unknown deployment evidence", async () => {
+    const result = await runFleetBoard({
+      catTask: "PR-TASK",
+      prDone: "pr:whelp99-code/jm-omo#77",
+      paneScreen: "Working (5s)\n❯",
+      checkRuns: [{ name: "Cursor Bugbot", status: "in_progress", conclusion: null, output: {} }],
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    for (let number = 1; number <= 8; number++) expect(result.output).toMatch(new RegExp(`^${number}\\.`, "m"));
+    expect(result.output).toContain("5. Usage inventory — NOT_STARTED");
+    expect(result.output).toContain("7. Pane context management — NOT_STARTED");
+    expect(result.output).toContain("CRM (crm, w6:p1): working");
+    expect(result.output).toContain("#2 OPEN draft");
+    expect(result.output).toContain("#77 OPEN draft");
+    expect(result.output).toContain("REVIEW_REQUIRED");
+    expect(result.output).toContain("Cursor Bugbot=IN_PROGRESS");
+    expect(result.output).toContain("Deployment: NOT_RUN");
+    expect(result.output).toContain("Production deployment: UNKNOWN");
+    expect(result.herdrWrites).toEqual([]);
+    expect(result.ghCalls.some((line) => line.startsWith("pr list "))).toBe(true);
+    expect(result.ghCalls.every((line) => !/--method\s+POST/i.test(line))).toBe(true);
+  });
+});
+
+describe("fleet UTF-8 dispatch and prompt isolation", () => {
+  it("sends the generated dispatch prompt as raw UTF-8 and ignores its prompt-only done example", async () => {
+    const result = await runRawUtf8Dispatch();
+    const sentMessage = result.sendBytes.subarray(0, result.sendBytes.length - 1).toString("utf8");
+    const attempt = sentMessage.match(/^UTF8-QA \[attempt=([0-9a-f-]{36}) skill:ulw\]:/)?.[1];
+    const expectedMessage = `UTF8-QA [attempt=${attempt} skill:ulw]: 지시문 파일 ${result.prompt} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 UTF8-QA_DONE <한 줄 요약> 또는 UTF8-QA_BLOCKED reason=<한 줄>.`;
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("DISPATCH_OK crm UTF8-QA started (MODEL_KEPT)");
+    expect(attempt).toMatch(/^[0-9a-f-]{36}$/);
+    expect(result.sendBytes).toEqual(Buffer.concat([Buffer.from(expectedMessage, "utf8"), Buffer.from([0])]));
+    const promptOnly = result.sendBytes.subarray(0, result.sendBytes.length - 1).toString("utf8");
+    expect(classify(`❯ ${promptOnly}\n\n❯`).done).toBeNull();
+  }, 15_000);
+});
+
+describe("fleet review-stall request correlation", () => {
+  it("fetches thread replies only for review-request roots", () => {
+    const roots = reviewRequestThreadRoots([
+      { ts: "1.1", reply_count: 3, user: "UOTHER", text: "Cursor 검수 요청 PR #12" },
+      { ts: "2.2", reply_count: 8, user: "UOTHER", text: "Unrelated discussion" },
+      { ts: "3.3", reply_count: 0, user: "UOTHER", text: "Cursor 검수 요청 PR #13" },
+    ]);
+    expect(roots.map((root) => root.ts)).toEqual(["1.1"]);
+  });
+
+  it("bounds Slack thread fetch concurrency and respects an expired deadline", async () => {
+    const roots = Array.from({ length: 12 }, (_, i) => ({ ts: String(i) }));
+    const controller = new AbortController();
+    let active = 0;
+    let maximum = 0;
+    const replies = await fetchSlackThreadReplies(roots, async (root) => {
+      active++;
+      maximum = Math.max(maximum, active);
+      await Promise.resolve();
+      active--;
+      return [`reply-${root.ts}`];
+    }, controller.signal);
+    expect(replies).toHaveLength(12);
+    expect(maximum).toBeLessThanOrEqual(5);
+
+    const expired = new AbortController();
+    expired.abort();
+    let called = false;
+    expect(await fetchSlackThreadReplies(roots, async () => { called = true; return []; }, expired.signal)).toBeNull();
+    expect(called).toBe(false);
+  });
+
+  it("fetches unanswered review requests and emits each stall once", async () => {
+    const nowMs = 100_000_000;
+    const requestTs = String((nowMs - 46 * 60_000) / 1000);
+    const messages = [{
+      ts: requestTs,
+      thread_ts: requestTs,
+      channel: "C0C6HJM0BV5",
+      user: "UOTHER",
+      text: "Cursor 검수 요청 PR #93 TASK-REVIEW-STALL",
+    }];
+    const alerted = new Set();
+    let since;
+    const fetchMessages = async (oldest) => {
+      since = oldest;
+      return messages;
+    };
+    const first = await reviewStallEvents(nowMs, alerted, fetchMessages);
+    expect(Number(since)).toBeLessThan(Number(requestTs));
+    expect(first).toHaveLength(1);
+    expect(first[0]).toContain("FLEET_REVIEW_STALL_DRAFT");
+    expect(first[0]).toContain("TASK-REVIEW-STALL");
+    expect(await reviewStallEvents(nowMs + 60_000, alerted, fetchMessages)).toEqual([]);
+  });
+
+  it("extracts request keys and recognizes the existing review-request wording", () => {
+    expect(reviewRequestKeys("서윤아, Cursor 검수 요청 PR #42 head=abcdef012345 TASK-OMO-IMPROVE-3-4-6-8"))
+      .toEqual(["pr:42", "head:abcdef01", "task:TASK-OMO-IMPROVE-3-4-6-8"]);
+    expect(isReviewRequest({ user: "UOTHER", text: "서윤아, Cursor 검수 요청: 확인 부탁해" })).toBe(true);
+    expect(isReviewRequest({ user: "U0B81F5GR6V", text: "Cursor 검수 요청 PR #42" })).toBe(false);
+    expect(isReviewRequest({ user: "UOTHER", text: "Cursor 검수 요청, 참조 키 없음" })).toBe(true);
+  });
+
+  it("pairs replies per request in the same thread without reusing one reply", () => {
+    const requests = [
+      { ts: "100.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 head=abcdef012345 TASK-REQ-A" },
+      { ts: "200.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 head=abcdef012345 TASK-REQ-B" },
+      { ts: "360.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청" },
+      { ts: "370.000001", thread_ts: "90.000001", user: "UOTHER", text: "Cursor 검수 요청" },
+    ];
+    const replies = [
+      { ts: "250.000001", thread_ts: "90.000001", user: "U0B81F5GR6V", text: "PR #42 head=abcdef012345 TASK-REQ-B" },
+      { ts: "350.000001", thread_ts: "90.000001", app_id: "A08SKDT6QUW", text: "확인했어" },
+      { ts: "400.000001", thread_ts: "90.000001", user: "UOTHER", text: "TASK-REQ-A" },
+      { ts: "500.000001", thread_ts: "499.000001", user: "U0B81F5GR6V", text: "PR #42 head=abcdef012345 TASK-REQ-A" },
+    ];
+    expect([...pairReviewReplies(requests, replies)]).toEqual([
+      ["200.000001", "250.000001"],
+      ["100.000001", "350.000001"],
+    ]);
+  });
+
+  it("pairs an identifier-free reply only when one request is eligible in its thread", () => {
+    const request = {
+      ts: "600.000001",
+      thread_ts: "590.000001",
+      user: "UOTHER",
+      text: "Cursor 검수 요청 PR #94 TASK-REQ-ONLY",
+    };
+    const reply = { ts: "700.000001", thread_ts: "590.000001", app_id: "A08SKDT6QUW", text: "확인했어" };
+    expect([...pairReviewReplies([request], [reply])]).toEqual([["600.000001", "700.000001"]]);
+
+    const ambiguous = [
+      request,
+      { ...request, ts: "650.000001", text: "Cursor 검수 요청 PR #95 TASK-REQ-OTHER" },
+    ];
+    expect([...pairReviewReplies(ambiguous, [reply])]).toEqual([]);
+    expect([...pairReviewReplies([request], [{ ...reply, text: "PR #999 TASK-UNRELATED" }])]).toEqual([]);
+  });
+
+  it("alerts each unanswered request at its own 45-minute deadline", () => {
+    const requests = [
+      { ts: "1000.000001", thread_ts: "1000.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 TASK-REQ-A" },
+      { ts: "1600.000001", thread_ts: "1600.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #43 TASK-REQ-B" },
+    ];
+    const replies = [
+      { ts: "1100.000001", thread_ts: "1000.000001", user: "U0B81F5GR6V", text: "PR #42 TASK-REQ-A 확인" },
+    ];
+    const alerted = new Set();
+    const firstDeadline = reviewStallDrafts(requests, replies, 1000_000 + 45 * 60_000, alerted);
+    expect(firstDeadline).toHaveLength(0);
+    const secondDeadline = reviewStallDrafts(requests, replies, 1600_000 + 45 * 60_000, alerted);
+    expect(secondDeadline).toHaveLength(1);
+    expect(secondDeadline[0]).toContain("FLEET_REVIEW_STALL_DRAFT owner=omonyang");
+    expect(secondDeadline[0]).toContain("TASK-REQ-B");
+    expect(secondDeadline[0]).toContain("p1600000001");
+    expect(reviewStallDrafts(requests, replies, 1700_000 + 45 * 60_000, alerted)).toEqual([]);
   });
 });
