@@ -1258,8 +1258,14 @@ describe("fleet completion claim verification", () => {
       { user: "U0B81F5GR6V", text: "ACCEPT PR #5 head=ce1cbb7b" },
     ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(true);
     expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT PR #99 head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
+    expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: `ACCEPT head=${head}` },
     ], head)).toBe(true);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT whelp99-code/jm-omo head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
   });
 
   it("does not treat a REJECT verdict that names the head as acceptance", async () => {

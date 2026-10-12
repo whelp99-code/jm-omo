@@ -578,7 +578,7 @@ async function slackHasHead(fullHead, sentAt, pr, runCommand = executeSignalComm
 function referencesPullRequest(text, { repo, prNumber }) {
   const source = String(text ?? "");
   const escapedRepo = repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:\\bPR\\s*#?${prNumber}\\b|#${prNumber}\\b|/pull/${prNumber}\\b|${escapedRepo}#${prNumber}\\b|\\b${escapedRepo}\\b)`, "i").test(source);
+  return new RegExp(`(?:\\bPR\\s*#?${prNumber}\\b|#${prNumber}\\b|/pull/${prNumber}\\b|${escapedRepo}#${prNumber}\\b)`, "i").test(source);
 }
 
 async function commitsForPullRequest(repo, prNumber, runCommand) {
