@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch as watchFs, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,7 +7,7 @@ import { join } from "node:path";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, verify, verifyClaims } = await import("./fleet.mjs");
+const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -50,7 +50,7 @@ async function runBlockedDispatch(paneScreen) {
     CREATE TABLE tasks(
       key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
       done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
-      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]', completion_claimed INTEGER DEFAULT 0
     );`);
     db.query("INSERT INTO cats(id,name,pane) VALUES('crm','CRM','w6:p1')").run();
     db.close();
@@ -153,7 +153,7 @@ async function runRawUtf8Dispatch() {
   }
 }
 
-async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", reservation = false, waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
   const state = join(home, ".local", "state", "omonyang");
   const bin = join(home, "bin");
@@ -178,9 +178,13 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);
   CREATE TABLE dispatch_reservations(pane TEXT PRIMARY KEY,key TEXT UNIQUE NOT NULL,attempt TEXT NOT NULL,reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
   const taskKey = catTask || (prDone ? "PR-TASK" : "");
-  if (taskKey) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,'crm',?,?,?,?)").run(taskKey, taskKey, prDone, taskStatus, new Date().toISOString());
-  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture','unknown',?)").run(taskKey || null);
-  if (reservation && taskKey) db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('w6:p1',?,'fixture-attempt')").run(taskKey);
+  if (taskKey) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at,history) VALUES(?,'crm',?,?,?,?,?)")
+    .run(taskKey, taskKey, prDone, taskStatus, new Date().toISOString(), JSON.stringify(taskHistory));
+  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture',?,?)").run(catState, taskKey || null);
+  if (reservation && taskKey) {
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES('w6:p1',?,'fixture-attempt',?)")
+      .run(taskKey, new Date(Date.now() - reservationAgeMs).toISOString());
+  }
   db.close();
   writeFileSync(join(usageDir, "usage-watch.log"), usageTick ? `${usageTick}\n` : "");
   const herdrPath = join(bin, "herdr");
@@ -188,7 +192,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const journalPath = join(bin, "journalctl");
   const ghPath = join(bin, "gh");
   const gitPath = join(bin, "git");
-  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf '%s\\n' \"$PANE_SCREEN\"; elif [ \"$1\" = pane ] && [ \"$2\" = send-text ] && [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n");
+  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1; printf '%s\\n' \"$PANE_SCREEN\"; elif [ \"$1\" = pane ] && [ \"$2\" = send-text ] && [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n");
   writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(gitPath, "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then printf 'https://github.com/whelp99-code/jm-omo.git\\n'; elif [ \"$1\" = branch ] && [ \"$2\" = --show-current ]; then printf 'fixture-branch\\n'; else exit 2; fi\n");
@@ -202,6 +206,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     HERDR_LOG: herdrLog,
     GH_LOG: ghLog,
     PANE_SCREEN: paneScreen,
+    PANE_READ_FAILURE: paneReadFailure ? "1" : "0",
     FAIL_FIRST_ANSWER: failFirstQuestionAnswer ? "1" : "0",
     FIRST_ANSWER_FAILED: firstAnswerFailedPath,
     GH_PR_JSON: JSON.stringify({ number: 77, title: "Fixture review", state: "OPEN", isDraft: true, url: "https://github.com/whelp99-code/jm-omo/pull/77", headRefOid: "abcdef0123456789abcdef0123456789abcdef01", reviewDecision: "REVIEW_REQUIRED", statusCheckRollup: [] }),
@@ -372,6 +377,193 @@ describe("fleet dependency dispatch", () => {
 });
 
 describe("fleet dispatch reservations", () => {
+  it("clears an idle pane and releases its reservation after a failed send command", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "failed-send-prompt.txt");
+    writeFileSync(prompt, "send failure fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('failed-send-cat','Failed Send','w-failed-send:p1')").run();
+    db.close();
+
+    const commands = [];
+    let failCommand = "send-text";
+    const runCommand = async (argv) => {
+      commands.push(argv);
+      if (argv[2] === failCommand) return { exitCode: 1, stdout: "" };
+      return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+    };
+    const result = await dispatch("failed-send-cat", "FAILED-SEND", prompt, {
+      keepModel: true,
+      runCommand,
+      sleep: async () => {},
+    });
+    expect(result).toContain("DISPATCH_UNCONFIRMED failed-send-cat FAILED-SEND");
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key='FAILED-SEND'").get().status).toBe("send-failed-unconfirmed");
+    expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-failed-send:p1'").get()).toBeNull();
+    expect(commands.some((argv) => argv[2] === "send-keys" && argv[3] === "w-failed-send:p1" && argv[4] === "ctrl+u")).toBe(true);
+    stored.close();
+
+    failCommand = "send-keys";
+    let reads = 0;
+    const next = await dispatch("failed-send-cat", "AFTER-FAILED-SEND", prompt, {
+      keepModel: true,
+      runCommand: async (argv) => ({
+        exitCode: 0,
+        stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+      }),
+      sleep: async () => {},
+    });
+    expect(next).toContain("DISPATCH_OK failed-send-cat AFTER-FAILED-SEND");
+  });
+
+  it("clears pending input and releases its lease after Enter send failure", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "failed-enter-prompt.txt");
+    writeFileSync(prompt, "failed Enter fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('failed-enter-cat','Failed Enter','w-failed-enter:p1')").run();
+    db.close();
+    let paneReads = 0;
+    const sleeps = [];
+    const runCommand = async (argv) => {
+      if (argv[2] === "read") paneReads++;
+      return {
+        exitCode: argv[2] === "send-keys" && argv[4] === "Enter" ? 1 : 0,
+        stdout: argv[2] === "read" ? "Idle\n❯" : "",
+      };
+    };
+    const result = await dispatch("failed-enter-cat", "FAILED-ENTER", prompt, {
+      keepModel: true,
+      runCommand,
+      sleep: async (ms) => { sleeps.push(ms); },
+    });
+    expect(result).toContain("DISPATCH_UNCONFIRMED failed-enter-cat FAILED-ENTER");
+    expect(paneReads).toBe(16);
+    expect(sleeps.filter((ms) => ms === 5000)).toHaveLength(11);
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key='FAILED-ENTER'").get().status).toBe("send-failed-unconfirmed");
+    expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-failed-enter:p1'").get()).toBeNull();
+    stored.close();
+  });
+
+  it("retains failed-send reservations when idle confirmation or cleanup fails", async () => {
+    const db = unitDb();
+    const pane = "w-uncertain-cleanup:p1";
+    const reservation = { pane, key: "UNCERTAIN-CLEANUP", attempt: "attempt-cleanup" };
+    db.query("INSERT INTO cats(id,name,pane) VALUES('uncertain-cleanup-cat','Uncertain Cleanup',?)").run(pane);
+    db.query("INSERT INTO tasks(key,cat,status,history,send_attempted) VALUES(?,'uncertain-cleanup-cat','dispatching',?,1)")
+      .run(reservation.key, JSON.stringify([{ ev: "send-attempted", attempt: reservation.attempt }]));
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,?,?)").run(pane, reservation.key, reservation.attempt);
+    const readFailed = await reconcileFailedDispatch(db, reservation, async () => ({ exitCode: 1, stdout: "" }), async () => ({ exitCode: 0, stdout: "" }));
+    expect(readFailed).toBe(false);
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(pane).key).toBe(reservation.key);
+
+    const cleanupFailed = await reconcileFailedDispatch(db, reservation, async () => ({ exitCode: 0, stdout: "Idle\n❯" }), async () => ({ exitCode: 1, stdout: "" }));
+    expect(cleanupFailed).toBe(false);
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(pane).key).toBe(reservation.key);
+    db.close();
+  });
+
+  it("allows only one of two recovery watchers to clear pending pane input", async () => {
+    const db = unitDb();
+    const pane = "w-exclusive-clear:p1";
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('exclusive-clear-cat','Exclusive Clear',?)").run(pane);
+    db.query(`INSERT INTO tasks(key,cat,status,history,send_attempted)
+      VALUES('EXCLUSIVE-CLEAR','exclusive-clear-cat','send-failed-unconfirmed',?,1)`)
+      .run(JSON.stringify([{ ev: "send-attempted", attempt: "exclusive-attempt" }]));
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run(pane, "EXCLUSIVE-CLEAR", "exclusive-attempt", reservedAt);
+    const mutations = [];
+    const runCommand = async (argv) => {
+      if (argv[2] === "send-keys") mutations.push(argv);
+      return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+    };
+    const nowMs = Date.parse(reservedAt) + 11 * 60_000;
+    const runWatcher = () => recoverInterruptedDispatches(db, [{ id: "exclusive-clear-cat", state: "idle" }], nowMs, runCommand);
+    const results = await Promise.all([
+      runWatcher(),
+      runWatcher(),
+    ]);
+    expect(results.flat()).toEqual(["FLEET_SEND_FAILED_UNCONFIRMED EXCLUSIVE-CLEAR pane=w-exclusive-clear:p1 reservation_released"]);
+    expect(mutations).toEqual([["herdr", "pane", "send-keys", pane, "ctrl+u"]]);
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(pane)).toBeNull();
+    db.close();
+  });
+
+  it("retries the same key after dispatch-held and dispatch-failed-before-send", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "same-key-unsent-prompt.txt");
+    writeFileSync(prompt, "same key unsent fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('same-key-unsent-cat','Same Key Unsent','w-same-key-unsent:p1')").run();
+    db.close();
+    let reads = 0;
+    const readIdleUntilWorking = async (argv) => ({
+      exitCode: 0,
+      stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+    });
+
+    const held = await dispatch("same-key-unsent-cat", "UNSENT-RETRY", prompt, {
+      runCommand: async (argv) => ({ exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" }),
+      switchPaneModel: async () => "MODEL_SWITCH_FAILED fixture",
+    });
+    expect(held).toContain("MODEL_SWITCH_FAILED");
+    const retriedHeld = await dispatch("same-key-unsent-cat", "UNSENT-RETRY", prompt, {
+      keepModel: true, runCommand: readIdleUntilWorking, sleep: async () => {},
+    });
+    expect(retriedHeld).toContain("DISPATCH_OK");
+
+    const failPrompt = join(unitHome, "same-key-failed-prompt.txt");
+    writeFileSync(failPrompt, "same key exception fixture\n");
+    const catDb = unitDb();
+    catDb.query("INSERT INTO cats(id,name,pane) VALUES('same-key-exception-cat','Same Key Exception','w-same-key-exception:p1')").run();
+    catDb.close();
+    let secondReads = 0;
+    const failed = await dispatch("same-key-exception-cat", "UNSENT-EXCEPTION", failPrompt, {
+      runCommand: async (argv) => ({ exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" }),
+      switchPaneModel: async () => { throw new Error("model picker interrupted"); },
+    });
+    expect(failed).toContain("DISPATCH_FAILED");
+    const retriedFailed = await dispatch("same-key-exception-cat", "UNSENT-EXCEPTION", failPrompt, {
+      keepModel: true,
+      runCommand: async (argv) => ({ exitCode: 0, stdout: argv[2] === "read" ? (++secondReads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "" }),
+      sleep: async () => {},
+    });
+    expect(retriedFailed).toContain("DISPATCH_OK");
+  });
+
+  it("retries the same task key after definitive pre-send failures", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "same-key-retry-prompt.txt");
+    writeFileSync(prompt, "same key retry fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('same-key-cat','Same Key','w-same-key:p1')").run();
+    db.close();
+    const runCommand = async (argv) => ({ exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" });
+
+    const failedBeforeSend = await dispatch("same-key-cat", "RETRY-SAME-KEY", prompt, {
+      runCommand,
+      switchPaneModel: async () => { throw new Error("MODEL_SWITCH_INTERRUPTED"); },
+    });
+    expect(failedBeforeSend).toContain("DISPATCH_FAILED same-key-cat RETRY-SAME-KEY");
+    const heldDb = unitDb();
+    expect(heldDb.query("SELECT status FROM tasks WHERE key='RETRY-SAME-KEY'").get().status).toBe("dispatch-failed-before-send");
+    heldDb.close();
+    const held = await dispatch("same-key-cat", "RETRY-SAME-KEY", prompt, {
+      runCommand,
+      switchPaneModel: async () => "MODEL_SWITCH_FAILED fixture",
+    });
+    expect(held).toContain("MODEL_SWITCH_FAILED");
+    const heldAgain = unitDb();
+    expect(heldAgain.query("SELECT status FROM tasks WHERE key='RETRY-SAME-KEY'").get().status).toBe("dispatch-held");
+    heldAgain.close();
+    let reads = 0;
+    const retried = await dispatch("same-key-cat", "RETRY-SAME-KEY", prompt, {
+      keepModel: true,
+      runCommand: async (argv) => ({ exitCode: 0, stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "" }),
+      sleep: async () => {},
+    });
+    expect(retried).toContain("DISPATCH_OK same-key-cat RETRY-SAME-KEY");
+  });
+
   it("does not reclaim a refreshed send attempt or send after a reclaimed reservation", async () => {
     const db = unitDb();
     const prompt = join(unitHome, "reservation-interleave-prompt.txt");
@@ -422,12 +614,86 @@ describe("fleet dispatch reservations", () => {
     const staleDb = unitDb();
     staleDb.query("UPDATE dispatch_reservations SET reserved_at=? WHERE key=?")
       .run(reservedAt, "RECLAIMED-TASK");
-    expect(await recoverInterruptedDispatches(staleDb, [{ id: "reclaim-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000))
+    expect(await recoverInterruptedDispatches(staleDb, [{ id: "reclaim-cat", state: "idle" }], Date.parse(reservedAt) + 11 * 60_000,
+      async () => ({ exitCode: 0, stdout: "Idle\n❯" })))
       .toEqual(["FLEET_DISPATCH_INTERRUPTED RECLAIMED-TASK pane=w-reclaim:p1 reservation_released"]);
     staleDb.close();
     releaseSwitch();
     expect(await dispatching).toBe("DISPATCH_HOLD reclaim-cat reservation-expired; not sent");
     expect(sendCalls.some((argv) => argv[2] === "send-text")).toBe(false);
+  });
+
+  it("does not reclaim an expired reservation when the pane is unreadable", async () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('unreadable-reservation-cat','Unreadable Reservation','w-unreadable-reservation:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('UNREADABLE-LEASE','unreadable-reservation-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-unreadable-reservation:p1", "UNREADABLE-LEASE", "attempt-unreadable", reservedAt);
+    const events = await recoverInterruptedDispatches(db, [{ id: "unreadable-reservation-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000,
+      async () => ({ exitCode: 1, stdout: "" }));
+    expect(events).toEqual([]);
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane='w-unreadable-reservation:p1'").get().key).toBe("UNREADABLE-LEASE");
+    expect(db.query("SELECT status FROM tasks WHERE key='UNREADABLE-LEASE'").get().status).toBe("dispatching");
+    db.close();
+  });
+
+  it("keeps send-attempt evidence after history truncation", () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('durable-send-cat','Durable Send','w-durable-send:p1')").run();
+    const history = JSON.stringify(Array.from({ length: 40 }, (_, index) => ({ ev: "noise", index })));
+    db.query("INSERT INTO tasks(key,cat,status,history,send_attempted) VALUES('DURABLE-SEND','durable-send-cat','dispatching',?,1)").run(history);
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-durable-send:p1", "DURABLE-SEND", "durable-send-attempt", reservedAt);
+    const reservation = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key=?").get("DURABLE-SEND");
+    expect(recoverDispatchReservation(db, reservation, "idle", Date.parse(reservedAt) + 11 * 60_000)).toBeNull();
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get("DURABLE-SEND").status).toBe("dispatching");
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get("w-durable-send:p1").key).toBe("DURABLE-SEND");
+    db.close();
+  });
+
+  it("does not grow duplicate recovery history across 50 question-state cycles", async () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    const history = JSON.stringify(Array.from({ length: 40 }, (_, index) => ({ ev: "noise", index })));
+    db.query("INSERT INTO cats(id,name,pane) VALUES('question-recovery-cat','Question Recovery','w-question-recovery:p1')").run();
+    db.query(`INSERT INTO tasks(key,cat,status,history,completion_claimed,send_attempted)
+      VALUES('QUESTION-RECOVERY','question-recovery-cat','dispatching',?,1,1)`).run(history);
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-question-recovery:p1", "QUESTION-RECOVERY", "question-recovery-attempt", reservedAt);
+    const nowMs = Date.parse(reservedAt) + 11 * 60_000;
+    for (let cycle = 0; cycle < 50; cycle++) {
+      expect(await recoverInterruptedDispatches(db, [{ id: "question-recovery-cat", state: "question" }], nowMs,
+        async () => ({ exitCode: 0, stdout: "Question pending\nNeed confirmation\n❯" }))).toEqual([]);
+    }
+    const task = db.query("SELECT status,history,completion_claimed,send_attempted FROM tasks WHERE key='QUESTION-RECOVERY'").get();
+    const events = JSON.parse(task.history);
+    expect(task.status).toBe("send-failed-unconfirmed");
+    expect(task.completion_claimed).toBe(1);
+    expect(task.send_attempted).toBe(1);
+    expect(events).toHaveLength(40);
+    expect(events.filter((event) => event.ev === "send-failed-unconfirmed")).toHaveLength(1);
+    expect(events.some((event) => event.ev === "send-attempted" || event.ev === "done-claimed")).toBe(false);
+    db.close();
+  });
+
+  it("claims recovery ownership before allowing picker Escape to mutate the pane", () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('picker-race-cat','Picker Race','w-picker-race:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('PICKER-RACE','picker-race-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-picker-race:p1", "PICKER-RACE", "attempt-picker-race", reservedAt);
+    const reservation = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key=?").get("PICKER-RACE");
+    expect(classify("Select model\n→ model [provider]\n❯").state).toBe("model-picker");
+    const recoveryToken = claimPickerRecoveryImmediatelyBeforeEscape(db, reservation, Date.parse(reservedAt) + 11 * 60_000);
+    expect(recoveryToken).toBeTruthy();
+    expect(db.query("SELECT recovery_token FROM dispatch_reservations WHERE key=?").get("PICKER-RACE").recovery_token).toBe(recoveryToken);
+    expect(recordDispatchSendAttempt(db, reservation.pane, reservation.key, reservation.attempt)).toBe(false);
+    expect(recoverDispatchReservation(db, { ...reservation, recoveryToken }, "idle", Date.parse(reservedAt) + 11 * 60_000))
+      .toBe("FLEET_DISPATCH_INTERRUPTED PICKER-RACE pane=w-picker-race:p1 reservation_released");
+    db.close();
   });
 
   it("recovers an expired dispatch and allows its task key to be retried", async () => {
@@ -442,7 +708,8 @@ describe("fleet dispatch reservations", () => {
     db.close();
 
     const recovered = unitDb();
-    const events = await recoverInterruptedDispatches(recovered, [{ id: "interrupted-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000);
+    const events = await recoverInterruptedDispatches(recovered, [{ id: "interrupted-cat", state: "idle" }], Date.parse(reservedAt) + 11 * 60_000,
+      async () => ({ exitCode: 0, stdout: "Idle\n❯" }));
     expect(events).toEqual(["FLEET_DISPATCH_INTERRUPTED INTERRUPTED-TASK pane=w-interrupted:p1 reservation_released"]);
     expect(recovered.query("SELECT status FROM tasks WHERE key='INTERRUPTED-TASK'").get().status).toBe("dispatch-interrupted");
     expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-interrupted:p1'").get()).toBeNull();
@@ -460,20 +727,60 @@ describe("fleet dispatch reservations", () => {
     expect(result).toContain("DISPATCH_OK interrupted-cat INTERRUPTED-TASK");
   });
 
+  it("preserves stale reservations when the pane read fails", async () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('unreadable-cat','Unreadable','w-unreadable:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('UNREADABLE-TASK','unreadable-cat','dispatching','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-unreadable:p1", "UNREADABLE-TASK", "unreadable-attempt", reservedAt);
+    const reads = [];
+    const events = await recoverInterruptedDispatches(db, [{ id: "unreadable-cat", state: "idle" }], Date.parse(reservedAt) + 10 * 60_000, async (argv) => {
+      reads.push(argv);
+      return { exitCode: 1, stdout: "" };
+    });
+    expect(events).toEqual([]);
+    expect(reads).toHaveLength(1);
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get("UNREADABLE-TASK").status).toBe("dispatching");
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get("w-unreadable:p1").key).toBe("UNREADABLE-TASK");
+    db.close();
+  });
+
+  it("does not clear a fresh possibly-sent reservation from an idle pane", async () => {
+    const db = unitDb();
+    const reservedAt = new Date().toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('fresh-send-cat','Fresh Send','w-fresh-send:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('FRESH-SEND','fresh-send-cat','send-failed-unconfirmed',?)")
+      .run(JSON.stringify([{ ev: "send-attempted", attempt: "attempt-fresh-send" }]));
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-fresh-send:p1", "FRESH-SEND", "attempt-fresh-send", reservedAt);
+    const commands = [];
+    const events = await recoverInterruptedDispatches(db, [{ id: "fresh-send-cat", state: "idle" }], Date.now(), async (argv) => {
+      commands.push(argv);
+      return { exitCode: 0, stdout: "Idle\n❯" };
+    });
+    expect(events).toEqual([]);
+    expect(commands.map((argv) => argv[2])).toEqual(["read"]);
+    expect(reservationLeaseExpiredAndOwned(db, { pane: "w-fresh-send:p1", key: "FRESH-SEND", attempt: "attempt-fresh-send", reserved_at: reservedAt }, Date.now())).toBe(false);
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE pane='w-fresh-send:p1'").get().key).toBe("FRESH-SEND");
+    db.close();
+  });
+
   it("releases an expired send-failed reservation so the pane can accept new work", async () => {
     const db = unitDb();
     const prompt = join(unitHome, "after-send-failed-prompt.txt");
     const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
     writeFileSync(prompt, "after uncertain send fixture\n");
     db.query("INSERT INTO cats(id,name,pane) VALUES('send-failed-recovery-cat','Send Failed','w-send-failed:p1')").run();
-    db.query("INSERT INTO tasks(key,cat,status,history) VALUES('SEND-ATTEMPTED-OLD','send-failed-recovery-cat','dispatching',?)")
+    db.query("INSERT INTO tasks(key,cat,status,history,send_attempted) VALUES('SEND-ATTEMPTED-OLD','send-failed-recovery-cat','dispatching',?,1)")
       .run(JSON.stringify([{ ev: "send-attempted", attempt: "attempt-send-failed" }]));
     db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
       .run("w-send-failed:p1", "SEND-ATTEMPTED-OLD", "attempt-send-failed", reservedAt);
     const reservation = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key=?").get("SEND-ATTEMPTED-OLD");
 
-    const event = recoverDispatchReservation(db, reservation, "idle", Date.parse(reservedAt) + 10 * 60_000);
-    expect(event).toBe("FLEET_SEND_FAILED_UNCONFIRMED SEND-ATTEMPTED-OLD pane=w-send-failed:p1 reservation_released");
+    const events = await recoverInterruptedDispatches(db, [{ id: "send-failed-recovery-cat", state: "idle" }], Date.parse(reservedAt) + 11 * 60_000,
+      async () => ({ exitCode: 0, stdout: "Idle\n❯" }));
+    expect(events).toEqual(["FLEET_SEND_FAILED_UNCONFIRMED SEND-ATTEMPTED-OLD pane=w-send-failed:p1 reservation_released"]);
     expect(db.query("SELECT status FROM tasks WHERE key=?").get("SEND-ATTEMPTED-OLD").status).toBe("send-failed-unconfirmed");
     expect(db.query("SELECT key FROM dispatch_reservations WHERE pane='w-send-failed:p1'").get()).toBeNull();
     db.close();
@@ -502,11 +809,16 @@ describe("fleet dispatch reservations", () => {
     expect(classify("Select model\n→ claude-sonnet [anthropic]\n❯").state).toBe("model-picker");
     const calls = [];
     const recovered = unitDb();
-    const events = await recoverInterruptedDispatches(recovered, [{ id: "picker-cat", state: "model-picker" }], Date.parse(reservedAt) + 10 * 60_000, async (argv) => {
+    let reads = 0;
+    const events = await recoverInterruptedDispatches(recovered, [{ id: "picker-cat", state: "model-picker" }], Date.parse(reservedAt) + 11 * 60_000, async (argv) => {
       calls.push(argv);
-      return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+      if (argv[2] === "send-keys") {
+        expect(recordDispatchSendAttempt(recovered, "w-picker:p1", "PICKER-TASK", "picker-attempt")).toBe(false);
+      }
+      return { exitCode: 0, stdout: argv[2] === "read" ? (++reads === 1 ? "Select model\n→ claude-sonnet [anthropic]\n❯" : "Idle\n❯") : "" };
     });
     expect(calls.map((argv) => argv.slice(1, 4))).toEqual([
+      ["pane", "read", "w-picker:p1"],
       ["pane", "send-keys", "w-picker:p1"],
       ["pane", "read", "w-picker:p1"],
     ]);
@@ -530,7 +842,7 @@ describe("fleet dispatch reservations", () => {
       calls.push(argv);
       return { exitCode: 0, stdout: "Idle\n❯" };
     })).toEqual([]);
-    expect(calls).toEqual([]);
+    expect(calls.map((argv) => argv[2])).toEqual(["read"]);
     expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-fresh-picker:p1'").get().key)
       .toBe("FRESH-PICKER-TASK");
     recovered.close();
@@ -743,6 +1055,177 @@ describe("fleet completion classification", () => {
 });
 
 describe("fleet completion claim verification", () => {
+  it("re-verifies not-done tasks with prior completion claims during watch polling", async () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE tasks(key TEXT,done TEXT,status TEXT,completion_claimed INTEGER)");
+    db.query("INSERT INTO tasks(key,done,status,completion_claimed) VALUES('RETRY-PR-REAL','pr:owner/repo#1','not-done',1)").run();
+    db.query("INSERT INTO tasks(key,done,status,completion_claimed) VALUES('NOT-A-CLAIM','cmd:true','not-done',1)").run();
+    const storage = unitDb();
+    storage.query("INSERT INTO tasks(key,cat,done,status,history,completion_claimed) VALUES('RETRY-PR-REAL','crm','pr:owner/repo#1','not-done','[]',1)").run();
+    const keys = [];
+    const checked = [];
+    const events = await retryNotDoneTasks(db, async (key) => {
+      keys.push(key);
+      return verify(key, async (signal) => {
+        checked.push(signal);
+        return { ok: false, detail: "state=OPEN" };
+      });
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toContain("NOT_DONE RETRY-PR-REAL");
+    expect(keys).toEqual(["RETRY-PR-REAL"]);
+    expect(checked).toEqual(["pr:owner/repo#1"]);
+    db.close();
+    storage.close();
+  });
+
+  it("keeps not-done PRs in active Bugbot polling", async () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE tasks(key TEXT, done TEXT, status TEXT, sent_at TEXT)");
+    db.query("INSERT INTO tasks(key,done,status,sent_at) VALUES('NOT-DONE-BUGBOT','pr:owner/repo#7','not-done','1')").run();
+    const polled = [];
+    await bugbotLimitEvents(db, new Map(), async (signal) => {
+      polled.push(signal);
+      return null;
+    });
+    expect(polled).toEqual(["pr:owner/repo#7"]);
+    db.close();
+  });
+
+  it("retries not-done tasks with completion claims and skips unrelated tasks", async () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE tasks(key TEXT,done TEXT,status TEXT,history TEXT,completion_claimed INTEGER)");
+    db.query("INSERT INTO tasks(key,status,done,history,completion_claimed) VALUES('NOT-DONE-PR','not-done','pr:owner/repo#1',?,1)")
+      .run(JSON.stringify(Array.from({ length: 40 }, (_, index) => ({ ev: "not-done", index }))));
+    db.query("INSERT INTO tasks(key,status,done,history,completion_claimed) VALUES('NOT-DONE-NO-CLAIM','not-done','pr:owner/repo#2','[]',0)").run();
+
+    const retried = [];
+    expect(await retryNotDoneTasks(db, async (key) => {
+      retried.push(key);
+      return `VERIFY_RETRY ${key}`;
+    })).toEqual(["VERIFY_RETRY NOT-DONE-PR"]);
+    expect(retried).toEqual(["NOT-DONE-PR"]);
+    db.close();
+  });
+
+  it("caps PR retries at three per cycle and rotates through the backlog", async () => {
+    const picker = new Database(":memory:");
+    picker.exec("CREATE TABLE tasks(key TEXT,done TEXT,status TEXT,completion_claimed INTEGER)");
+    const storage = unitDb();
+    const keys = Array.from({ length: 7 }, (_, index) => `ROTATING-PR-${index + 1}`);
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index];
+      const signal = `pr:owner/repo#${index + 1}`;
+      picker.query("INSERT INTO tasks(key,done,status,completion_claimed) VALUES(?,?,'not-done',1)").run(key, signal);
+      storage.query(`INSERT INTO tasks(key,cat,done,status,history,completion_claimed)
+        VALUES(?,'crm',?,'not-done','[]',1)`).run(key, signal);
+    }
+    const checked = [];
+    let active = 0;
+    let maximum = 0;
+    const verifyTask = async (key) => {
+      checked.push(key);
+      return verify(key, async () => {
+        active++;
+        maximum = Math.max(maximum, active);
+        await Promise.resolve();
+        active--;
+        return { ok: false, detail: "state=OPEN" };
+      });
+    };
+    const first = await retryNotDoneTasks(picker, verifyTask);
+    const second = await retryNotDoneTasks(picker, verifyTask);
+    const third = await retryNotDoneTasks(picker, verifyTask);
+    expect([first.length, second.length, third.length]).toEqual([3, 3, 3]);
+    expect(new Set(checked.slice(0, 7)).size).toBe(7);
+    expect(checked.slice(0, 7).sort()).toEqual(keys.slice().sort());
+    expect(maximum).toBe(3);
+    picker.close();
+    storage.close();
+  });
+
+  it("re-verifies after 45 failures and completes when durable ACCEPT evidence is present", async () => {
+    const db = unitDb();
+    const key = "VERIFY-45-FAILURES";
+    const head = "0123456789abcdef0123456789abcdef01234567";
+    const history = [
+      { ev: "done-claimed", text: "ready" },
+      ...Array.from({ length: 38 }, (_, index) => ({ ev: "not-done", detail: `prior-${index}` })),
+    ];
+    db.query(`INSERT INTO tasks(key,cat,done,status,history,completion_claimed,claim_evidence)
+      VALUES(?,?,?,'not-done',?,1,'{}')`)
+      .run(key, "reservation-cat", "pr:owner/repo#1", JSON.stringify(history));
+    let failedChecks = 0;
+    const failedCheck = async () => {
+      failedChecks++;
+      return { ok: false, detail: `state=OPEN attempt=${failedChecks}`, headRefOid: head };
+    };
+    for (let attempt = 0; attempt < 45; attempt++) {
+      expect(await verify(key, failedCheck)).toContain(`NOT_DONE ${key}`);
+    }
+    expect(failedChecks).toBe(45);
+    const capped = db.query("SELECT history,completion_claimed,claim_evidence FROM tasks WHERE key=?").get(key);
+    expect(JSON.parse(capped.history)).toHaveLength(40);
+    expect(JSON.parse(capped.history).some((event) => event.ev === "done-claimed" || event.ev === "claim-ok")).toBe(false);
+    expect(capped.completion_claimed).toBe(1);
+    expect(JSON.parse(capped.claim_evidence)).toEqual({});
+
+    recordTaskClaimEvidence(db, key, {
+      kind: "cursor-accept", ok: true, head, acceptedPrefix: head.slice(0, 8), actualHead: head, detail: "slack_author_full_head_match",
+    });
+    recordTaskClaimEvidence(db, key, {
+      kind: "pr-ready", ok: true, head, acceptedPrefix: head.slice(0, 10), actualHead: head, detail: "pr_head_match",
+    });
+    const verified = await verify(key, async () => ({
+      ok: true, detail: "merged", headRefOid: head, mergeCommit: "f".repeat(40),
+    }));
+    expect(verified).toContain(`VERIFIED_DONE ${key}`);
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("verified-done");
+    db.close();
+  });
+
+  it("matches bundled PR claims to every configured completion signal", async () => {
+    const db = unitDb();
+    const key = "VERIFY-MULTI-PR";
+    const signalOne = "pr:owner/one#11";
+    const signalTwo = "pr:owner/two#22";
+    const heads = {
+      [signalOne]: "1111111111111111111111111111111111111111",
+      [signalTwo]: "2222222222222222222222222222222222222222",
+    };
+    const task = {
+      key,
+      sent_at: "2026-10-12T10:00:00.000Z",
+      done: `${signalOne};${signalTwo}`,
+    };
+    db.query(`INSERT INTO tasks(key,cat,done,status,sent_at,history,completion_claimed,claim_evidence)
+      VALUES(?,?,?,'done-claimed',?,'[]',1,'{}')`)
+      .run(key, "reservation-cat", task.done, task.sent_at);
+    const claims = await verifyClaims([
+      `Cursor ACCEPT owner/two#22 head=${heads[signalTwo].slice(0, 8)}`,
+      `owner/two#22 PR READY head=${heads[signalTwo].slice(0, 8)}`,
+      `Cursor ACCEPT owner/one#11 head=${heads[signalOne].slice(0, 8)}`,
+      `owner/one#11 PR READY head=${heads[signalOne].slice(0, 8)}`,
+    ].join("\n"), task, {
+      getPrHead: async (signal) => heads[signal],
+      slackHasHead: async (head, sentAt, pr) => sentAt === task.sent_at
+        && head === heads[`pr:${pr.repo}#${pr.prNumber}`],
+    });
+    expect(claims.map(({ kind, signal, ok }) => ({ kind, signal, ok }))).toEqual([
+      { kind: "cursor-accept", signal: signalTwo, ok: true },
+      { kind: "cursor-accept", signal: signalOne, ok: true },
+      { kind: "pr-ready", signal: signalTwo, ok: true },
+      { kind: "pr-ready", signal: signalOne, ok: true },
+    ]);
+    for (const claim of claims) recordTaskClaimEvidence(db, key, claim);
+    const verified = await verify(key, async (signal) => ({
+      ok: true, detail: "merged", headRefOid: heads[signal], mergeCommit: "f".repeat(40),
+    }));
+    expect(verified).toContain(`VERIFIED_DONE ${key}`);
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("verified-done");
+    db.close();
+  });
+
   it("preserves concurrent task history appends", async () => {
     const db = unitDb();
     const key = "HISTORY-CONCURRENT";
@@ -837,7 +1320,7 @@ describe("fleet completion claim verification", () => {
     const key = "VERIFY-OLD-HEAD";
     const headA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const headB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history,completion_claimed) VALUES(?,?,?,'done-claimed','finished',?,1)")
       .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#79", JSON.stringify([
         { ev: "claim-ok", claim: "cursor-accept", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "slack_author_full_head_match" },
         { ev: "claim-ok", claim: "pr-ready", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "pr_head_match" },
@@ -894,7 +1377,7 @@ describe("fleet completion claim verification", () => {
     const headA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const headB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const done = "pr:whelp99-code/jm-omo#80";
-    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'done-claimed','finished',?)")
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history,completion_claimed) VALUES(?,?,?,'done-claimed','finished',?,1)")
       .run(key, "reservation-cat", done, JSON.stringify([
         { ev: "done-claimed", text: "finished" },
         { ev: "claim-ok", claim: "cursor-accept", head: headA, acceptedPrefix: headA, actualHead: headA, detail: "slack_author_full_head_match" },
@@ -915,7 +1398,7 @@ describe("fleet completion claim verification", () => {
     const db = unitDb();
     const key = "VERIFY-EMPTY-RESULT";
     const head = "abcdef0123456789abcdef0123456789abcdef01";
-    db.query("INSERT INTO tasks(key,cat,done,status,result,history) VALUES(?,?,?,'not-done','',?)")
+    db.query("INSERT INTO tasks(key,cat,done,status,result,history,completion_claimed) VALUES(?,?,?,'not-done','',?,1)")
       .run(key, "reservation-cat", "pr:whelp99-code/jm-omo#82", JSON.stringify([
         { ev: "done-claimed", text: "" },
         { ev: "claim-ok", claim: "cursor-accept", head, acceptedPrefix: head.slice(0, 8), actualHead: head, detail: "slack_author_full_head_match" },
@@ -948,55 +1431,115 @@ describe("fleet completion claim verification", () => {
     stored.close();
   });
 
-  it("accepts only Cursor's same-line full SHA", () => {
+  it("accepts full SHA only when the ACCEPT identifies the target PR", async () => {
     const head = "abcdef0123456789abcdef0123456789abcdef01";
-    expect(cursorHeadMatches([
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `ACCEPT owner/jm-omo#5 head=${head}` },
+      { user: "UOTHER", text: `ACCEPT owner/jm-omo#5 head=${head}` },
+    ], head, { repo: "owner/jm-omo", prNumber: "5" })).toBe(true);
+    expect(await cursorHeadMatches([
+      { user: "UOTHER", text: `ACCEPT owner/jm-omo#5 head=${head}` },
+      { user: "U0B81F5GR6V", text: `ACCEPT owner/jm-omo#99 head=${head}` },
+    ], head, { repo: "owner/jm-omo", prNumber: "5" })).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `ACCEPT jm-omo PR5 head=${head}` },
+    ], head, { repo: "owner/jm-omo", prNumber: "5" })).toBe(true);
+    expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: `ACCEPT head=${head}` },
-      { user: "UOTHER", text: `ACCEPT head=${head}` },
-    ], head)).toBe(true);
-    expect(cursorHeadMatches([
-      { user: "UOTHER", text: `ACCEPT head=${head}` },
-      { user: "U0B81F5GR6V", text: `ACCEPT head=${head.slice(0, 8)}` },
-    ], head)).toBe(true);
-    expect(cursorHeadMatches([
-      { user: "U0B81F5GR6V", text: "ACCEPT head=ffffffff" },
     ], head)).toBe(false);
   });
 
-  it("does not treat a REJECT verdict that names the head as acceptance", () => {
+  it("requires PR context for short Slack SHA tokens but accepts an exact full SHA", async () => {
+    const head = "ce1cbb7b17d38b58c55e22e24963ca96afcbb0b3";
+    const options = {
+      repo: "whelp99-code/jm-omo",
+      prNumber: "5",
+    };
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT jm-omo PR5 head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(true);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT jm-omo PR99 head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT other-repo#5 head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `ACCEPT head=${head}` },
+    ], head)).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `ACCEPT TASK-OMO-5 head=${head}` },
+    ], head, { taskKey: "TASK-OMO-5" })).toBe(true);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: "ACCEPT whelp99-code/jm-omo head=ce1cbb7b" },
+    ], head, options, async () => ({ exitCode: 0, stdout: `${head}\n` }))).toBe(false);
+  });
+
+  it("does not treat a REJECT verdict that names the head as acceptance", async () => {
     const head = "abcdef0123456789abcdef0123456789abcdef01";
-    expect(cursorHeadMatches([
+    expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: `REJECT head=${head}: claim check is wrong` },
     ], head)).toBe(false);
-    expect(cursorHeadMatches([
+    expect(await cursorHeadMatches([
       { user: "U0B81F5GR6V", text: `reviewed ${head}, needs changes` },
     ], head)).toBe(false);
   });
 
-  it("reads the verdict on the head's own table row", () => {
+  it("reads the verdict on the head's own table row", async () => {
     const rejected = `e2963141${"0".repeat(32)}`;
     const accepted = `14344f04${"0".repeat(32)}`;
     const table = `| 건 | head | 판정 | | --- | --- | --- | | Mail #57 | \`${accepted}\` | ACCEPT | | jm-omo #2 | \`${rejected}\` | REJECT |`;
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], rejected)).toBe(false);
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], accepted)).toBe(true);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], rejected, { repo: "owner/jm-omo", prNumber: "2" })).toBe(false);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: table }], accepted, { repo: "owner/mail", prNumber: "57" })).toBe(true);
     const lines = `jm-omo #2 ${rejected} REJECT\nMail #57 ${accepted} ACCEPT`;
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], rejected)).toBe(false);
-    expect(cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], accepted)).toBe(true);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], rejected, { repo: "owner/jm-omo", prNumber: "2" })).toBe(false);
+    expect(await cursorHeadMatches([{ user: "U0B81F5GR6V", text: lines }], accepted, { repo: "owner/mail", prNumber: "57" })).toBe(true);
+  });
+
+  it("requires target PR identity on the ACCEPT line and rejects another owner shorthand", async () => {
+    const head = "0123456789abcdef0123456789abcdef01234567";
+    const messages = [
+      { user: "U0B81F5GR6V", text: `owner/jm-omo#5 ${head} REJECT\nother-owner/jm-omo#5 ${head} ACCEPT` },
+      { user: "U0B81F5GR6V", text: `TASK-BOUND-PR ${head} REJECT\nACCEPT head=${head}` },
+    ];
+    expect(await cursorHeadMatches(messages, head, {
+      repo: "owner/jm-omo", prNumber: "5", taskKey: "TASK-BOUND-PR",
+    })).toBe(false);
+    expect(await cursorHeadMatches([
+      { user: "U0B81F5GR6V", text: `other-jm-omo#5 ${head} ACCEPT` },
+    ], head, { repo: "owner/jm-omo", prNumber: "5" })).toBe(false);
   });
 
   it("resolves a short claim through the PR and checks Slack against the full SHA", async () => {
     const fullHead = "abcdef0123456789abcdef0123456789abcdef01";
     const acceptedPrefix = fullHead.slice(0, 8);
     const task = { sent_at: "2026-10-09T10:00:00.000Z", done: "pr:whelp99-code/jm-omo#1" };
-    const slackMessages = [{ user: "U0B81F5GR6V", text: `ACCEPT head=${acceptedPrefix}` }];
+    const slackMessages = [{ user: "U0B81F5GR6V", text: `ACCEPT jm-omo#1 head=${acceptedPrefix}` }];
     let checkedHead;
     const verified = await verifyClaims(`Cursor ACCEPT head=${acceptedPrefix}`, task, {
-      slackHasHead: async (head, sentAt) => { checkedHead = head; return head === fullHead && sentAt === task.sent_at && cursorHeadMatches(slackMessages, head); },
+      slackHasHead: async (head, sentAt) => {
+        checkedHead = head;
+        return head === fullHead && sentAt === task.sent_at && await cursorHeadMatches(slackMessages, head,
+          { repo: "whelp99-code/jm-omo", prNumber: "1" },
+          async (argv) => ({ exitCode: 0, stdout: argv[1] === "api" ? `${fullHead}\n` : "" }));
+      },
       getPrHead: async () => fullHead,
     });
     expect(checkedHead).toBe(fullHead);
     expect(verified[0]).toMatchObject({ kind: "cursor-accept", ok: true, head: fullHead, acceptedPrefix, actualHead: fullHead });
     expect(claimEvent("crm", "TASK-X", verified[0])).toBe("FLEET_CLAIM_OK crm TASK-X cursor-accept slack_author_full_head_match");
+
+    const differentPrefix = "ffffffff";
+    const mismatchedSlack = await verifyClaims(`Cursor ACCEPT head=${acceptedPrefix}`, task, {
+      slackHasHead: async (head) => cursorHeadMatches([{ user: "U0B81F5GR6V", text: `ACCEPT head=${differentPrefix} PR #1` }], head,
+        { repo: "whelp99-code/jm-omo", prNumber: "1" },
+        async () => ({ exitCode: 0, stdout: `${fullHead}\n` })),
+      getPrHead: async () => fullHead,
+    });
+    expect(mismatchedSlack[0]).toMatchObject({ kind: "cursor-accept", ok: false, actualHead: fullHead });
 
     const rejected = await verifyClaims(`Cursor APPROVE head=${acceptedPrefix}`, task, {
       slackHasHead: async () => false,
@@ -1015,10 +1558,48 @@ describe("fleet completion claim verification", () => {
     expect(separateLine.find((claim) => claim.kind === "cursor-accept").ok).toBe(false);
   });
 
-  it("rejects a Slack ACCEPT collision on the same seven-character prefix", async () => {
+  it("uses the parsed task PR number in default Slack short-head verification", async () => {
+    const repo = "whelp99-code/jm-omo";
+    const prNumber = "85";
+    const fullHead = "efaf6d9222222222222222222222222222222222";
+    const prefix = "efaf6d92";
+    const task = {
+      sent_at: "2026-10-12T10:00:00.000Z",
+      done: `pr:${repo}#${prNumber}`,
+    };
+    const calls = [];
+    let messages = [{ user: "U0B81F5GR6V", text: `ACCEPT jm-omo PR${prNumber} head=${prefix}` }];
+    const runCommand = async (argv) => {
+      calls.push(argv);
+      if (argv[1] === "pr") return { exitCode: 0, stdout: JSON.stringify({ headRefOid: fullHead }) };
+      if (argv[1] === "api") return { exitCode: 0, stdout: `${fullHead}\n` };
+      throw new Error(`unexpected command: ${argv.join(" ")}`);
+    };
+    const matched = await verifyClaims(`Cursor ACCEPT PR #${prNumber} head=${prefix}`, task, {
+      runCommand,
+      slackHistory: async () => messages,
+    });
+    expect(matched[0]).toMatchObject({ kind: "cursor-accept", ok: true, head: fullHead, actualHead: fullHead });
+    expect(calls).toEqual([
+      ["gh", "pr", "view", prNumber, "--repo", repo, "--json", "headRefOid"],
+      ["gh", "api", `repos/${repo}/pulls/${prNumber}/commits`, "--paginate", "--jq", ".[].sha"],
+    ]);
+
+    calls.length = 0;
+    messages = [{ user: "U0B81F5GR6V", text: `ACCEPT jm-omo PR99 head=${prefix}` }];
+    const wrongPr = await verifyClaims(`Cursor ACCEPT PR #99 head=${prefix}`, task, {
+      runCommand,
+      slackHistory: async () => messages,
+    });
+    expect(wrongPr[0]).toMatchObject({ kind: "cursor-accept", ok: false });
+    expect(calls).toEqual([["gh", "pr", "view", prNumber, "--repo", repo, "--json", "headRefOid"]]);
+  });
+
+  it("rejects a Slack ACCEPT prefix that resolves to a different commit", async () => {
     const mergedHead = "efaf6d945ebb757ee0d349e3a65c5345cf882a8d";
     const differentHead = "efaf6d9a1234567890abcdef1234567890abcdef";
-    const prefix = mergedHead.slice(0, 7);
+    const prefix = mergedHead.slice(0, 8);
+    const commitsCommand = async () => ({ exitCode: 0, stdout: `${mergedHead}\n${differentHead}\n` });
     let checkedHead;
     const claims = await verifyClaims(`Cursor ACCEPT head=${prefix}\nPR READY head=${prefix}`, {
       sent_at: "2026-10-09T10:00:00.000Z",
@@ -1026,12 +1607,48 @@ describe("fleet completion claim verification", () => {
     }, {
       slackHasHead: async (head) => {
         checkedHead = head;
-        return cursorHeadMatches([{ user: "U0B81F5GR6V", text: `ACCEPT head=${differentHead.slice(0, 8)}` }], head);
+        return cursorHeadMatches([{ user: "U0B81F5GR6V", text: `ACCEPT head=${differentHead.slice(0, 8)} PR #83` }], head,
+          { repo: "whelp99-code/jm-omo", prNumber: "83" }, commitsCommand);
       },
       getPrHead: async () => mergedHead,
     });
     expect(checkedHead).toBe(mergedHead);
     expect(claims.find((claim) => claim.kind === "cursor-accept")).toMatchObject({ ok: false, actualHead: mergedHead });
+  });
+
+  it("rejects an ambiguous prefix shared by current and prior PR commits", async () => {
+    const headA = "efaf6d9111111111111111111111111111111111";
+    const headB = "efaf6d9222222222222222222222222222222222";
+    const accepted = await cursorHeadMatches(
+      [{ user: "U0B81F5GR6V", text: "ACCEPT PR #84 head=efaf6d9" }],
+      headB,
+      { repo: "owner/repo", prNumber: "84" },
+      async () => ({ exitCode: 0, stdout: `${headA}\n${headB}\n` }),
+    );
+    expect(accepted).toBe(false);
+  });
+
+  it("accepts a prefix that uniquely identifies the current PR head", async () => {
+    const head = "efaf6d9222222222222222222222222222222222";
+    const accepted = await cursorHeadMatches(
+      [{ user: "U0B81F5GR6V", text: "ACCEPT owner/repo#85 head=efaf6d92" }],
+      head,
+      { repo: "owner/repo", prNumber: "85" },
+      async () => ({ exitCode: 0, stdout: `${head}\n` }),
+    );
+    expect(accepted).toBe(true);
+  });
+
+  it("rejects a unique prefix that identifies an older PR commit", async () => {
+    const current = "efaf6d9222222222222222222222222222222222";
+    const previous = "efaf6d9111111111111111111111111111111111";
+    const accepted = await cursorHeadMatches(
+      [{ user: "U0B81F5GR6V", text: "ACCEPT owner/repo#86 head=efaf6d91" }],
+      current,
+      { repo: "owner/repo", prNumber: "86" },
+      async () => ({ exitCode: 0, stdout: `${previous}\n${current}\n` }),
+    );
+    expect(accepted).toBe(false);
   });
 
   it("compares PR READY with the actual PR head", async () => {
@@ -1052,33 +1669,20 @@ describe("fleet completion claim verification", () => {
     await verifyClaims(`PR READY head=${head} https://github.com/whelp99-code/jm-omo/pull/7`, { done: "pr:other/repo#1" }, {
       getPrHead: async (signal) => { urlSignal = signal; return head; },
     });
-    expect(urlSignal).toBe("pr:whelp99-code/jm-omo#7");
+    expect(urlSignal).toBe("pr:other/repo#1");
   });
 
-  it("uses a read-only gh pr view for the referenced PR", async () => {
-    const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-gh-"));
-    const bin = join(home, "bin");
-    mkdirSync(bin);
-    const ghPath = join(bin, "gh");
-    const ghLog = join(home, "gh.log");
+  it("uses a read-only argv gh pr view for the referenced PR", async () => {
     const head = "abcdef0123456789abcdef0123456789abcdef01";
-    writeFileSync(ghPath, `#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_LOG\"\nprintf '{\"headRefOid\":\"${head}\"}\\n'\n`);
-    chmodSync(ghPath, 0o755);
-    const previousPath = process.env.PATH;
-    const previousGhLog = process.env.GH_LOG;
-    process.env.PATH = `${bin}:${previousPath ?? ""}`;
-    process.env.GH_LOG = ghLog;
-    try {
-      const claims = await verifyClaims(`PR READY head=${head}`, { done: "pr:whelp99-code/jm-omo#1" });
-      expect(readFileSync(ghLog, "utf8").trim()).toBe("pr view 1 --repo whelp99-code/jm-omo --json headRefOid");
-      expect(claims[0]).toMatchObject({ kind: "pr-ready", ok: true });
-    } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-      if (previousGhLog === undefined) delete process.env.GH_LOG;
-      else process.env.GH_LOG = previousGhLog;
-      rmSync(home, { recursive: true, force: true });
-    }
+    const calls = [];
+    const claims = await verifyClaims(`PR READY head=${head}`, { done: "pr:whelp99-code/jm-omo#1" }, {
+      runCommand: async (argv) => {
+        calls.push(argv);
+        return { exitCode: 0, stdout: JSON.stringify({ headRefOid: head }) };
+      },
+    });
+    expect(calls).toEqual([["gh", "pr", "view", "1", "--repo", "whelp99-code/jm-omo", "--json", "headRefOid"]]);
+    expect(claims[0]).toMatchObject({ kind: "pr-ready", ok: true });
   });
 
   it("does not treat a tests count as completion evidence", async () => {
@@ -1089,6 +1693,48 @@ describe("fleet completion claim verification", () => {
     });
     expect(claims).toEqual([{ kind: "tests-count", ok: false, detail: "tests_count_is_not_evidence" }]);
     expect(called).toBe(false);
+  });
+});
+
+describe("fleet startup schema migration", () => {
+  it("serializes additive migrations when multiple fleet processes start together", async () => {
+    const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-migration-race-"));
+    const state = join(home, ".local", "state", "omonyang");
+    mkdirSync(state, { recursive: true });
+    const dbPath = join(state, "fleet.sqlite");
+    const legacy = new Database(dbPath);
+    legacy.exec(`CREATE TABLE tasks(
+      key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
+      done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
+      result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+    );
+    CREATE TABLE dispatch_reservations(pane TEXT PRIMARY KEY,key TEXT UNIQUE NOT NULL,attempt TEXT NOT NULL);`);
+    legacy.close();
+
+    const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
+    const env = { ...process.env, HOME: home };
+    try {
+      const processes = Array.from({ length: 6 }, () => Bun.spawn([
+        "bun", "-e", `await import(${JSON.stringify(fleetPath)});`,
+      ], { env, stdout: "pipe", stderr: "pipe" }));
+      const results = await Promise.all(processes.map(async (proc) => {
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        return { stdout, stderr, exitCode };
+      }));
+      expect(results.filter((result) => result.exitCode !== 0)).toEqual([]);
+      const migrated = new Database(dbPath);
+      const taskColumns = new Set(migrated.query("PRAGMA table_info(tasks)").all().map((column) => column.name));
+      const reservationColumns = new Set(migrated.query("PRAGMA table_info(dispatch_reservations)").all().map((column) => column.name));
+      expect(["completion_claimed", "send_attempted", "claim_evidence"].every((column) => taskColumns.has(column))).toBe(true);
+      expect(["reserved_at", "recovery_token", "recovery_started_at"].every((column) => reservationColumns.has(column))).toBe(true);
+      migrated.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1294,6 +1940,60 @@ describe("fleet working-task compaction recovery", () => {
 });
 
 describe("fleet usage and Bugbot alerts", () => {
+  it("honors an idle completion marker before reconciling an expired send reservation", async () => {
+    const result = await runWatchCycle({
+      catTask: "TASK-DONE-ON-RESTART",
+      taskStatus: "send-failed-unconfirmed",
+      taskHistory: [{ ev: "send-attempted", attempt: "fixture-attempt" }],
+      reservation: true,
+      reservationAgeMs: 10 * 60_000,
+      paneScreen: "⏺ The work is complete.\nTASK-DONE-ON-RESTART_DONE finished\n\n❯",
+    });
+    expect(result.output).toContain("FLEET_TASK_DONE crm TASK-DONE-ON-RESTART finished");
+    expect(result.taskStatus).toBe("done-claimed");
+    expect(result.herdrWrites).toEqual([]);
+    expect(result.reservationLeft).toBe(true);
+  });
+
+  it("re-verifies not-done PR tasks during a watch cycle", async () => {
+    const result = await runWatchCycle({
+      catTask: "WATCH-RETRY-PR",
+      taskStatus: "not-done",
+      taskHistory: [{ ev: "done-claimed", text: "ready" }],
+      prDone: "pr:whelp99-code/jm-omo#77",
+      paneScreen: "Idle\n❯",
+    });
+    expect(result.output).toContain("NOT_DONE WATCH-RETRY-PR");
+    expect(result.ghCalls).toContain("pr view 77 --repo whelp99-code/jm-omo --json state,mergeCommit,headRefOid");
+    expect(result.taskStatus).toBe("not-done");
+  });
+
+  it("keeps not-done PRs visible and re-verifies them on each watch cycle", async () => {
+    const result = await runWatchCycle({
+      catTask: "NOT-DONE-PR",
+      taskStatus: "not-done",
+      taskHistory: [{ ev: "done-claimed", text: "merged" }],
+      prDone: "pr:whelp99-code/jm-omo#77",
+      paneScreen: "Idle\n❯",
+      checkRuns: [{
+        name: "Cursor Bugbot",
+        status: "completed",
+        conclusion: "neutral",
+        output: { title: "usage limit reached", summary: "", text: "" },
+      }],
+    });
+    expect(result.output).toContain("NOT_DONE NOT-DONE-PR");
+    expect(result.output).toContain("FLEET_BUGBOT_LIMIT NOT-DONE-PR");
+    expect(result.taskStatus).toBe("not-done");
+
+    const board = await runFleetBoard({
+      catTask: "NOT-DONE-PR",
+      taskStatus: "not-done",
+      prDone: "pr:whelp99-code/jm-omo#77",
+    });
+    expect(board.output).toContain("#77 OPEN draft");
+  });
+
   it("monitors tracked tasks in the watcher and board before completion", async () => {
     const options = {
       catTask: "TRACKED-PR",
@@ -1386,6 +2086,50 @@ describe("fleet usage and Bugbot alerts", () => {
 });
 
 describe("fleet question policy", () => {
+  it("does not apply a policy phrase from assistant history to a staging question", () => {
+    const screen = [
+      "⏺ I will not use the production auth account.",
+      "Question pending",
+      "May I use the staging account password?",
+      "❯",
+    ].join("\n");
+    const state = classify(screen);
+    expect(state.questionText).toBe("May I use the staging account password?");
+    expect(questionPolicy(state.questionText)).toBeNull();
+  });
+
+  it("matches allowlisted policies only against the pending question", () => {
+    const screen = [
+      "Earlier response: I avoided using the production auth account.",
+      "Question pending",
+      "Can I use the staging account password?",
+      "❯",
+    ].join("\n");
+    const classified = classify(screen);
+    expect(classified.questionText).toBe("Can I use the staging account password?");
+    expect(questionPolicy(classified.questionText)).toBeNull();
+    expect(questionPolicy("May I use the production auth account?")?.id).toBe("production-auth-prohibited");
+  });
+
+  it("keeps unanswered words inside the question instead of treating them as status markers", async () => {
+    const question = "May I use the production auth account for this unanswered issue?";
+    const classified = classify(`Question pending\n${question}\n❯`);
+    expect(classified.state).toBe("question");
+    expect(classified.questionText).toBe(question);
+    expect(questionPolicy(classified.questionText)?.id).toBe("production-auth-prohibited");
+
+    const result = await runWatchCycle({
+      catTask: "Q-UNANSWERED-WORD",
+      paneScreen: `Question pending\n${question}\n❯`,
+    });
+    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-UNANSWERED-WORD policy=production-auth-prohibited");
+    expect(result.herdrWrites).toEqual([
+      "pane send-text w6:p1 운영 인증 계정은 사용하지 마.",
+      "pane send-keys w6:p1 Enter",
+    ]);
+    expect(classify("This is still an unanswered issue\n❯").state).toBe("idle");
+  });
+
   it("retries an allowlisted answer after a transient send failure", async () => {
     const result = await runFleetCommand({
       catTask: "Q-RETRY",
@@ -1448,6 +2192,18 @@ describe("fleet question policy", () => {
 });
 
 describe("fleet text board", () => {
+  it("persists unknown cat state after a pane read failure", async () => {
+    const result = await runFleetCommand({
+      catState: "working",
+      paneReadFailure: true,
+      command: ["status"],
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toContain("unknown");
+    expect(result.output).not.toContain("working");
+    expect(result.output).toContain("FLEET_REFRESH_ERROR crm");
+  });
+
   it("shows all roadmap items, live cats, PR review state, and unknown deployment evidence", async () => {
     const result = await runFleetBoard({
       catTask: "PR-TASK",
@@ -1490,6 +2246,56 @@ describe("fleet UTF-8 dispatch and prompt isolation", () => {
 });
 
 describe("fleet review-stall request correlation", () => {
+  it("persists a cursor and revisits an old unanswered request after restart", async () => {
+    const db = unitDb();
+    const nowMs = Date.now();
+    const requestTs = String((nowMs - 30 * 60 * 60_000) / 1000);
+    const request = {
+      ts: requestTs,
+      thread_ts: requestTs,
+      channel: "C0C6HJM0BV5",
+      reply_count: 1,
+      user: "UOTHER",
+      text: "Cursor 검수 요청 PR #98 TASK-OLD-REVIEW",
+    };
+    let since;
+    const first = await pollReviewStalls(db, nowMs, async (oldest) => {
+      since = oldest;
+      return [request];
+    });
+    const bootstrapCursor = ((nowMs - 30 * 24 * 60 * 60_000) / 1000).toFixed(6);
+    expect(since).toBe(bootstrapCursor);
+    const exactRootParams = slackHistoryParams(requestTs);
+    expect(exactRootParams.get("oldest")).toBe(requestTs);
+    expect(exactRootParams.get("inclusive")).toBe("true");
+    expect(first).toHaveLength(1);
+    expect(first[0]).toContain("TASK-OLD-REVIEW");
+    expect(db.query("SELECT value FROM fleet_state WHERE key='slack-review-cursor'").get().value).toBe(requestTs);
+    expect(db.query("SELECT ts FROM fleet_review_requests").get().ts).toBe(requestTs);
+
+    const restartedPoll = await pollReviewStalls(db, nowMs + 60 * 60_000, async (oldest) => {
+      since = oldest;
+      return [
+        request,
+        { ts: String((nowMs + 1_000) / 1000), thread_ts: requestTs, app_id: "A08SKDT6QUW", text: "확인했어" },
+      ];
+    });
+    expect(since).toBe(requestTs);
+    expect(slackHistoryParams(since).get("inclusive")).toBe("true");
+    const refetchedRoots = reviewRequestThreadRoots([request]);
+    const refetchedThreadRoots = [];
+    await fetchSlackThreadReplies(refetchedRoots, async (root) => {
+      refetchedThreadRoots.push(root.ts);
+      return [{ ts: String(Number(root.ts) + 1), thread_ts: root.ts, app_id: "A08SKDT6QUW", text: "prior review reply" }];
+    }, new AbortController().signal);
+    expect(refetchedThreadRoots).toEqual([requestTs]);
+    expect(restartedPoll).toEqual([]);
+    expect(db.query("SELECT ts FROM fleet_review_requests").get()).toBeNull();
+    expect(db.query("SELECT value FROM fleet_state WHERE key='slack-review-cursor'").get().value)
+      .toBe(requestTs);
+    db.close();
+  });
+
   it("fetches thread replies only for review-request roots", () => {
     const roots = reviewRequestThreadRoots([
       { ts: "1.1", reply_count: 3, user: "UOTHER", text: "Cursor 검수 요청 PR #12" },
