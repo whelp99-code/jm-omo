@@ -1315,15 +1315,24 @@ export async function verifyClaims(text, task, checks = {}) {
 }
 
 export function hasListedTests(body) {
+  const hasExecutedCounts = (text) => {
+    const source = String(text ?? "");
+    if (/^\s*(?:pending|skipped|todo|no[- ]tests?|none|n\/a|not run|not executed|not performed)\b/i.test(source)) return false;
+    const passed = source.match(/\b(\d+)\s+(?:tests?\s+)?pass(?:ed|ing)?\b/i)?.[1]
+      ?? source.match(/\bpass(?:ed|ing)?\s*:\s*(\d+)\b/i)?.[1];
+    const failed = source.match(/\b(\d+)\s+(?:tests?\s+)?fail(?:ed|ing)?\b/i)?.[1]
+      ?? source.match(/\bfail(?:ed|ing)?\s*:\s*(\d+)\b/i)?.[1];
+    return Number(passed) > 0 && Number(failed) === 0;
+  };
   const lines = String(body ?? "").split(/\r?\n/);
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index].trim();
     const inline = line.match(/^(?:tests?|testing)\s*:\s*(.+)$/i);
-    if (inline?.[1].trim() && !/^(?:none|n\/a|not run)$/i.test(inline[1].trim())) return true;
+    if (inline && hasExecutedCounts(inline[1])) return true;
     if (!/^#{1,6}\s*(?:tests?|testing|test plan)\s*$/i.test(line)) continue;
     for (let next = index + 1; next < lines.length && !/^#{1,6}\s/.test(lines[next]); next++) {
       const item = lines[next].match(/^\s*(?:[-*+]|\d+[.)])\s+(.+)$/)?.[1]?.trim();
-      if (item && !/^(?:none|n\/a|not run|not executed|not performed|pending|todo)\b/i.test(item)) return true;
+      if (item && hasExecutedCounts(item)) return true;
     }
   }
   return false;
@@ -2074,10 +2083,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
           continue;
         }
         if (!["OPEN", "MERGED"].includes(info.state)) continue;
-        if (info.state === "OPEN") {
-          info = await ensurePrLoopReady(info, signal, runCommand);
-          if (!info) continue;
-        }
+        if (info.state === "OPEN" && info.isDraft) continue;
         const verdict = matchPrLoopVerdict(replies, {
           repo: row.repo,
           prNumber: row.pr_number,

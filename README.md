@@ -28,6 +28,8 @@
 
 `fleet/fleet.config.json` is loaded when `fleet.mjs` starts. Its `cats` array defines each cat's `id`, display `name`, `role`, `kind`, `pane`, and `product`; `fleet init` upserts these configured panes into the fleet database. The `slack` object holds `reviewChannel`, `cursorUserId`, and `reviewReplyAppId`. `agentMessengerCredentialPath` is the absolute path to the global agent-messenger Slack credential manager. `prLoop` holds the review thread, `enabled` and `autoMerge` kill switches (both default false), `mergePendingTimeoutMs`, `deployTimeoutMs`, a `mergeMethods` map keyed by repository with `merge`, `squash`, or `rebase` values, and an empty-by-default `deploy` map keyed by GitHub repository; each deploy entry has an `argv` array and `healthUrl`.
 
+Draft PRs are automatically readied only when their Tests/Test Plan contains an executed summary with at least one pass and an explicit zero-failure count.
+
 Environment overrides are `FLEET_CAT_<ID>_PANE` (for example, `FLEET_CAT_CRM_PANE`), `FLEET_SLACK_REVIEW_CHANNEL`, `FLEET_CURSOR_USER_ID`, `FLEET_REVIEW_REPLY_APP_ID`, `FLEET_AGENT_MESSENGER_CREDENTIAL_PATH`, `FLEET_PR_LOOP_ENABLED`, and `FLEET_PR_LOOP_AUTO_MERGE`.
 
 ```bash

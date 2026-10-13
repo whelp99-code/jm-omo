@@ -469,7 +469,7 @@ describe("fleet PR automation", () => {
         exitCode: 0,
         stdout: JSON.stringify({
           state: "OPEN", isDraft, headRefOid: head, url: "https://github.com/owner/repo/pull/52",
-          body: "## Tests\n- bun test fleet/\n",
+          body: "## Tests\n- bun test fleet/\n- 210 pass, 0 fail\n",
         }),
       };
       if (argv[1] === "pr" && argv[2] === "ready") {
@@ -530,10 +530,57 @@ describe("fleet PR automation", () => {
     expect(events).toEqual([]);
     expect(calls.some((argv) => argv[1] === "pr" && argv[2] === "ready")).toBe(false);
     expect(db.query("SELECT COUNT(*) AS count FROM fleet_pr_loop").get().count).toBe(0);
-    expect(hasListedTests("## Tests\n- bun test fleet/\n")).toBe(true);
+    expect(hasListedTests("## Tests\n- bun test fleet/\n")).toBe(false);
+    expect(hasListedTests("## Tests\n- bun test fleet/\n- 210 pass, 0 fail\n")).toBe(true);
     expect(hasListedTests("## Tests\nNot run\n")).toBe(false);
+    expect(hasListedTests("## Test Plan\n- Not run (environment unavailable)\n")).toBe(false);
     db.close();
   });
+
+  it("keeps an administrator draft hold while awaiting Cursor review", async () => {
+    const db = prLoopDb({ key: "PRLOOP-ADMIN-DRAFT-HOLD", done: signal });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,updated_at)
+      VALUES('owner/repo','52',?,'PRLOOP-ADMIN-DRAFT-HOLD','awaiting-review','100','1')`).run(head);
+    let readyCalls = 0;
+    const events = await processPrLoopEvents(db, prLoopConfig, {
+      fetchReplies: async () => [{
+        ts: "101", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW",
+        text: `ACCEPT owner/repo#52 head=${head}`,
+      }],
+      runCommand: async (argv) => {
+        if (argv[2] === "ready") readyCalls++;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            state: "OPEN", isDraft: true, headRefOid: head, body: "Tests: 210 pass, 0 fail",
+          }),
+        };
+      },
+    });
+    expect(readyCalls).toBe(0);
+    expect(events).toEqual([]);
+    expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("awaiting-review");
+    db.close();
+  });
+
+  it.each([
+    "pending",
+    "skipped",
+    "todo",
+    "no tests",
+    "not executed",
+    "4 passed",
+    "0 passed, 0 failed",
+    "4 passed, 1 failed",
+  ])("does not treat inline Tests: %s as an executed test result", (status) => {
+    expect(hasListedTests(`Tests: ${status}`)).toBe(false);
+  });
+
+  it.each(["4 passed, 0 failed", "210 pass, 0 fail", "3 tests passed, 0 tests failed"])(
+    "accepts inline executed test counts: %s",
+    (summary) => expect(hasListedTests(`Testing: ${summary}`)).toBe(true),
+  );
 
   it("rejects a PR head that differs from its full PR READY claim", async () => {
     const otherHead = "ffffffffffffffffffffffffffffffffffffffff";
@@ -854,7 +901,7 @@ describe("fleet PR automation", () => {
           exitCode: 0,
           stdout: JSON.stringify({
             state: "OPEN", isDraft, headRefOid: head, url: "https://github.com/owner/repo/pull/52",
-            body: "## Tests\n- bun test fleet/\n",
+            body: "## Tests\n- bun test fleet/\n- 210 pass, 0 fail\n",
           }),
         };
       }
@@ -1851,7 +1898,8 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
 
   it("does not count a Test Plan entry that says not run", () => {
     expect(hasListedTests("## Test Plan\n- Not run (environment unavailable)\n")).toBe(false);
-    expect(hasListedTests("## Tests\n- bun test fleet/\n")).toBe(true);
+    expect(hasListedTests("## Tests\n- bun test fleet/\n")).toBe(false);
+    expect(hasListedTests("## Tests\n- 210 passed, 0 failed\n")).toBe(true);
   });
 });
 
