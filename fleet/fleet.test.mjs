@@ -2203,6 +2203,46 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     db.close();
   });
 
+  it.each([
+    ["HTTP 403 API rate limit", "HTTP 403: API rate limit exceeded", "merge-pending", 0, 1],
+    ["HTTP 429 rate limit", "HTTP 429: rate limit exceeded; retry-after: 30", "merge-pending", 0, 1],
+    ["HTTP 403 secondary rate limit", "HTTP 403: secondary rate limit and abuse detection", "merge-pending", 0, 1],
+    ["HTTP 403 permission denial", "HTTP 403: Resource not accessible by integration; permission denied", "merge-failed", 1, 0],
+  ])("classifies %s merge stderr correctly", async (_label, stderr, expectedState, expectedDefinitiveCount, expectedAmbiguousCount) => {
+    const key = `PRLOOP-CLASSIFY-${String(_label).toUpperCase().replaceAll(/[^A-Z0-9]+/g, "-")}`;
+    const db = prLoopDb({ key, done: signal });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,verdict,verdict_ts,updated_at)
+      VALUES('owner/repo','52',?,?,'accepted','100','ACCEPT','101','1')`).run(head, key);
+    let mergeCalls = 0;
+    const runCommand = async (argv) => {
+      if (argv[1] === "pr" && argv[2] === "merge") {
+        mergeCalls++;
+        return { exitCode: 1, stdout: "", stderr };
+      }
+      if (argv[1] === "pr" && argv[2] === "view") return {
+        exitCode: 0,
+        stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head }),
+      };
+      throw new Error(`unexpected command ${argv.join(" ")}`);
+    };
+    const fetchReplies = async () => [{
+      ts: "102", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW",
+      text: `ACCEPT owner/repo#52 head=${head}`,
+    }];
+    const events = await processPrLoopEvents(db, { ...config, autoMerge: true }, { runCommand, fetchReplies });
+    const row = db.query("SELECT state,merge_failure_count,merge_ambiguous_count FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?")
+      .get(head);
+    expect(mergeCalls).toBe(1);
+    expect(row).toEqual({
+      state: expectedState,
+      merge_failure_count: expectedDefinitiveCount,
+      merge_ambiguous_count: expectedAmbiguousCount,
+    });
+    expect(events.some((event) => event.includes(expectedState === "merge-pending"
+      ? "FLEET_PR_MERGE_PENDING" : "FLEET_PR_MERGE_FAILED"))).toBe(true);
+    db.close();
+  });
+
   it("moves ambiguous merge polling to needs-attention after six hours", async () => {
     const key = "PRLOOP-MERGE-AMBIGUOUS-TIMEOUT";
     const db = prLoopDb({ key, done: signal });
