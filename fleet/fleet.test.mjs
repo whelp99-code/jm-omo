@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch as watchFs, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SELF_POLICY_ENABLED } from "../runtime/usage-policy.mjs";
 
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
@@ -12,6 +13,12 @@ if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
 afterAll(() => rmSync(unitHome, { recursive: true, force: true }));
+
+describe("usage-watch policy", () => {
+  it("keeps self-policy disabled for the JARVIS pane", () => {
+    expect(SELF_POLICY_ENABLED).toBe(false);
+  });
+});
 
 function unitDb() {
   return new Database(join(unitHome, ".local", "state", "omonyang", "fleet.sqlite"));
