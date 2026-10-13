@@ -19,7 +19,13 @@ CREATE TABLE IF NOT EXISTS fleet_review_requests(ts TEXT PRIMARY KEY, channel TE
 CREATE TABLE IF NOT EXISTS fleet_pr_loop(
   repo TEXT NOT NULL, pr_number TEXT NOT NULL, head TEXT NOT NULL, task_key TEXT NOT NULL,
   state TEXT NOT NULL, request_ts TEXT, verdict TEXT, verdict_ts TEXT, merge_sha TEXT, merge_pending_since TEXT,
-  merge_lease_token TEXT, merge_lease_until TEXT, deploy_lease_token TEXT, deploy_lease_until TEXT,
+  merge_ambiguous_since TEXT,
+  post_lease_token TEXT, post_lease_until TEXT, reject_lease_token TEXT, reject_lease_until TEXT, reject_sent_at TEXT,
+  reject_delivery_attempt TEXT, reject_submit_confirmed_at TEXT,
+  merge_lease_token TEXT, merge_lease_until TEXT,
+  merge_failure_count INTEGER NOT NULL DEFAULT 0, merge_ambiguous_count INTEGER NOT NULL DEFAULT 0,
+  merge_retry_at TEXT, merge_failure_reason TEXT,
+  deploy_lease_token TEXT, deploy_lease_until TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(repo,pr_number,head)
 );`);
@@ -50,8 +56,20 @@ export function migrateFleetColumns(dbHandle) {
     addMissing("fleet_pr_loop", [
       ["verdict", "TEXT"],
       ["merge_pending_since", "TEXT"],
+      ["merge_ambiguous_since", "TEXT"],
+      ["post_lease_token", "TEXT"],
+      ["post_lease_until", "TEXT"],
+      ["reject_lease_token", "TEXT"],
+      ["reject_lease_until", "TEXT"],
+      ["reject_sent_at", "TEXT"],
+      ["reject_delivery_attempt", "TEXT"],
+      ["reject_submit_confirmed_at", "TEXT"],
       ["merge_lease_token", "TEXT"],
       ["merge_lease_until", "TEXT"],
+      ["merge_failure_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["merge_ambiguous_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["merge_retry_at", "TEXT"],
+      ["merge_failure_reason", "TEXT"],
       ["deploy_lease_token", "TEXT"],
       ["deploy_lease_until", "TEXT"],
     ]);
@@ -1312,15 +1330,24 @@ export async function verifyClaims(text, task, checks = {}) {
 }
 
 export function hasListedTests(body) {
+  const hasExecutedCounts = (text) => {
+    const source = String(text ?? "");
+    if (/^\s*(?:pending|skipped|todo|no[- ]tests?|none|n\/a|not run|not executed|not performed)\b/i.test(source)) return false;
+    const passed = source.match(/\b(\d+)\s+(?:tests?\s+)?pass(?:ed|ing)?\b/i)?.[1]
+      ?? source.match(/\bpass(?:ed|ing)?\s*:\s*(\d+)\b/i)?.[1];
+    const failed = source.match(/\b(\d+)\s+(?:tests?\s+)?fail(?:ed|ing)?\b/i)?.[1]
+      ?? source.match(/\bfail(?:ed|ing)?\s*:\s*(\d+)\b/i)?.[1];
+    return Number(passed) > 0 && Number(failed) === 0;
+  };
   const lines = String(body ?? "").split(/\r?\n/);
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index].trim();
     const inline = line.match(/^(?:tests?|testing)\s*:\s*(.+)$/i);
-    if (inline?.[1].trim() && !/^(?:none|n\/a|not run)$/i.test(inline[1].trim())) return true;
+    if (inline && hasExecutedCounts(inline[1])) return true;
     if (!/^#{1,6}\s*(?:tests?|testing|test plan)\s*$/i.test(line)) continue;
     for (let next = index + 1; next < lines.length && !/^#{1,6}\s/.test(lines[next]); next++) {
       const item = lines[next].match(/^\s*(?:[-*+]|\d+[.)])\s+(.+)$/)?.[1]?.trim();
-      if (item && !/^(?:none|n\/a|not run|not executed|not performed|pending|todo)\b/i.test(item)) return true;
+      if (item && hasExecutedCounts(item)) return true;
     }
   }
   return false;
@@ -1509,9 +1536,25 @@ function readPrLoopClaimedHead(task, signal, currentHead) {
 }
 
 function reservePrLoopRequest(dbHandle, info, taskKey) {
-  return dbHandle.transaction(() => dbHandle.query(`INSERT OR IGNORE INTO fleet_pr_loop
-    (repo,pr_number,head,task_key,state,updated_at) VALUES(?,?,?,?,'posting',?)`)
-    .run(info.repo, info.prNumber, info.headRefOid.toLowerCase(), taskKey, now()).changes === 1).immediate();
+  const token = crypto.randomUUID();
+  const leaseUntil = new Date(Date.now() + 30_000).toISOString();
+  const claimed = dbHandle.transaction(() => dbHandle.query(`INSERT OR IGNORE INTO fleet_pr_loop
+    (repo,pr_number,head,task_key,state,post_lease_token,post_lease_until,updated_at)
+    VALUES(?,?,?,?,'posting',?,?,?)`)
+    .run(info.repo, info.prNumber, info.headRefOid.toLowerCase(), taskKey, token, leaseUntil, now()).changes === 1).immediate();
+  return claimed ? token : null;
+}
+
+function claimPrLoopReviewPost(dbHandle, row) {
+  const token = crypto.randomUUID();
+  const claimNow = now();
+  const leaseUntil = new Date(Date.now() + 30_000).toISOString();
+  const claimed = dbHandle.transaction(() => dbHandle.query(`UPDATE fleet_pr_loop
+    SET state='posting',post_lease_token=?,post_lease_until=?,updated_at=?
+    WHERE repo=? AND pr_number=? AND head=?
+      AND (state='post-failed' OR (state='posting' AND (post_lease_until IS NULL OR post_lease_until<=?)))`)
+    .run(token, leaseUntil, claimNow, row.repo, row.pr_number, row.head, claimNow).changes === 1).immediate();
+  return claimed ? token : null;
 }
 
 function buildPrLoopReviewRequest(repo, prNumber, url, head) {
@@ -1534,7 +1577,8 @@ async function postPrLoopRequest(dbHandle, task, info, config, postMessage, even
       `claimed=${claimedHead ?? "missing"} actual=${readyInfo.headRefOid ?? "missing"}`);
     return false;
   }
-  if (!reservePrLoopRequest(dbHandle, readyInfo, task.key)) return true;
+  const postToken = reservePrLoopRequest(dbHandle, readyInfo, task.key);
+  if (!postToken) return true;
   const signal = `pr:${readyInfo.repo}#${readyInfo.prNumber}`;
   const url = readyInfo.url || `https://github.com/${readyInfo.repo}/pull/${readyInfo.prNumber}`;
   const text = buildPrLoopReviewRequest(readyInfo.repo, readyInfo.prNumber, url, claimedHead).text;
@@ -1542,13 +1586,15 @@ async function postPrLoopRequest(dbHandle, task, info, config, postMessage, even
     const posted = await postMessage(config.reviewChannel, config.reviewThreadTs, text);
     if (posted?.ok !== true || !posted.ts) throw new Error(posted?.error || "Slack post returned no timestamp");
     dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-      .run(String(posted.ts), now(), readyInfo.repo, readyInfo.prNumber, claimedHead);
+      ,post_lease_token=NULL,post_lease_until=NULL
+      WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+      .run(String(posted.ts), now(), readyInfo.repo, readyInfo.prNumber, claimedHead, postToken);
     events.push(`FLEET_PR_REVIEW_REQUESTED ${task.key} ${signal} head=${claimedHead} request_ts=${posted.ts}`);
   } catch (error) {
     dbHandle.query(`UPDATE fleet_pr_loop SET state='post-failed',updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-      .run(now(), readyInfo.repo, readyInfo.prNumber, claimedHead);
+      ,post_lease_token=NULL,post_lease_until=NULL
+      WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+      .run(now(), readyInfo.repo, readyInfo.prNumber, claimedHead, postToken);
     fleetError("PR_LOOP_POST", `task=${task.key} signal=${signal}`, error);
   }
   return true;
@@ -1570,54 +1616,183 @@ function existingPrLoopRequestTs(replies, row, threadTs) {
 async function retryPrLoopReviewPost(dbHandle, row, info, config, postMessage, events, runCommand) {
   const readyInfo = await ensurePrLoopReady(info, `pr:${row.repo}#${row.pr_number}`, runCommand);
   if (!readyInfo) return false;
-  const claimed = dbHandle.query(`UPDATE fleet_pr_loop SET state='posting',updated_at=?
-    WHERE repo=? AND pr_number=? AND head=? AND state IN ('posting','post-failed')`)
-    .run(now(), row.repo, row.pr_number, row.head).changes === 1;
-  if (!claimed) return false;
+  const postToken = claimPrLoopReviewPost(dbHandle, row);
+  if (!postToken) return false;
   const url = readyInfo.url || `https://github.com/${row.repo}/pull/${row.pr_number}`;
   const text = buildPrLoopReviewRequest(row.repo, row.pr_number, url, row.head).text;
   try {
     const posted = await postMessage(config.reviewChannel, config.reviewThreadTs, text);
     if (posted?.ok !== true || !posted.ts) throw new Error(posted?.error || "Slack post returned no timestamp");
     dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-      .run(String(posted.ts), now(), row.repo, row.pr_number, row.head);
+      ,post_lease_token=NULL,post_lease_until=NULL
+      WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+      .run(String(posted.ts), now(), row.repo, row.pr_number, row.head, postToken);
     events.push(`FLEET_PR_REVIEW_REQUESTED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} request_ts=${posted.ts}`);
   } catch (error) {
     dbHandle.query(`UPDATE fleet_pr_loop SET state='post-failed',updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-      .run(now(), row.repo, row.pr_number, row.head);
+      ,post_lease_token=NULL,post_lease_until=NULL
+      WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+      .run(now(), row.repo, row.pr_number, row.head, postToken);
     fleetError("PR_LOOP_POST", `task=${row.task_key} signal=pr:${row.repo}#${row.pr_number}`, error);
   }
   return true;
 }
 
-async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, sendFollowup) {
+const PR_LOOP_REJECT_LEASE_MS = 120_000;
+
+function claimPrLoopRejection(dbHandle, row, verdict = null) {
+  const token = crypto.randomUUID();
+  const deliveryAttempt = crypto.randomUUID();
+  const claimedAt = now();
+  const leaseUntil = new Date(Date.now() + PR_LOOP_REJECT_LEASE_MS).toISOString();
+  const changed = dbHandle.transaction(() => verdict
+    ? dbHandle.query(`UPDATE fleet_pr_loop SET state='rejecting',verdict=?,verdict_ts=?,
+        reject_sent_at=NULL,reject_delivery_attempt=?,reject_submit_confirmed_at=NULL,
+        merge_pending_since=NULL,merge_ambiguous_since=NULL,merge_ambiguous_count=0,merge_retry_at=NULL,merge_failure_reason=NULL,
+        reject_lease_token=?,reject_lease_until=?,updated_at=?
+        WHERE repo=? AND pr_number=? AND head=?
+          AND state IN ('awaiting-review','accepted','merge-failed','merge-pending','merge-timeout','merge-needs-attention')`)
+      .run(verdict.text, verdict.ts, deliveryAttempt, token, leaseUntil, claimedAt, row.repo, row.pr_number, row.head).changes
+    : dbHandle.query(`UPDATE fleet_pr_loop SET state='rejecting',reject_delivery_attempt=COALESCE(reject_delivery_attempt,?),
+        reject_lease_token=?,reject_lease_until=?,updated_at=?
+        WHERE repo=? AND pr_number=? AND head=? AND reject_sent_at IS NULL
+          AND (state='reject-failed' OR (state='rejecting' AND (reject_lease_until IS NULL OR reject_lease_until<=?)))`)
+      .run(deliveryAttempt, token, leaseUntil, claimedAt, row.repo, row.pr_number, row.head, claimedAt).changes
+  ).immediate();
+  return changed === 1 ? token : null;
+}
+
+function prLoopRejectDeliveryMarker(row, attempt) {
+  return `FLEET_REJECT_DELIVERY:${encodeURIComponent(row.task_key)}:${row.repo}#${row.pr_number}:${row.head}:${attempt}`;
+}
+
+const PR_LOOP_REJECT_SCROLLBACK_LINES = 10_000;
+
+function prLoopRejectMarkerLocation(screen, marker) {
+  const text = String(screen ?? "").replace(/\r/g, "");
+  const prompt = [...text.matchAll(/^[ \t]*❯/gm)].at(-1);
+  const compact = (value) => value.replace(/\s+/g, "");
+  const compactMarker = compact(marker);
+  if (!prompt) return compact(text).includes(compactMarker) ? "submitted" : "absent";
+  if (compact(text.slice(0, prompt.index)).includes(compactMarker)) return "submitted";
+  if (compact(text.slice(prompt.index)).includes(compactMarker)) return "input";
+  return "absent";
+}
+
+function prLoopRejectScrollbackComplete(transcript) {
+  if (transcript?.truncated === true) return false;
+  const stdout = String(transcript?.stdout ?? "");
+  const stderr = String(transcript?.stderr ?? "");
+  if (/(?:output|scrollback).{0,24}(?:truncated|limit reached)|(?:truncated|limit reached).{0,24}(?:output|scrollback)/i.test(stderr))
+    return false;
+  if (/(?:^|\n)\s*\[?(?:output|scrollback)\s+truncated\b/im.test(stdout)) return false;
+  return stdout.split(/\r?\n/).length < PR_LOOP_REJECT_SCROLLBACK_LINES;
+}
+
+function rejectDeliveryAttentionError(code, detail) {
+  const error = new Error(detail);
+  error.code = code;
+  return error;
+}
+
+async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, sendFollowup, rejectLeaseToken) {
+  if (!rejectLeaseToken) throw new Error("REJECT_LEASE_REQUIRED");
   const task = dbHandle.query("SELECT t.cat,c.pane FROM tasks t LEFT JOIN cats c ON c.id=t.cat WHERE t.key=?").get(row.task_key);
   const pane = configuredCatPane(task?.cat, task?.pane);
   if (!pane || pane === "-") throw new Error("task pane unavailable");
-  const text = `Cursor REJECT for ${row.repo}#${row.pr_number} head=${row.head}:\n${verdict.text}`;
-  if (sendFollowup) {
-    if (!await sendFollowup(pane, text, row)) throw new Error("pane follow-up send failed");
-  } else {
-    const sent = await runCommand(["herdr", "pane", "send-text", pane, text]);
-    if (sent.exitCode !== 0) throw new Error(`pane send-text exited ${sent.exitCode}`);
+  const delivery = dbHandle.query(`SELECT reject_delivery_attempt,reject_submit_confirmed_at FROM fleet_pr_loop
+    WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+    .get(row.repo, row.pr_number, row.head, rejectLeaseToken);
+  if (!delivery) throw new Error("REJECT_LEASE_LOST");
+  const deliveryAttempt = delivery.reject_delivery_attempt ?? row.reject_delivery_attempt;
+  if (!deliveryAttempt) throw new Error("REJECT_DELIVERY_ATTEMPT_REQUIRED");
+  const marker = prLoopRejectDeliveryMarker(row, deliveryAttempt);
+  const complete = () => {
+    const sentAt = now();
+    dbHandle.transaction(() => {
+      dbHandle.query("UPDATE tasks SET status='working',completion_claimed=0,result=NULL WHERE key=?").run(row.task_key);
+      appendHistoryInTransaction(dbHandle, row.task_key, {
+        ev: "cursor-reject-followup", signal: `pr:${row.repo}#${row.pr_number}`, head: row.head, text: verdict.text,
+      });
+      const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='rejected',verdict=?,verdict_ts=?,
+        reject_sent_at=?,reject_submit_confirmed_at=COALESCE(reject_submit_confirmed_at,?),
+        reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
+        WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+        .run(verdict.text, verdict.ts, sentAt, sentAt, sentAt, row.repo, row.pr_number, row.head, rejectLeaseToken).changes;
+      if (!changed) throw new Error("REJECT_LEASE_LOST");
+    }).immediate();
+  };
+  const readScrollback = async () => {
+    const transcript = await readPane(pane);
+    if (transcript?.exitCode !== 0)
+      throw rejectDeliveryAttentionError("REJECT_SCROLLBACK_INCOMPLETE", `pane scrollback read failed with exit ${transcript?.exitCode ?? "unavailable"}`);
+    return transcript;
+  };
+  if (delivery.reject_submit_confirmed_at) {
+    complete();
+    return;
+  }
+  const transcript = await readScrollback();
+  const markerLocation = prLoopRejectMarkerLocation(transcript.stdout, marker);
+  if (markerLocation === "submitted") {
+    complete();
+    return;
+  }
+  if (markerLocation === "input") {
     const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
     if (enter.exitCode !== 0) throw new Error(`pane Enter exited ${enter.exitCode}`);
+  } else {
+    if (!prLoopRejectScrollbackComplete(transcript))
+      throw rejectDeliveryAttentionError("REJECT_SCROLLBACK_INCOMPLETE", "pane scrollback cannot prove the rejection marker is absent");
+    const text = `Cursor REJECT for ${row.repo}#${row.pr_number} head=${row.head}:\n${verdict.text}\n${marker}`;
+    if (sendFollowup) {
+      if (!await sendFollowup(pane, text, row)) throw new Error("pane follow-up send failed");
+    } else {
+      const sent = await runCommand(["herdr", "pane", "send-text", pane, text]);
+      if (sent.exitCode !== 0) throw new Error(`pane send-text exited ${sent.exitCode}`);
+      const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
+      if (enter.exitCode !== 0) throw new Error(`pane Enter exited ${enter.exitCode}`);
+    }
   }
-  dbHandle.transaction(() => {
-    dbHandle.query("UPDATE tasks SET status='working',completion_claimed=0,result=NULL WHERE key=?").run(row.task_key);
-    appendHistoryInTransaction(dbHandle, row.task_key, {
-      ev: "cursor-reject-followup", signal: `pr:${row.repo}#${row.pr_number}`, head: row.head, text: verdict.text,
-    });
-    dbHandle.query(`UPDATE fleet_pr_loop SET state='rejected',verdict=?,verdict_ts=?,updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='rejecting'`)
-      .run(verdict.text, verdict.ts, now(), row.repo, row.pr_number, row.head);
-  }).immediate();
+  const confirmation = await readScrollback();
+  if (prLoopRejectMarkerLocation(confirmation.stdout, marker) !== "submitted")
+    throw rejectDeliveryAttentionError("REJECT_SUBMIT_UNCONFIRMED", "pane does not show the rejection marker in submitted output");
+  complete();
+}
+
+function recordPrLoopRejectFailure(dbHandle, row, rejectLeaseToken, error, events, signal) {
+  const reason = error?.code === "REJECT_SCROLLBACK_INCOMPLETE" ? "scrollback_incomplete"
+    : error?.code === "REJECT_SUBMIT_UNCONFIRMED" ? "submit_unconfirmed"
+      : null;
+  const state = reason ? "reject-needs-attention" : "reject-failed";
+  const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state=?,reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
+    WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+    .run(state, now(), row.repo, row.pr_number, row.head, rejectLeaseToken).changes;
+  if (changed && reason)
+    events.push(`FLEET_PR_REJECT_NEEDS_ATTENTION ${row.task_key} ${signal} head=${row.head} reason=${reason}`);
+  fleetError("PR_LOOP_REJECT", `task=${row.task_key} signal=${signal}`, error);
 }
 
 const activePrLoopMerges = new Set();
 const PR_LOOP_MERGE_LEASE_MS = 120_000;
+const MAX_PR_LOOP_MERGE_ATTEMPTS = 3;
+const PR_LOOP_MERGE_RETRY_BASE_MS = 30_000;
+const PR_LOOP_MERGE_RETRY_MAX_MS = 300_000;
+const PR_LOOP_MERGE_AMBIGUOUS_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+
+function classifyPrLoopMergeFailure(result) {
+  const exitCode = Number(result?.exitCode);
+  const text = `${result?.stderr ?? ""}\n${result?.stdout ?? ""}\n${result?.message ?? ""}`.toLowerCase();
+  if (exitCode === 4 || /authentication required|not logged in|gh auth login|unauthorized/.test(text))
+    return "authentication_required";
+  if (/permission denied|permission to .* denied|resource not accessible|forbidden|http 403/.test(text))
+    return "permission_denied";
+  if (/not mergeable|merge conflict|conflicts with|has conflicts/.test(text))
+    return "not_mergeable";
+  if (/pull request.{0,40}\bclosed\b|\bpr\b.{0,40}\bclosed\b|closed without merge/.test(text))
+    return "pull_request_closed";
+  return null;
+}
 
 async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
   const mergeKey = `${row.repo}#${row.pr_number}@${row.head}`;
@@ -1647,10 +1822,63 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
   const pending = (reason) => {
     const pendingAt = now();
     dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-pending',
-      merge_pending_since=COALESCE(merge_pending_since,?),merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
+      merge_pending_since=COALESCE(merge_pending_since,?),merge_retry_at=NULL,
+      merge_ambiguous_since=NULL,merge_ambiguous_count=0,merge_failure_reason=NULL,
+      merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
       WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
       .run(pendingAt, pendingAt, row.repo, row.pr_number, row.head, mergeLeaseToken);
     return `FLEET_PR_MERGE_PENDING ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=${reason}`;
+  };
+  const retryableFailure = (reason) => {
+    const current = dbHandle.query(`SELECT merge_failure_count FROM fleet_pr_loop
+      WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
+      .get(row.repo, row.pr_number, row.head, mergeLeaseToken);
+    if (!current) return null;
+    const attempts = Number(current.merge_failure_count ?? 0) + 1;
+    const retryAt = attempts >= MAX_PR_LOOP_MERGE_ATTEMPTS
+      ? null
+      : new Date(Date.now() + Math.min(PR_LOOP_MERGE_RETRY_BASE_MS * (2 ** (attempts - 1)), PR_LOOP_MERGE_RETRY_MAX_MS)).toISOString();
+    const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-failed',merge_failure_count=?,
+      merge_retry_at=?,merge_failure_reason=?,merge_pending_since=NULL,merge_ambiguous_since=NULL,
+      merge_ambiguous_count=0,merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
+      WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
+      .run(attempts, retryAt, reason, now(), row.repo, row.pr_number, row.head, mergeLeaseToken).changes;
+    if (!changed) return null;
+    const retry = retryAt ? ` retry_at=${retryAt}` : " retry=exhausted";
+    return `FLEET_PR_MERGE_FAILED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=${reason} attempt=${attempts}/${MAX_PR_LOOP_MERGE_ATTEMPTS}${retry}`;
+  };
+  const ambiguousFailure = (reason) => {
+    const current = dbHandle.query(`SELECT merge_ambiguous_count,merge_ambiguous_since FROM fleet_pr_loop
+      WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
+      .get(row.repo, row.pr_number, row.head, mergeLeaseToken);
+    if (!current) return null;
+    const pendingAt = now();
+    const ambiguousSince = current.merge_ambiguous_since ?? pendingAt;
+    const elapsed = Date.now() - Date.parse(ambiguousSince);
+    const attempts = Number(current.merge_ambiguous_count ?? 0) + 1;
+    const attention = Number.isFinite(elapsed) && elapsed >= PR_LOOP_MERGE_AMBIGUOUS_TIMEOUT_MS;
+    const retryAt = attention ? null
+      : new Date(Date.now() + Math.min(PR_LOOP_MERGE_RETRY_BASE_MS * (2 ** (attempts - 1)), PR_LOOP_MERGE_RETRY_MAX_MS)).toISOString();
+    const state = attention ? "merge-needs-attention" : "merge-pending";
+    const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state=?,merge_pending_since=COALESCE(merge_pending_since,?),
+      merge_ambiguous_since=?,merge_ambiguous_count=?,merge_retry_at=?,merge_failure_reason=?,
+      merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
+      WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
+      .run(state, pendingAt, ambiguousSince, attempts, retryAt, reason, now(),
+        row.repo, row.pr_number, row.head, mergeLeaseToken).changes;
+    if (!changed) return null;
+    return attention
+      ? `FLEET_PR_MERGE_NEEDS_ATTENTION ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=ambiguous_timeout`
+      : `FLEET_PR_MERGE_PENDING ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=ambiguous_${reason} retry_at=${retryAt} ambiguous_attempt=${attempts}`;
+  };
+  const closedEvent = () => {
+    const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='closed',
+      merge_failure_count=COALESCE(merge_failure_count,0)+1,merge_failure_reason='pull_request_closed',
+      merge_pending_since=NULL,merge_ambiguous_since=NULL,merge_ambiguous_count=0,merge_retry_at=NULL,
+      merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
+      WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
+      .run(now(), row.repo, row.pr_number, row.head, mergeLeaseToken).changes;
+    return changed ? `FLEET_PR_CLOSED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head}` : null;
   };
   const fail = (reason) => {
     dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-failed',merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
@@ -1659,11 +1887,14 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
     return `FLEET_PR_MERGE_FAILED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=${reason}`;
   };
   const mergedEvent = (mergeSha) => {
-    dbHandle.query(`UPDATE fleet_pr_loop SET state='merged',merge_sha=?,merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
+    dbHandle.query(`UPDATE fleet_pr_loop SET state='merged',merge_sha=?,merge_pending_since=NULL,
+      merge_ambiguous_since=NULL,merge_ambiguous_count=0,merge_retry_at=NULL,
+      merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
       WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
       .run(mergeSha, now(), row.repo, row.pr_number, row.head, mergeLeaseToken);
     return `FLEET_PR_MERGED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} merge_sha=${mergeSha}`;
   };
+  let mergeCommandAttempted = false;
   try {
     let info = await prLoopPullRequestInfo(`pr:${row.repo}#${row.pr_number}`, runCommand);
     if (!info) return retry("pr_lookup_unavailable");
@@ -1677,10 +1908,15 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
       return mergedEvent(info.mergeCommit.oid.toLowerCase());
     }
     if (info.state !== "OPEN") return retry("pr_not_open");
+    mergeCommandAttempted = true;
     const merged = await runCommand([
       "gh", "pr", "merge", row.pr_number, "-R", row.repo, mergeFlag, "--match-head-commit", row.head,
     ], AbortSignal.timeout(30_000));
-    if (merged.exitCode !== 0) throw new Error(`gh exited ${merged.exitCode}`);
+    if (merged.exitCode !== 0) {
+      const reason = classifyPrLoopMergeFailure(merged);
+      if (reason === "pull_request_closed") return closedEvent();
+      return reason ? retryableFailure(reason) : ambiguousFailure(`merge_command_exit_${merged.exitCode}`);
+    }
     const result = await runCommand([
       "gh", "pr", "view", row.pr_number, "-R", row.repo, "--json", "state,headRefOid,mergeCommit",
     ], AbortSignal.timeout(10_000));
@@ -1695,6 +1931,15 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
     return pending("merge_status_inconclusive");
   } catch (error) {
     fleetError("PR_LOOP_MERGE", `signal=pr:${row.repo}#${row.pr_number}`, error);
+    const reason = classifyPrLoopMergeFailure({
+      exitCode: error?.exitCode,
+      stdout: error?.stdout,
+      stderr: error?.stderr,
+      message: error?.message,
+    });
+    if (reason === "pull_request_closed") return closedEvent();
+    if (reason) return retryableFailure(reason);
+    if (mergeCommandAttempted) return ambiguousFailure("merge_command_result_unknown");
     return fail(String(error?.message ?? error).slice(0, 120));
   } finally {
     activePrLoopMerges.delete(mergeKey);
@@ -1719,10 +1964,28 @@ function deployMergedPrLoopRow(dbHandle, row, config, io, events, runCommand) {
   if (!["merged", "deploying"].includes(row.state)) return;
   const deployment = configuredRepositoryValue(config.deploy, row.repo);
   if (!deployment) {
-    const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='merged-no-deploy',updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='merged'`)
-      .run(now(), row.repo, row.pr_number, row.head).changes;
-    if (changed) events.push(`FLEET_MERGED_NO_DEPLOY owner=omonyang ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head}`);
+    if (row.state === "merged") {
+      const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='merged-no-deploy',updated_at=?
+        WHERE repo=? AND pr_number=? AND head=? AND state='merged'`)
+        .run(now(), row.repo, row.pr_number, row.head).changes;
+      if (changed) events.push(`FLEET_MERGED_NO_DEPLOY owner=omonyang ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head}`);
+      return;
+    }
+    const deploymentKey = `${row.repo}#${row.pr_number}@${row.head}`;
+    if (activePrLoopDeployments.has(deploymentKey)) return;
+    const checkedAt = now();
+    const changed = dbHandle.transaction(() => dbHandle.query(`UPDATE fleet_pr_loop
+      SET state='deploy-needs-attention',deploy_lease_token=NULL,deploy_lease_until=NULL,updated_at=?
+      WHERE repo=? AND pr_number=? AND head=? AND state='deploying'
+        AND (deploy_lease_until IS NULL OR deploy_lease_until<=?)`)
+      .run(checkedAt, row.repo, row.pr_number, row.head, checkedAt).changes).immediate();
+    if (changed) {
+      appendTaskHistory(dbHandle, row.task_key, {
+        ev: "deploy-needs-attention", signal: `pr:${row.repo}#${row.pr_number}`, head: row.head,
+        merge_sha: row.merge_sha, detail: "deploy_config_removed_after_lease_expired",
+      });
+      events.push(`FLEET_DEPLOY_NEEDS_ATTENTION ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=deploy_config_removed`);
+    }
     return;
   }
   if (!Array.isArray(deployment.argv) || !deployment.argv.length || typeof deployment.healthUrl !== "string") {
@@ -1804,13 +2067,30 @@ function deployMergedPrLoopRow(dbHandle, row, config, io, events, runCommand) {
 export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop, io = {}) {
   if (!config?.enabled) return [];
   const runCommand = io.runCommand ?? executeSignalCommand;
+  const readPane = io.readPane ?? ((pane) => runCommand([
+    "herdr", "pane", "read", pane, "--source", "recent",
+    "--lines", String(PR_LOOP_REJECT_SCROLLBACK_LINES), "--format", "text",
+  ]));
   const postMessage = io.postMessage ?? defaultPrLoopPost;
   const fetchReplies = io.fetchReplies ?? defaultPrLoopReplies;
   const events = pendingPrLoopDeployEvents.splice(0);
-  const waiting = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE state IN ('awaiting-review','accepted','posting','post-failed')").all();
+  const leaseCheckAt = now();
+  const waiting = dbHandle.query(`SELECT repo,pr_number,head,state,merge_pending_since,merge_ambiguous_since,merge_retry_at,merge_ambiguous_count FROM fleet_pr_loop
+    WHERE state IN ('awaiting-review','accepted','posting','post-failed','merge-failed','merge-pending','merge-timeout','merge-needs-attention')
+      OR (state='merging' AND (merge_lease_until IS NULL OR merge_lease_until<=?))
+      `).all(leaseCheckAt);
+  const needsReplies = waiting.some((row) => {
+    if (row.state === "merging") return !activePrLoopMerges.has(`${row.repo}#${row.pr_number}@${row.head}`);
+    if (row.state === "merge-pending") {
+      const ambiguousSince = Date.parse(row.merge_ambiguous_since ?? row.merge_pending_since ?? "");
+      if (Number(row.merge_ambiguous_count ?? 0) > 0 && Number.isFinite(ambiguousSince)
+        && Date.now() - ambiguousSince >= PR_LOOP_MERGE_AMBIGUOUS_TIMEOUT_MS) return false;
+    }
+    return true;
+  });
   let replies = [];
-  let repliesAvailable = waiting.length === 0;
-  if (waiting.length) {
+  let repliesAvailable = !needsReplies;
+  if (needsReplies) {
     try {
       const fetched = await fetchReplies(config.reviewChannel, config.reviewThreadTs);
       if (Array.isArray(fetched)) {
@@ -1821,7 +2101,6 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       fleetError("PR_LOOP_SLACK_READ", `thread=${config.reviewThreadTs}`, error);
     }
   }
-  const leaseCheckAt = now();
   for (const row of dbHandle.query("SELECT repo,pr_number,head FROM fleet_pr_loop WHERE state='merging'").all()) {
     const mergeKey = `${row.repo}#${row.pr_number}@${row.head}`;
     if (activePrLoopMerges.has(mergeKey)) continue;
@@ -1834,7 +2113,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
     WHERE status NOT IN ('closed','blocked') AND (
       (completion_claimed=1 AND status IN ('done-claimed','not-done'))
       OR key IN (SELECT task_key FROM fleet_pr_loop
-        WHERE state IN ('awaiting-review','accepted','posting','post-failed','rejecting','reject-failed','merging','merge-pending','merge-timeout'))
+        WHERE state IN ('awaiting-review','accepted','posting','post-failed','rejecting','reject-failed','reject-needs-attention','merging','merge-pending','merge-timeout','merge-needs-attention','merge-failed'))
     ) ORDER BY sent_at`).all();
   for (const task of tasks) {
     if (task.status === "working" && !task.completion_claimed
@@ -1845,10 +2124,10 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       const parsed = parsePullRequestSignal(candidateSignal);
       if (!parsed) continue;
       const candidate = dbHandle.query(`SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=?
-        AND task_key=? AND state IN ('awaiting-review','accepted') ORDER BY updated_at DESC LIMIT 1`)
+        AND task_key=? AND state IN ('awaiting-review','accepted','merge-failed','merge-pending','merge-timeout','merge-needs-attention') ORDER BY updated_at DESC LIMIT 1`)
         .get(parsed.repo, parsed.prNumber, task.key);
       const interruptedReject = dbHandle.query(`SELECT head FROM fleet_pr_loop WHERE repo=? AND pr_number=?
-        AND task_key=? AND state IN ('rejecting','reject-failed') LIMIT 1`)
+        AND task_key=? AND state IN ('rejecting','reject-failed','reject-needs-attention') LIMIT 1`)
         .get(parsed.repo, parsed.prNumber, task.key);
       if (interruptedReject) pendingRejections.set(candidateSignal, true);
       if (!candidate) continue;
@@ -1872,31 +2151,29 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       if (pendingReject && typeof pendingReject === "object") {
         const row = pendingReject.row;
         const verdict = pendingReject.verdict;
-        const claimed = dbHandle.transaction(() => dbHandle.query(`UPDATE fleet_pr_loop
-          SET state='rejecting',verdict=?,verdict_ts=?,updated_at=?
-          WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted')`)
-          .run(verdict.text, verdict.ts, now(), row.repo, row.pr_number, row.head).changes === 1).immediate();
-        if (!claimed) continue;
+        const rejectLeaseToken = claimPrLoopRejection(dbHandle, row, verdict);
+        if (!rejectLeaseToken) {
+          rejectedTaskThisCycle = true;
+          continue;
+        }
         try {
-          await sendPrLoopFollowup(dbHandle, { ...row, state: "rejecting" }, verdict, runCommand, io.sendFollowup);
+          await sendPrLoopFollowup(dbHandle, { ...row, state: "rejecting" }, verdict, runCommand, readPane, io.sendFollowup, rejectLeaseToken);
           events.push(`FLEET_PR_REJECT_FOLLOWUP ${row.task_key} ${signal} head=${row.head}`);
         } catch (error) {
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state='rejecting'`)
-            .run(now(), row.repo, row.pr_number, row.head);
-          fleetError("PR_LOOP_REJECT", `task=${row.task_key} signal=${signal}`, error);
+          recordPrLoopRejectFailure(dbHandle, row, rejectLeaseToken, error, events, signal);
         }
         rejectedTaskThisCycle = true;
         continue;
       }
       const rejected = dbHandle.query(`SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=?
-        AND task_key=? AND state IN ('rejecting','reject-failed') ORDER BY updated_at DESC LIMIT 1`)
+        AND task_key=? AND state IN ('rejecting','reject-failed','reject-needs-attention') ORDER BY updated_at DESC LIMIT 1`)
         .get(repo, prNumber, task.key);
       if (rejected) {
-        const claimed = dbHandle.transaction(() => dbHandle.query(`UPDATE fleet_pr_loop SET state='rejecting',updated_at=?
-          WHERE repo=? AND pr_number=? AND head=? AND state IN ('rejecting','reject-failed')`)
-          .run(now(), rejected.repo, rejected.pr_number, rejected.head).changes === 1).immediate();
-        if (!claimed) continue;
+        const rejectLeaseToken = claimPrLoopRejection(dbHandle, rejected);
+        if (!rejectLeaseToken) {
+          rejectedTaskThisCycle = true;
+          continue;
+        }
         try {
           if (!rejected.verdict) throw new Error("stored reject verdict missing");
           await sendPrLoopFollowup(
@@ -1904,14 +2181,13 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
             rejected,
             { kind: "reject", text: rejected.verdict, ts: String(rejected.verdict_ts ?? "") },
             runCommand,
+            readPane,
             io.sendFollowup,
+            rejectLeaseToken,
           );
           events.push(`FLEET_PR_REJECT_FOLLOWUP ${rejected.task_key} ${signal} head=${rejected.head}`);
         } catch (error) {
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state='rejecting'`)
-            .run(now(), rejected.repo, rejected.pr_number, rejected.head);
-          fleetError("PR_LOOP_REJECT", `task=${rejected.task_key} signal=${signal}`, error);
+          recordPrLoopRejectFailure(dbHandle, rejected, rejectLeaseToken, error, events, signal);
         }
         rejectedTaskThisCycle = true;
         continue;
@@ -1920,9 +2196,9 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       if (!info || !/^[a-f0-9]{40}$/i.test(info.headRefOid || "")) continue;
       const head = info.headRefOid.toLowerCase();
       for (const stale of dbHandle.query(`SELECT head FROM fleet_pr_loop WHERE repo=? AND pr_number=?
-        AND head!=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout')`).all(repo, prNumber, head)) {
+        AND head!=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout','merge-needs-attention','merge-failed')`).all(repo, prNumber, head)) {
         dbHandle.query(`UPDATE fleet_pr_loop SET state='stale-head',updated_at=?
-          WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout')`)
+          WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout','merge-needs-attention','merge-failed')`)
           .run(now(), repo, prNumber, stale.head);
       }
       let row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
@@ -1951,23 +2227,21 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         }
         info = await ensurePrLoopReady(info, signal, runCommand);
         if (!info) continue;
-        const reserved = dbHandle.transaction(() => dbHandle.query(`INSERT OR IGNORE INTO fleet_pr_loop
-          (repo,pr_number,head,task_key,state,updated_at) VALUES(?,?,?,?,'posting',?)`)
-          .run(repo, prNumber, claimedHead, task.key, now()).changes === 1).immediate();
-        if (reserved) {
+        const postToken = reservePrLoopRequest(dbHandle, info, task.key);
+        if (postToken) {
           const url = info.url || `https://github.com/${repo}/pull/${prNumber}`;
           const text = buildPrLoopReviewRequest(repo, prNumber, url, claimedHead).text;
           try {
             const posted = await postMessage(config.reviewChannel, config.reviewThreadTs, text);
             if (posted?.ok !== true || !posted.ts) throw new Error(posted?.error || "Slack post returned no timestamp");
-            dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,updated_at=?
-              WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-              .run(String(posted.ts), now(), repo, prNumber, claimedHead);
+            dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,post_lease_token=NULL,post_lease_until=NULL,updated_at=?
+              WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+              .run(String(posted.ts), now(), repo, prNumber, claimedHead, postToken);
             events.push(`FLEET_PR_REVIEW_REQUESTED ${task.key} ${signal} head=${claimedHead} request_ts=${posted.ts}`);
           } catch (error) {
-            dbHandle.query(`UPDATE fleet_pr_loop SET state='post-failed',updated_at=?
-              WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-              .run(now(), repo, prNumber, claimedHead);
+            dbHandle.query(`UPDATE fleet_pr_loop SET state='post-failed',post_lease_token=NULL,post_lease_until=NULL,updated_at=?
+              WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+              .run(now(), repo, prNumber, claimedHead, postToken);
             fleetError("PR_LOOP_POST", `task=${task.key} signal=${signal}`, error);
           }
         }
@@ -1975,11 +2249,32 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
           .get(repo, prNumber, claimedHead);
       }
       if (!row) continue;
+      if (row.state === "merge-failed") {
+        const retryAt = Date.parse(row.merge_retry_at ?? "");
+        const currentCycleVerdict = repliesAvailable ? matchPrLoopVerdict(replies, {
+          repo: row.repo,
+          prNumber: row.pr_number,
+          head: row.head,
+          threadTs: config.reviewThreadTs,
+          afterTs: row.request_ts,
+        }) : null;
+        if (!Number.isFinite(retryAt) || Date.now() < retryAt
+          || Number(row.merge_failure_count ?? 0) >= MAX_PR_LOOP_MERGE_ATTEMPTS
+          || currentCycleVerdict?.kind !== "accept") continue;
+        const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='accepted',merge_retry_at=NULL,updated_at=?
+          WHERE repo=? AND pr_number=? AND head=? AND state='merge-failed'
+            AND merge_retry_at=? AND merge_failure_count<?`)
+          .run(now(), row.repo, row.pr_number, row.head, row.merge_retry_at, MAX_PR_LOOP_MERGE_ATTEMPTS).changes;
+        if (!changed) continue;
+        row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
+          .get(repo, prNumber, row.head);
+      }
       if (existingRow && ["posting", "post-failed"].includes(row.state)) {
         if (!repliesAvailable) continue;
         const requestTs = existingPrLoopRequestTs(replies, row, config.reviewThreadTs);
         if (requestTs) {
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,updated_at=?
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,
+            post_lease_token=NULL,post_lease_until=NULL,updated_at=?
             WHERE repo=? AND pr_number=? AND head=? AND state IN ('posting','post-failed')`)
             .run(requestTs, now(), row.repo, row.pr_number, row.head);
           events.push(`FLEET_PR_REVIEW_RECOVERED ${row.task_key} ${signal} head=${row.head} request_ts=${requestTs}`);
@@ -1999,10 +2294,10 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
           continue;
         }
       }
-      if (["merge-pending", "merge-timeout"].includes(row.state)) {
+      if (["merge-pending", "merge-timeout", "merge-needs-attention"].includes(row.state)) {
         if (info.headRefOid?.toLowerCase() !== row.head) {
           dbHandle.query(`UPDATE fleet_pr_loop SET state='stale-head',updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout')`)
+            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout','merge-needs-attention')`)
             .run(now(), row.repo, row.pr_number, row.head);
           fleetError("PR_LOOP_STALE", `task=${task.key} signal=${signal}`,
             `expected=${row.head} actual=${info.headRefOid ?? "unavailable"}`);
@@ -2010,22 +2305,61 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         }
         if (info.state === "MERGED" && /^[a-f0-9]{40}$/i.test(info.mergeCommit?.oid || "")) {
           const mergeSha = info.mergeCommit.oid.toLowerCase();
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='merged',merge_sha=?,merge_pending_since=NULL,updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout')`)
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='merged',merge_sha=?,merge_pending_since=NULL,
+            merge_ambiguous_since=NULL,merge_ambiguous_count=0,merge_retry_at=NULL,updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout','merge-needs-attention')`)
             .run(mergeSha, now(), row.repo, row.pr_number, row.head);
           events.push(`FLEET_PR_MERGED ${row.task_key} ${signal} head=${row.head} merge_sha=${mergeSha}`);
           row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
             .get(repo, prNumber, row.head);
         } else if (info.state === "CLOSED") {
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='closed',merge_pending_since=NULL,updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout')`)
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='closed',merge_pending_since=NULL,
+            merge_ambiguous_since=NULL,merge_ambiguous_count=0,merge_retry_at=NULL,updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout','merge-needs-attention')`)
             .run(now(), row.repo, row.pr_number, row.head);
           events.push(`FLEET_PR_CLOSED ${row.task_key} ${signal} head=${row.head}`);
           continue;
         } else if (info.state === "OPEN" && row.state === "merge-pending") {
           const pendingSince = Date.parse(row.merge_pending_since ?? row.updated_at ?? "");
+          const ambiguousCount = Number(row.merge_ambiguous_count ?? 0);
+          const ambiguousSince = Date.parse(row.merge_ambiguous_since ?? row.merge_pending_since ?? "");
+          if (ambiguousCount > 0 && Number.isFinite(ambiguousSince)
+            && Date.now() - ambiguousSince >= PR_LOOP_MERGE_AMBIGUOUS_TIMEOUT_MS) {
+            const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-needs-attention',
+              merge_retry_at=NULL,updated_at=?
+              WHERE repo=? AND pr_number=? AND head=? AND state='merge-pending'`)
+              .run(now(), repo, prNumber, row.head).changes;
+            if (changed) events.push(`FLEET_PR_MERGE_NEEDS_ATTENTION ${row.task_key} ${signal} head=${row.head} reason=ambiguous_timeout`);
+            continue;
+          }
+          const ambiguousRetryAt = Date.parse(row.merge_retry_at ?? "");
+          if (ambiguousCount > 0 && Number.isFinite(ambiguousRetryAt) && Date.now() >= ambiguousRetryAt) {
+            const currentCycleVerdict = repliesAvailable ? matchPrLoopVerdict(replies, {
+              repo: row.repo,
+              prNumber: row.pr_number,
+              head: row.head,
+              threadTs: config.reviewThreadTs,
+              afterTs: row.request_ts,
+            }) : null;
+            if (currentCycleVerdict?.kind === "accept") {
+              const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='accepted',merge_retry_at=NULL,updated_at=?
+                WHERE repo=? AND pr_number=? AND head=? AND state='merge-pending' AND merge_retry_at=?`)
+                .run(now(), repo, prNumber, row.head, row.merge_retry_at).changes;
+              if (!changed) continue;
+              row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
+                .get(repo, prNumber, row.head);
+            } else {
+              const delay = Math.min(PR_LOOP_MERGE_RETRY_BASE_MS * (2 ** Math.max(0, ambiguousCount - 1)),
+                PR_LOOP_MERGE_RETRY_MAX_MS);
+              const nextRetryAt = new Date(Date.now() + delay).toISOString();
+              dbHandle.query(`UPDATE fleet_pr_loop SET merge_retry_at=?,updated_at=?
+                WHERE repo=? AND pr_number=? AND head=? AND state='merge-pending' AND merge_retry_at=?`)
+                .run(nextRetryAt, now(), repo, prNumber, row.head, row.merge_retry_at);
+              continue;
+            }
+          }
           const timeoutMs = Number(config.mergePendingTimeoutMs) > 0 ? Number(config.mergePendingTimeoutMs) : 1_800_000;
-          if (Number.isFinite(pendingSince) && Date.now() - pendingSince >= timeoutMs) {
+          if (ambiguousCount === 0 && Number.isFinite(pendingSince) && Date.now() - pendingSince >= timeoutMs) {
             dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-timeout',updated_at=?
               WHERE repo=? AND pr_number=? AND head=? AND state='merge-pending'`)
               .run(now(), row.repo, prNumber, row.head);
@@ -2053,10 +2387,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
           continue;
         }
         if (!["OPEN", "MERGED"].includes(info.state)) continue;
-        if (info.state === "OPEN") {
-          info = await ensurePrLoopReady(info, signal, runCommand);
-          if (!info) continue;
-        }
+        if (info.state === "OPEN" && info.isDraft) continue;
         const verdict = matchPrLoopVerdict(replies, {
           repo: row.repo,
           prNumber: row.pr_number,
@@ -2065,30 +2396,31 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
           afterTs: row.request_ts,
         });
         if (!verdict) continue;
-        const nextState = verdict.kind === "accept" ? "accepted" : "rejecting";
-        const claimed = dbHandle.transaction(() => {
-          const changed = dbHandle.query(`UPDATE fleet_pr_loop
-            SET state=?,verdict=?,verdict_ts=?,updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state='awaiting-review'`)
-            .run(nextState, verdict.text, verdict.ts, now(), row.repo, row.pr_number, row.head).changes === 1;
-          if (!changed) return false;
-          if (verdict.kind === "accept") {
+        let rejectLeaseToken = null;
+        let claimed;
+        if (verdict.kind === "reject") {
+          rejectLeaseToken = claimPrLoopRejection(dbHandle, row, verdict);
+          claimed = Boolean(rejectLeaseToken);
+        } else {
+          claimed = dbHandle.transaction(() => {
+            const changed = dbHandle.query(`UPDATE fleet_pr_loop
+              SET state='accepted',verdict=?,verdict_ts=?,updated_at=?
+              WHERE repo=? AND pr_number=? AND head=? AND state='awaiting-review'`)
+              .run(verdict.text, verdict.ts, now(), row.repo, row.pr_number, row.head).changes === 1;
+            if (!changed) return false;
             recordTaskClaimEvidenceInTransaction(dbHandle, row.task_key, {
               kind: "cursor-accept", signal, ok: true, head: row.head,
               acceptedPrefix: row.head, actualHead: row.head, detail: "accepted_exact_pr_head",
             });
-          }
-          return true;
-        }).immediate();
+            return true;
+          }).immediate();
+        }
         if (claimed && verdict.kind === "reject") {
           try {
-            await sendPrLoopFollowup(dbHandle, row, verdict, runCommand, io.sendFollowup);
+            await sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, io.sendFollowup, rejectLeaseToken);
             events.push(`FLEET_PR_REJECT_FOLLOWUP ${row.task_key} ${signal} head=${row.head}`);
           } catch (error) {
-            dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',updated_at=?
-              WHERE repo=? AND pr_number=? AND head=? AND state='rejecting'`)
-              .run(now(), row.repo, row.pr_number, row.head);
-            fleetError("PR_LOOP_REJECT", `task=${row.task_key} signal=${signal}`, error);
+            recordPrLoopRejectFailure(dbHandle, row, rejectLeaseToken, error, events, signal);
           }
         } else if (claimed) {
           events.push(`FLEET_PR_ACCEPTED ${row.task_key} ${signal} head=${row.head}${config.autoMerge ? "" : " auto_merge=disabled"}`);
@@ -2097,6 +2429,13 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
         .get(repo, prNumber, row.head);
       if (row?.state === "accepted") {
+        const currentCycleVerdict = repliesAvailable ? matchPrLoopVerdict(replies, {
+          repo: row.repo,
+          prNumber: row.pr_number,
+          head: row.head,
+          threadTs: config.reviewThreadTs,
+          afterTs: row.request_ts,
+        }) : null;
         const info = await prLoopPullRequestInfo(signal, runCommand);
         if (!info) continue;
         if (info?.state === "MERGED" && info.headRefOid?.toLowerCase() === row.head
@@ -2111,7 +2450,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
             WHERE repo=? AND pr_number=? AND head=? AND state='accepted'`)
             .run(now(), repo, prNumber, row.head);
           events.push(`FLEET_PR_CLOSED ${row.task_key} ${signal} head=${row.head}`);
-        } else if (config.autoMerge && !info.isDraft) {
+        } else if (config.autoMerge && !info.isDraft && currentCycleVerdict?.kind === "accept") {
           const merge = await mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand);
           if (merge) events.push(merge);
         }
@@ -2351,9 +2690,13 @@ export async function dispatchQueuedDependencies(dbHandle, paneRows, dispatchTas
 
 // Machine-checked done (Dori signals.ts idea). Spec: "pr:owner/repo#N" | "url:http://...=200" | "cmd:<shell>"; ';'-separated.
 async function executeSignalCommand(argv, signal = AbortSignal.timeout(10000)) {
-  const proc = Bun.spawn({ cmd: argv, stdout: "pipe", stderr: "ignore", signal });
-  const [exitCode, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
-  return { exitCode, stdout };
+  const proc = Bun.spawn({ cmd: argv, stdout: "pipe", stderr: "pipe", signal });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
 }
 
 export async function checkSignal(sig, runCommand = executeSignalCommand) {
