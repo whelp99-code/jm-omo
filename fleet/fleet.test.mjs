@@ -1818,6 +1818,91 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     db.close();
   });
 
+  it("polls a merge-needs-attention row to MERGED and starts normal deployment", async () => {
+    const key = "PRLOOP-MERGE-ATTENTION-MERGED";
+    const mergeSha = "abcdef0123456789abcdef0123456789abcdef01";
+    const db = prLoopDb({ key, done: signal, status: "verified-done" });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,merge_pending_since,
+      merge_ambiguous_since,merge_ambiguous_count,updated_at)
+      VALUES('owner/repo','52',?,?,'merge-needs-attention','100','2026-10-13T00:00:00.000Z',
+        '2026-10-13T00:00:00.000Z',3,'1')`)
+      .run(head, key);
+    const deployment = { argv: ["./deploy.sh"], healthUrl: "https://service.example/version" };
+    const finished = deferred();
+    let mergeCalls = 0;
+    let deploySha;
+    const events = await processPrLoopEvents(db, {
+      ...config,
+      autoMerge: true,
+      deploy: { "owner/repo": deployment },
+    }, {
+      fetchReplies: async () => [],
+      runCommand: async (argv) => {
+        if (argv[1] === "pr" && argv[2] === "merge") mergeCalls++;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ state: "MERGED", isDraft: false, headRefOid: head, mergeCommit: { oid: mergeSha } }),
+        };
+      },
+      getMainSha: async () => mergeSha,
+      runDeploy: async (_repo, _deployment, sha) => { deploySha = sha; return { exitCode: 0 }; },
+      checkHealth: async (_url, _timeout, sha) => ({ status: 200, mergeSha: sha }),
+      onDeploySettled: finished.resolve,
+    });
+    expect(events).toContain(`FLEET_PR_MERGED ${key} ${signal} head=${head} merge_sha=${mergeSha}`);
+    expect(events).toContain(`FLEET_DEPLOY_STARTED ${key} ${signal} merge_sha=${mergeSha}`);
+    expect(mergeCalls).toBe(0);
+    expect((await settlesWithin(finished.promise)).settled).toBe(true);
+    expect(deploySha).toBe(mergeSha);
+    expect(db.query("SELECT state,merge_sha FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head))
+      .toEqual({ state: "deployed", merge_sha: mergeSha });
+    db.close();
+  });
+
+  it("closes a merge-needs-attention row when GitHub reports CLOSED", async () => {
+    const key = "PRLOOP-MERGE-ATTENTION-CLOSED";
+    const db = prLoopDb({ key, done: signal, status: "verified-done" });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,updated_at)
+      VALUES('owner/repo','52',?,?,'merge-needs-attention','100','1')`)
+      .run(head, key);
+    let mergeCalls = 0;
+    const events = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      fetchReplies: async () => [],
+      runCommand: async (argv) => {
+        if (argv[1] === "pr" && argv[2] === "merge") mergeCalls++;
+        return { exitCode: 0, stdout: JSON.stringify({ state: "CLOSED", isDraft: false, headRefOid: head }) };
+      },
+    });
+    expect(events).toContain(`FLEET_PR_CLOSED ${key} ${signal} head=${head}`);
+    expect(mergeCalls).toBe(0);
+    expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("closed");
+    db.close();
+  });
+
+  it("never invokes merge for an OPEN merge-needs-attention row", async () => {
+    const key = "PRLOOP-MERGE-ATTENTION-OPEN";
+    const db = prLoopDb({ key, done: signal, status: "verified-done" });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,verdict,verdict_ts,updated_at)
+      VALUES('owner/repo','52',?,?,'merge-needs-attention','100','ACCEPT','101','1')`)
+      .run(head, key);
+    let mergeCalls = 0;
+    await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      fetchReplies: async () => [{
+        ts: "102", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW",
+        text: `ACCEPT owner/repo#52 head=${head}`,
+      }],
+      runCommand: async (argv) => {
+        if (argv[1] === "pr" && argv[2] === "merge") mergeCalls++;
+        return { exitCode: 0, stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head }) };
+      },
+    });
+    expect(mergeCalls).toBe(0);
+    expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("merge-needs-attention");
+    db.close();
+  });
+
   it("uses only the latest verdict and accepts APPROVE/REVISE aliases", () => {
     const messages = [
       { ts: "101", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW", text: `ACCEPT owner/repo#52 head=${head}` },

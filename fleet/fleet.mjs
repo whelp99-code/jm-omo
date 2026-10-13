@@ -2294,10 +2294,10 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
           continue;
         }
       }
-      if (["merge-pending", "merge-timeout"].includes(row.state)) {
+      if (["merge-pending", "merge-timeout", "merge-needs-attention"].includes(row.state)) {
         if (info.headRefOid?.toLowerCase() !== row.head) {
           dbHandle.query(`UPDATE fleet_pr_loop SET state='stale-head',updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout')`)
+            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout','merge-needs-attention')`)
             .run(now(), row.repo, row.pr_number, row.head);
           fleetError("PR_LOOP_STALE", `task=${task.key} signal=${signal}`,
             `expected=${row.head} actual=${info.headRefOid ?? "unavailable"}`);
@@ -2305,15 +2305,17 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         }
         if (info.state === "MERGED" && /^[a-f0-9]{40}$/i.test(info.mergeCommit?.oid || "")) {
           const mergeSha = info.mergeCommit.oid.toLowerCase();
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='merged',merge_sha=?,merge_pending_since=NULL,updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout')`)
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='merged',merge_sha=?,merge_pending_since=NULL,
+            merge_ambiguous_since=NULL,merge_ambiguous_count=0,merge_retry_at=NULL,updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout','merge-needs-attention')`)
             .run(mergeSha, now(), row.repo, row.pr_number, row.head);
           events.push(`FLEET_PR_MERGED ${row.task_key} ${signal} head=${row.head} merge_sha=${mergeSha}`);
           row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
             .get(repo, prNumber, row.head);
         } else if (info.state === "CLOSED") {
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='closed',merge_pending_since=NULL,updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout')`)
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='closed',merge_pending_since=NULL,
+            merge_ambiguous_since=NULL,merge_ambiguous_count=0,merge_retry_at=NULL,updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout','merge-needs-attention')`)
             .run(now(), row.repo, row.pr_number, row.head);
           events.push(`FLEET_PR_CLOSED ${row.task_key} ${signal} head=${row.head}`);
           continue;
