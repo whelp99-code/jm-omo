@@ -2208,6 +2208,8 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     ["HTTP 429 rate limit", "HTTP 429: rate limit exceeded; retry-after: 30", "merge-pending", 0, 1],
     ["HTTP 403 secondary rate limit", "HTTP 403: secondary rate limit and abuse detection", "merge-pending", 0, 1],
     ["HTTP 403 permission denial", "HTTP 403: Resource not accessible by integration; permission denied", "merge-failed", 1, 0],
+    ["HTTP 403 access denied", "HTTP 403: access denied", "merge-failed", 1, 0],
+    ["HTTP 403 must have push access", "HTTP 403: must have push access", "merge-failed", 1, 0],
   ])("classifies %s merge stderr correctly", async (_label, stderr, expectedState, expectedDefinitiveCount, expectedAmbiguousCount) => {
     const key = `PRLOOP-CLASSIFY-${String(_label).toUpperCase().replaceAll(/[^A-Z0-9]+/g, "-")}`;
     const db = prLoopDb({ key, done: signal });
