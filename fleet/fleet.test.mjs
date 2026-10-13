@@ -1506,6 +1506,42 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     db.close();
   });
 
+  it("presses Enter when an unsubmitted REJECT marker is visible despite truncated scrollback", async () => {
+    const key = "PRLOOP-REJECT-INPUT-TRUNCATED";
+    const attempt = "attempt-input-truncated";
+    const marker = `FLEET_REJECT_DELIVERY:${encodeURIComponent(key)}:owner/repo#52:${head}:${attempt}`;
+    const verdict = `REJECT owner/repo#52 head=${head} fix this`;
+    const input = `${Array.from({ length: 10_000 }, (_, index) => `history-${index}`).join("\n")}\nIdle\n❯ Cursor REJECT for owner/repo#52 head=${head}:\n${verdict}\n${marker}`;
+    const db = prLoopDb({ key, done: signal, status: "done-claimed", completion_claimed: 1 });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,verdict_ts,
+      reject_delivery_attempt,updated_at)
+      VALUES('owner/repo','52',? ,?,'reject-failed',?,'101',?,'1')`)
+      .run(head, key, verdict, attempt);
+    let reads = 0;
+    let enterCalls = 0;
+    let followupSends = 0;
+    const events = await processPrLoopEvents(db, config, {
+      fetchReplies: async () => [],
+      readPane: async () => ({
+        exitCode: 0,
+        stdout: ++reads === 1 ? input : `submitted output\n${marker}\n❯`,
+      }),
+      runCommand: async (argv) => {
+        expect(argv.slice(0, 3)).toEqual(["herdr", "pane", "send-keys"]);
+        expect(argv[4]).toBe("Enter");
+        enterCalls++;
+        return { exitCode: 0, stdout: "" };
+      },
+      sendFollowup: async () => { followupSends++; return true; },
+    });
+    expect(enterCalls).toBe(1);
+    expect(followupSends).toBe(0);
+    expect(events).toContain(`FLEET_PR_REJECT_FOLLOWUP ${key} ${signal} head=${head}`);
+    expect(db.query("SELECT state,reject_sent_at FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("rejected");
+    db.close();
+  });
+
   it("finds a delivered rejection marker in recent pane scrollback without resending", async () => {
     const key = "PRLOOP-REJECT-SCROLLBACK-MARKER";
     const attempt = "attempt-scrollback";
@@ -1929,7 +1965,7 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     db.close();
   });
 
-  it("does not fetch Slack replies when only merge-pending rows need polling", async () => {
+  it("fetches Slack replies so REJECT can stop merge-pending polling", async () => {
     const key = "PRLOOP-POLL-WITHOUT-SLACK";
     const db = prLoopDb({ key, done: signal });
     db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,verdict_ts,merge_pending_since,updated_at)
@@ -1946,7 +1982,7 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
         return { exitCode: 0, stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head }) };
       },
     });
-    expect(slackCalls).toBe(0);
+    expect(slackCalls).toBe(1);
     expect(prPolls).toBeGreaterThan(0);
     expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
       .toBe("merge-pending");
@@ -2240,6 +2276,47 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
       .toBe("accepted");
     db.close();
   });
+
+  it.each(["merge-pending", "merge-timeout", "merge-needs-attention"])(
+    "forwards a current-head REJECT from %s without retrying merge", async (state) => {
+      const key = `PRLOOP-REJECT-${state.toUpperCase()}`;
+      const pendingSince = new Date().toISOString();
+      const retryAt = state === "merge-pending" ? "2000-01-01T00:00:00.000Z" : null;
+      const ambiguousCount = state === "merge-pending" ? 1 : 0;
+      const db = prLoopDb({ key, done: signal, status: "done-claimed", completion_claimed: 1 });
+      db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,verdict,verdict_ts,
+        merge_pending_since,merge_ambiguous_since,merge_retry_at,merge_ambiguous_count,updated_at)
+        VALUES('owner/repo','52',?,? ,?,'100','ACCEPT','101',?,?,?,?, '1')`)
+        .run(head, key, state, pendingSince, pendingSince, retryAt, ambiguousCount);
+      let submitted = false;
+      let submittedMarker = "";
+      let sends = 0;
+      let mergeCalls = 0;
+      const events = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+        fetchReplies: async () => [{
+          ts: "102", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW",
+          text: `REJECT owner/repo#52 head=${head} please fix`,
+        }],
+        readPane: async () => ({ exitCode: 0, stdout: submitted ? `worker transcript\n${submittedMarker}\n❯` : "" }),
+        runCommand: async (argv) => {
+          if (argv[1] === "pr" && argv[2] === "merge") mergeCalls++;
+          return { exitCode: 0, stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head }) };
+        },
+        sendFollowup: async (_pane, text) => {
+          sends++;
+          submitted = true;
+          submittedMarker = text.match(/FLEET_REJECT_DELIVERY:[^\s]+/)?.[0] ?? "";
+          return true;
+        },
+      });
+      expect(sends).toBe(1);
+      expect(mergeCalls).toBe(0);
+      expect(events).toContain(`FLEET_PR_REJECT_FOLLOWUP ${key} ${signal} head=${head}`);
+      expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+        .toBe("rejected");
+      db.close();
+    },
+  );
 
   it("uses database leases to prevent overlapping watch instances from repeating a deployment", async () => {
     const original = process.env.HOME;
