@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS fleet_pr_loop(
   repo TEXT NOT NULL, pr_number TEXT NOT NULL, head TEXT NOT NULL, task_key TEXT NOT NULL,
   state TEXT NOT NULL, request_ts TEXT, verdict TEXT, verdict_ts TEXT, merge_sha TEXT, merge_pending_since TEXT,
   post_lease_token TEXT, post_lease_until TEXT, reject_lease_token TEXT, reject_lease_until TEXT, reject_sent_at TEXT,
+  reject_delivery_attempt TEXT,
   merge_lease_token TEXT, merge_lease_until TEXT,
+  merge_failure_count INTEGER NOT NULL DEFAULT 0, merge_retry_at TEXT, merge_failure_reason TEXT,
   deploy_lease_token TEXT, deploy_lease_until TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(repo,pr_number,head)
@@ -57,8 +59,12 @@ export function migrateFleetColumns(dbHandle) {
       ["reject_lease_token", "TEXT"],
       ["reject_lease_until", "TEXT"],
       ["reject_sent_at", "TEXT"],
+      ["reject_delivery_attempt", "TEXT"],
       ["merge_lease_token", "TEXT"],
       ["merge_lease_until", "TEXT"],
+      ["merge_failure_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["merge_retry_at", "TEXT"],
+      ["merge_failure_reason", "TEXT"],
       ["deploy_lease_token", "TEXT"],
       ["deploy_lease_until", "TEXT"],
     ]);
@@ -1631,36 +1637,40 @@ const PR_LOOP_REJECT_LEASE_MS = 120_000;
 
 function claimPrLoopRejection(dbHandle, row, verdict = null) {
   const token = crypto.randomUUID();
+  const deliveryAttempt = crypto.randomUUID();
   const claimedAt = now();
   const leaseUntil = new Date(Date.now() + PR_LOOP_REJECT_LEASE_MS).toISOString();
   const changed = dbHandle.transaction(() => verdict
     ? dbHandle.query(`UPDATE fleet_pr_loop SET state='rejecting',verdict=?,verdict_ts=?,
-        reject_sent_at=NULL,reject_lease_token=?,reject_lease_until=?,updated_at=?
-        WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted')`)
-      .run(verdict.text, verdict.ts, token, leaseUntil, claimedAt, row.repo, row.pr_number, row.head).changes
-    : dbHandle.query(`UPDATE fleet_pr_loop SET state='rejecting',reject_lease_token=?,reject_lease_until=?,updated_at=?
+        reject_sent_at=NULL,reject_delivery_attempt=?,reject_lease_token=?,reject_lease_until=?,updated_at=?
+        WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted','merge-failed')`)
+      .run(verdict.text, verdict.ts, deliveryAttempt, token, leaseUntil, claimedAt, row.repo, row.pr_number, row.head).changes
+    : dbHandle.query(`UPDATE fleet_pr_loop SET state='rejecting',reject_delivery_attempt=COALESCE(reject_delivery_attempt,?),
+        reject_lease_token=?,reject_lease_until=?,updated_at=?
         WHERE repo=? AND pr_number=? AND head=? AND reject_sent_at IS NULL
           AND (state='reject-failed' OR (state='rejecting' AND (reject_lease_until IS NULL OR reject_lease_until<=?)))`)
-      .run(token, leaseUntil, claimedAt, row.repo, row.pr_number, row.head, claimedAt).changes
+      .run(deliveryAttempt, token, leaseUntil, claimedAt, row.repo, row.pr_number, row.head, claimedAt).changes
   ).immediate();
   return changed === 1 ? token : null;
 }
 
-async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, sendFollowup, rejectLeaseToken) {
+function prLoopRejectDeliveryMarker(row, attempt) {
+  return `FLEET_REJECT_DELIVERY:${encodeURIComponent(row.task_key)}:${row.repo}#${row.pr_number}:${row.head}:${attempt}`;
+}
+
+async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, sendFollowup, rejectLeaseToken) {
   if (!rejectLeaseToken) throw new Error("REJECT_LEASE_REQUIRED");
   const task = dbHandle.query("SELECT t.cat,c.pane FROM tasks t LEFT JOIN cats c ON c.id=t.cat WHERE t.key=?").get(row.task_key);
   const pane = configuredCatPane(task?.cat, task?.pane);
   if (!pane || pane === "-") throw new Error("task pane unavailable");
-  const text = `Cursor REJECT for ${row.repo}#${row.pr_number} head=${row.head}:\n${verdict.text}`;
-  if (sendFollowup) {
-    if (!await sendFollowup(pane, text, row)) throw new Error("pane follow-up send failed");
-  } else {
-    const sent = await runCommand(["herdr", "pane", "send-text", pane, text]);
-    if (sent.exitCode !== 0) throw new Error(`pane send-text exited ${sent.exitCode}`);
-    const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
-    if (enter.exitCode !== 0) throw new Error(`pane Enter exited ${enter.exitCode}`);
-  }
-  dbHandle.transaction(() => {
+  const deliveryAttempt = row.reject_delivery_attempt ?? dbHandle.query(`SELECT reject_delivery_attempt FROM fleet_pr_loop
+    WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+    .get(row.repo, row.pr_number, row.head, rejectLeaseToken)?.reject_delivery_attempt;
+  if (!deliveryAttempt) throw new Error("REJECT_DELIVERY_ATTEMPT_REQUIRED");
+  const marker = prLoopRejectDeliveryMarker(row, deliveryAttempt);
+  const transcript = await readPane(pane);
+  if (transcript?.exitCode !== 0) throw new Error(`pane transcript read failed with exit ${transcript?.exitCode ?? "unavailable"}`);
+  const complete = () => dbHandle.transaction(() => {
     dbHandle.query("UPDATE tasks SET status='working',completion_claimed=0,result=NULL WHERE key=?").run(row.task_key);
     appendHistoryInTransaction(dbHandle, row.task_key, {
       ev: "cursor-reject-followup", signal: `pr:${row.repo}#${row.pr_number}`, head: row.head, text: verdict.text,
@@ -1671,10 +1681,41 @@ async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, sendFollow
       .run(verdict.text, verdict.ts, now(), now(), row.repo, row.pr_number, row.head, rejectLeaseToken).changes;
     if (!changed) throw new Error("REJECT_LEASE_LOST");
   }).immediate();
+  if (String(transcript.stdout ?? "").includes(marker)) {
+    complete();
+    return;
+  }
+  const text = `Cursor REJECT for ${row.repo}#${row.pr_number} head=${row.head}:\n${verdict.text}\n${marker}`;
+  if (sendFollowup) {
+    if (!await sendFollowup(pane, text, row)) throw new Error("pane follow-up send failed");
+  } else {
+    const sent = await runCommand(["herdr", "pane", "send-text", pane, text]);
+    if (sent.exitCode !== 0) throw new Error(`pane send-text exited ${sent.exitCode}`);
+    const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
+    if (enter.exitCode !== 0) throw new Error(`pane Enter exited ${enter.exitCode}`);
+  }
+  complete();
 }
 
 const activePrLoopMerges = new Set();
 const PR_LOOP_MERGE_LEASE_MS = 120_000;
+const MAX_PR_LOOP_MERGE_ATTEMPTS = 3;
+const PR_LOOP_MERGE_RETRY_BASE_MS = 30_000;
+const PR_LOOP_MERGE_RETRY_MAX_MS = 300_000;
+
+function classifyPrLoopMergeFailure(result) {
+  const exitCode = Number(result?.exitCode);
+  const text = `${result?.stderr ?? ""}\n${result?.stdout ?? ""}\n${result?.message ?? ""}`.toLowerCase();
+  if (exitCode === 4 || /authentication required|not logged in|gh auth login|unauthorized/.test(text))
+    return "authentication_required";
+  if (/permission denied|permission to .* denied|resource not accessible|forbidden|http 403/.test(text))
+    return "permission_denied";
+  if (/not mergeable|merge conflict|conflicts with|has conflicts/.test(text))
+    return "not_mergeable";
+  if (/already (?:enabled|in progress)|checks pending|timed? out|timeout|network|connection (?:reset|refused|closed)|could not resolve|temporary failure|gateway|http 50[234]|tls handshake/.test(text))
+    return null;
+  return exitCode === 1 ? "command_failed" : null;
+}
 
 async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
   const mergeKey = `${row.repo}#${row.pr_number}@${row.head}`;
@@ -1704,10 +1745,28 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
   const pending = (reason) => {
     const pendingAt = now();
     dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-pending',
-      merge_pending_since=COALESCE(merge_pending_since,?),merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
+      merge_pending_since=COALESCE(merge_pending_since,?),merge_retry_at=NULL,
+      merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
       WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
       .run(pendingAt, pendingAt, row.repo, row.pr_number, row.head, mergeLeaseToken);
     return `FLEET_PR_MERGE_PENDING ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=${reason}`;
+  };
+  const retryableFailure = (reason) => {
+    const current = dbHandle.query(`SELECT merge_failure_count FROM fleet_pr_loop
+      WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
+      .get(row.repo, row.pr_number, row.head, mergeLeaseToken);
+    if (!current) return null;
+    const attempts = Number(current.merge_failure_count ?? 0) + 1;
+    const retryAt = attempts >= MAX_PR_LOOP_MERGE_ATTEMPTS
+      ? null
+      : new Date(Date.now() + Math.min(PR_LOOP_MERGE_RETRY_BASE_MS * (2 ** (attempts - 1)), PR_LOOP_MERGE_RETRY_MAX_MS)).toISOString();
+    const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-failed',merge_failure_count=?,
+      merge_retry_at=?,merge_failure_reason=?,merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
+      WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
+      .run(attempts, retryAt, reason, now(), row.repo, row.pr_number, row.head, mergeLeaseToken).changes;
+    if (!changed) return null;
+    const retry = retryAt ? ` retry_at=${retryAt}` : " retry=exhausted";
+    return `FLEET_PR_MERGE_FAILED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=${reason} attempt=${attempts}/${MAX_PR_LOOP_MERGE_ATTEMPTS}${retry}`;
   };
   const fail = (reason) => {
     dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-failed',merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
@@ -1721,6 +1780,7 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
       .run(mergeSha, now(), row.repo, row.pr_number, row.head, mergeLeaseToken);
     return `FLEET_PR_MERGED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} merge_sha=${mergeSha}`;
   };
+  let mergeCommandAttempted = false;
   try {
     let info = await prLoopPullRequestInfo(`pr:${row.repo}#${row.pr_number}`, runCommand);
     if (!info) return retry("pr_lookup_unavailable");
@@ -1734,10 +1794,14 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
       return mergedEvent(info.mergeCommit.oid.toLowerCase());
     }
     if (info.state !== "OPEN") return retry("pr_not_open");
+    mergeCommandAttempted = true;
     const merged = await runCommand([
       "gh", "pr", "merge", row.pr_number, "-R", row.repo, mergeFlag, "--match-head-commit", row.head,
     ], AbortSignal.timeout(30_000));
-    if (merged.exitCode !== 0) return pending(`merge_command_exit_${merged.exitCode}`);
+    if (merged.exitCode !== 0) {
+      const reason = classifyPrLoopMergeFailure(merged);
+      return reason ? retryableFailure(reason) : pending(`merge_command_exit_${merged.exitCode}`);
+    }
     const result = await runCommand([
       "gh", "pr", "view", row.pr_number, "-R", row.repo, "--json", "state,headRefOid,mergeCommit",
     ], AbortSignal.timeout(10_000));
@@ -1752,6 +1816,14 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
     return pending("merge_status_inconclusive");
   } catch (error) {
     fleetError("PR_LOOP_MERGE", `signal=pr:${row.repo}#${row.pr_number}`, error);
+    const reason = classifyPrLoopMergeFailure({
+      exitCode: error?.exitCode,
+      stdout: error?.stdout,
+      stderr: error?.stderr,
+      message: error?.message,
+    });
+    if (reason) return retryableFailure(reason);
+    if (mergeCommandAttempted) return pending("merge_command_result_unknown");
     return fail(String(error?.message ?? error).slice(0, 120));
   } finally {
     activePrLoopMerges.delete(mergeKey);
@@ -1879,11 +1951,12 @@ function deployMergedPrLoopRow(dbHandle, row, config, io, events, runCommand) {
 export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop, io = {}) {
   if (!config?.enabled) return [];
   const runCommand = io.runCommand ?? executeSignalCommand;
+  const readPane = io.readPane ?? ((pane) => runCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]));
   const postMessage = io.postMessage ?? defaultPrLoopPost;
   const fetchReplies = io.fetchReplies ?? defaultPrLoopReplies;
   const events = pendingPrLoopDeployEvents.splice(0);
   const waiting = dbHandle.query(`SELECT * FROM fleet_pr_loop
-    WHERE state IN ('awaiting-review','accepted','posting','post-failed','merging','merge-pending','merge-timeout')`).all();
+    WHERE state IN ('awaiting-review','accepted','posting','post-failed','merging','merge-pending','merge-timeout','merge-failed')`).all();
   let replies = [];
   let repliesAvailable = waiting.length === 0;
   if (waiting.length) {
@@ -1910,7 +1983,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
     WHERE status NOT IN ('closed','blocked') AND (
       (completion_claimed=1 AND status IN ('done-claimed','not-done'))
       OR key IN (SELECT task_key FROM fleet_pr_loop
-        WHERE state IN ('awaiting-review','accepted','posting','post-failed','rejecting','reject-failed','merging','merge-pending','merge-timeout'))
+        WHERE state IN ('awaiting-review','accepted','posting','post-failed','rejecting','reject-failed','merging','merge-pending','merge-timeout','merge-failed'))
     ) ORDER BY sent_at`).all();
   for (const task of tasks) {
     if (task.status === "working" && !task.completion_claimed
@@ -1921,7 +1994,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       const parsed = parsePullRequestSignal(candidateSignal);
       if (!parsed) continue;
       const candidate = dbHandle.query(`SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=?
-        AND task_key=? AND state IN ('awaiting-review','accepted') ORDER BY updated_at DESC LIMIT 1`)
+        AND task_key=? AND state IN ('awaiting-review','accepted','merge-failed') ORDER BY updated_at DESC LIMIT 1`)
         .get(parsed.repo, parsed.prNumber, task.key);
       const interruptedReject = dbHandle.query(`SELECT head FROM fleet_pr_loop WHERE repo=? AND pr_number=?
         AND task_key=? AND state IN ('rejecting','reject-failed') LIMIT 1`)
@@ -1949,9 +2022,12 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         const row = pendingReject.row;
         const verdict = pendingReject.verdict;
         const rejectLeaseToken = claimPrLoopRejection(dbHandle, row, verdict);
-        if (!rejectLeaseToken) continue;
+        if (!rejectLeaseToken) {
+          rejectedTaskThisCycle = true;
+          continue;
+        }
         try {
-          await sendPrLoopFollowup(dbHandle, { ...row, state: "rejecting" }, verdict, runCommand, io.sendFollowup, rejectLeaseToken);
+          await sendPrLoopFollowup(dbHandle, { ...row, state: "rejecting" }, verdict, runCommand, readPane, io.sendFollowup, rejectLeaseToken);
           events.push(`FLEET_PR_REJECT_FOLLOWUP ${row.task_key} ${signal} head=${row.head}`);
         } catch (error) {
           dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
@@ -1967,7 +2043,10 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         .get(repo, prNumber, task.key);
       if (rejected) {
         const rejectLeaseToken = claimPrLoopRejection(dbHandle, rejected);
-        if (!rejectLeaseToken) continue;
+        if (!rejectLeaseToken) {
+          rejectedTaskThisCycle = true;
+          continue;
+        }
         try {
           if (!rejected.verdict) throw new Error("stored reject verdict missing");
           await sendPrLoopFollowup(
@@ -1975,6 +2054,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
             rejected,
             { kind: "reject", text: rejected.verdict, ts: String(rejected.verdict_ts ?? "") },
             runCommand,
+            readPane,
             io.sendFollowup,
             rejectLeaseToken,
           );
@@ -1992,9 +2072,9 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       if (!info || !/^[a-f0-9]{40}$/i.test(info.headRefOid || "")) continue;
       const head = info.headRefOid.toLowerCase();
       for (const stale of dbHandle.query(`SELECT head FROM fleet_pr_loop WHERE repo=? AND pr_number=?
-        AND head!=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout')`).all(repo, prNumber, head)) {
+        AND head!=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout','merge-failed')`).all(repo, prNumber, head)) {
         dbHandle.query(`UPDATE fleet_pr_loop SET state='stale-head',updated_at=?
-          WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout')`)
+          WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout','merge-failed')`)
           .run(now(), repo, prNumber, stale.head);
       }
       let row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
@@ -2045,6 +2125,26 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
           .get(repo, prNumber, claimedHead);
       }
       if (!row) continue;
+      if (row.state === "merge-failed") {
+        const retryAt = Date.parse(row.merge_retry_at ?? "");
+        const currentCycleVerdict = repliesAvailable ? matchPrLoopVerdict(replies, {
+          repo: row.repo,
+          prNumber: row.pr_number,
+          head: row.head,
+          threadTs: config.reviewThreadTs,
+          afterTs: row.request_ts,
+        }) : null;
+        if (!Number.isFinite(retryAt) || Date.now() < retryAt
+          || Number(row.merge_failure_count ?? 0) >= MAX_PR_LOOP_MERGE_ATTEMPTS
+          || currentCycleVerdict?.kind !== "accept") continue;
+        const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='accepted',merge_retry_at=NULL,updated_at=?
+          WHERE repo=? AND pr_number=? AND head=? AND state='merge-failed'
+            AND merge_retry_at=? AND merge_failure_count<?`)
+          .run(now(), row.repo, row.pr_number, row.head, row.merge_retry_at, MAX_PR_LOOP_MERGE_ATTEMPTS).changes;
+        if (!changed) continue;
+        row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
+          .get(repo, prNumber, row.head);
+      }
       if (existingRow && ["posting", "post-failed"].includes(row.state)) {
         if (!repliesAvailable) continue;
         const requestTs = existingPrLoopRequestTs(replies, row, config.reviewThreadTs);
@@ -2154,7 +2254,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         }
         if (claimed && verdict.kind === "reject") {
           try {
-            await sendPrLoopFollowup(dbHandle, row, verdict, runCommand, io.sendFollowup, rejectLeaseToken);
+            await sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, io.sendFollowup, rejectLeaseToken);
             events.push(`FLEET_PR_REJECT_FOLLOWUP ${row.task_key} ${signal} head=${row.head}`);
           } catch (error) {
             dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
@@ -2430,9 +2530,13 @@ export async function dispatchQueuedDependencies(dbHandle, paneRows, dispatchTas
 
 // Machine-checked done (Dori signals.ts idea). Spec: "pr:owner/repo#N" | "url:http://...=200" | "cmd:<shell>"; ';'-separated.
 async function executeSignalCommand(argv, signal = AbortSignal.timeout(10000)) {
-  const proc = Bun.spawn({ cmd: argv, stdout: "pipe", stderr: "ignore", signal });
-  const [exitCode, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
-  return { exitCode, stdout };
+  const proc = Bun.spawn({ cmd: argv, stdout: "pipe", stderr: "pipe", signal });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
 }
 
 export async function checkSignal(sig, runCommand = executeSignalCommand) {
