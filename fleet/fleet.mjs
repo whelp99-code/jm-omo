@@ -1783,9 +1783,14 @@ const PR_LOOP_MERGE_AMBIGUOUS_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 function classifyPrLoopMergeFailure(result) {
   const exitCode = Number(result?.exitCode);
   const text = `${result?.stderr ?? ""}\n${result?.stdout ?? ""}\n${result?.message ?? ""}`.toLowerCase();
-  if (exitCode === 4 || /authentication required|not logged in|gh auth login|unauthorized/.test(text))
+  const rateLimitStatus = /\b(?:http\s*)?(?:403|429)\b/i.test(text);
+  const rateLimitText = /rate[\s-]?limit|secondary rate|abuse|retry[\s-]?after|api rate limit exceeded/i.test(text);
+  if (rateLimitStatus && rateLimitText) return null;
+  if (/\b(?:http\s*)?403\b/i.test(text)) return "permission_denied";
+  if (exitCode === 4) return "authentication_required";
+  if (/authentication required|not logged in|gh auth login|unauthorized/.test(text))
     return "authentication_required";
-  if (/permission denied|permission to .* denied|resource not accessible|forbidden|http 403/.test(text))
+  if (/permission denied|permission to .* denied|resource not accessible|forbidden|must have (?:admin|administrator|write)|admin\/write|\bpermission\b/.test(text))
     return "permission_denied";
   if (/not mergeable|merge conflict|conflicts with|has conflicts/.test(text))
     return "not_mergeable";
