@@ -107,6 +107,7 @@
     "autoMerge": false,
     "reviewChannel": "C0C5Z4SJ309",
     "reviewThreadTs": "1791757469.519659",
+    "mergePendingTimeoutMs": 1800000,
     "deployTimeoutMs": 300000,
     "mergeMethods": {},
     "deploy": {}

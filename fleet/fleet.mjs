@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS fleet_alerts(key TEXT PRIMARY KEY, alerted_at TEXT NO
 CREATE TABLE IF NOT EXISTS fleet_review_requests(ts TEXT PRIMARY KEY, channel TEXT, thread_ts TEXT, user TEXT, text TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_pr_loop(
   repo TEXT NOT NULL, pr_number TEXT NOT NULL, head TEXT NOT NULL, task_key TEXT NOT NULL,
-  state TEXT NOT NULL, request_ts TEXT, verdict TEXT, verdict_ts TEXT, merge_sha TEXT,
+  state TEXT NOT NULL, request_ts TEXT, verdict TEXT, verdict_ts TEXT, merge_sha TEXT, merge_pending_since TEXT,
   merge_lease_token TEXT, merge_lease_until TEXT, deploy_lease_token TEXT, deploy_lease_until TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(repo,pr_number,head)
@@ -49,6 +49,7 @@ export function migrateFleetColumns(dbHandle) {
     ]);
     addMissing("fleet_pr_loop", [
       ["verdict", "TEXT"],
+      ["merge_pending_since", "TEXT"],
       ["merge_lease_token", "TEXT"],
       ["merge_lease_until", "TEXT"],
       ["deploy_lease_token", "TEXT"],
@@ -1513,6 +1514,16 @@ function reservePrLoopRequest(dbHandle, info, taskKey) {
     .run(info.repo, info.prNumber, info.headRefOid.toLowerCase(), taskKey, now()).changes === 1).immediate();
 }
 
+function buildPrLoopReviewRequest(repo, prNumber, url, head) {
+  const header = `서윤아, Cursor 검수 요청 ${repo}#${prNumber}`;
+  const headLine = `head=${head}`;
+  return {
+    header,
+    headLine,
+    text: [header, url, headLine, `[<@${REVIEW_RELAY_USER_ID}> 서윤]`].join("\n"),
+  };
+}
+
 async function postPrLoopRequest(dbHandle, task, info, config, postMessage, events) {
   if (info.state !== "OPEN") return false;
   const readyInfo = await ensurePrLoopReady(info, `pr:${info.repo}#${info.prNumber}`, config.runCommand);
@@ -1526,7 +1537,7 @@ async function postPrLoopRequest(dbHandle, task, info, config, postMessage, even
   if (!reservePrLoopRequest(dbHandle, readyInfo, task.key)) return true;
   const signal = `pr:${readyInfo.repo}#${readyInfo.prNumber}`;
   const url = readyInfo.url || `https://github.com/${readyInfo.repo}/pull/${readyInfo.prNumber}`;
-  const text = `서윤아, Cursor 검수 요청 ${readyInfo.repo}#${readyInfo.prNumber}\n${url}\nhead=${claimedHead}\n[<@${REVIEW_RELAY_USER_ID}> 서윤]`;
+  const text = buildPrLoopReviewRequest(readyInfo.repo, readyInfo.prNumber, url, claimedHead).text;
   try {
     const posted = await postMessage(config.reviewChannel, config.reviewThreadTs, text);
     if (posted?.ok !== true || !posted.ts) throw new Error(posted?.error || "Slack post returned no timestamp");
@@ -1544,15 +1555,16 @@ async function postPrLoopRequest(dbHandle, task, info, config, postMessage, even
 }
 
 function existingPrLoopRequestTs(replies, row, threadTs) {
-  const requestHeader = `Cursor 검수 요청 ${row.repo}#${row.pr_number}`.toLowerCase();
-  const headLine = `head=${row.head}`.toLowerCase();
-  const request = replies.find((message) => {
+  const request = buildPrLoopReviewRequest(row.repo, row.pr_number, "", row.head);
+  const requestHeader = request.header.toLowerCase();
+  const headLine = request.headLine.toLowerCase();
+  const matchingMessage = replies.find((message) => {
     const lines = String(message.text ?? "").split(/\r?\n/).map((line) => line.trim().toLowerCase());
     return String(message.thread_ts ?? "") === String(threadTs)
       && lines[0] === requestHeader
       && lines.includes(headLine);
   });
-  return request?.ts ? String(request.ts) : null;
+  return matchingMessage?.ts ? String(matchingMessage.ts) : null;
 }
 
 async function retryPrLoopReviewPost(dbHandle, row, info, config, postMessage, events, runCommand) {
@@ -1563,7 +1575,7 @@ async function retryPrLoopReviewPost(dbHandle, row, info, config, postMessage, e
     .run(now(), row.repo, row.pr_number, row.head).changes === 1;
   if (!claimed) return false;
   const url = readyInfo.url || `https://github.com/${row.repo}/pull/${row.pr_number}`;
-  const text = `서윤아, Cursor 검수 요청 ${row.repo}#${row.pr_number}\n${url}\nhead=${row.head}\n[<@${REVIEW_RELAY_USER_ID}> 서윤]`;
+  const text = buildPrLoopReviewRequest(row.repo, row.pr_number, url, row.head).text;
   try {
     const posted = await postMessage(config.reviewChannel, config.reviewThreadTs, text);
     if (posted?.ok !== true || !posted.ts) throw new Error(posted?.error || "Slack post returned no timestamp");
@@ -1633,9 +1645,11 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
     return `FLEET_PR_MERGE_RETRY ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=${reason}`;
   };
   const pending = (reason) => {
-    dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-pending',merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
+    const pendingAt = now();
+    dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-pending',
+      merge_pending_since=COALESCE(merge_pending_since,?),merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
       WHERE repo=? AND pr_number=? AND head=? AND state='merging' AND merge_lease_token=?`)
-      .run(now(), row.repo, row.pr_number, row.head, mergeLeaseToken);
+      .run(pendingAt, pendingAt, row.repo, row.pr_number, row.head, mergeLeaseToken);
     return `FLEET_PR_MERGE_PENDING ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=${reason}`;
   };
   const fail = (reason) => {
@@ -1808,8 +1822,6 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
     }
   }
   const leaseCheckAt = now();
-  dbHandle.query(`UPDATE fleet_pr_loop SET state='accepted',merge_lease_token=NULL,merge_lease_until=NULL,updated_at=?
-    WHERE state='merge-pending'`).run(leaseCheckAt);
   for (const row of dbHandle.query("SELECT repo,pr_number,head FROM fleet_pr_loop WHERE state='merging'").all()) {
     const mergeKey = `${row.repo}#${row.pr_number}@${row.head}`;
     if (activePrLoopMerges.has(mergeKey)) continue;
@@ -1822,7 +1834,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
     WHERE status NOT IN ('closed','blocked') AND (
       (completion_claimed=1 AND status IN ('done-claimed','not-done'))
       OR key IN (SELECT task_key FROM fleet_pr_loop
-        WHERE state IN ('awaiting-review','accepted','posting','post-failed','rejecting','reject-failed','merging'))
+        WHERE state IN ('awaiting-review','accepted','posting','post-failed','rejecting','reject-failed','merging','merge-pending','merge-timeout'))
     ) ORDER BY sent_at`).all();
   for (const task of tasks) {
     if (task.status === "working" && !task.completion_claimed
@@ -1908,9 +1920,9 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       if (!info || !/^[a-f0-9]{40}$/i.test(info.headRefOid || "")) continue;
       const head = info.headRefOid.toLowerCase();
       for (const stale of dbHandle.query(`SELECT head FROM fleet_pr_loop WHERE repo=? AND pr_number=?
-        AND head!=? AND state IN ('awaiting-review','accepted','posting','post-failed')`).all(repo, prNumber, head)) {
+        AND head!=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout')`).all(repo, prNumber, head)) {
         dbHandle.query(`UPDATE fleet_pr_loop SET state='stale-head',updated_at=?
-          WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted','posting','post-failed')`)
+          WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted','posting','post-failed','merge-pending','merge-timeout')`)
           .run(now(), repo, prNumber, stale.head);
       }
       let row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
@@ -1944,7 +1956,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
           .run(repo, prNumber, claimedHead, task.key, now()).changes === 1).immediate();
         if (reserved) {
           const url = info.url || `https://github.com/${repo}/pull/${prNumber}`;
-          const text = `서윤아, Cursor 검수 요청 ${repo}#${prNumber}\n${url}\nhead=${claimedHead}\n[<@${REVIEW_RELAY_USER_ID}> 서윤]`;
+          const text = buildPrLoopReviewRequest(repo, prNumber, url, claimedHead).text;
           try {
             const posted = await postMessage(config.reviewChannel, config.reviewThreadTs, text);
             if (posted?.ok !== true || !posted.ts) throw new Error(posted?.error || "Slack post returned no timestamp");
@@ -1986,6 +1998,41 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         } else {
           continue;
         }
+      }
+      if (["merge-pending", "merge-timeout"].includes(row.state)) {
+        if (info.headRefOid?.toLowerCase() !== row.head) {
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='stale-head',updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout')`)
+            .run(now(), row.repo, row.pr_number, row.head);
+          fleetError("PR_LOOP_STALE", `task=${task.key} signal=${signal}`,
+            `expected=${row.head} actual=${info.headRefOid ?? "unavailable"}`);
+          continue;
+        }
+        if (info.state === "MERGED" && /^[a-f0-9]{40}$/i.test(info.mergeCommit?.oid || "")) {
+          const mergeSha = info.mergeCommit.oid.toLowerCase();
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='merged',merge_sha=?,merge_pending_since=NULL,updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout')`)
+            .run(mergeSha, now(), row.repo, row.pr_number, row.head);
+          events.push(`FLEET_PR_MERGED ${row.task_key} ${signal} head=${row.head} merge_sha=${mergeSha}`);
+          row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
+            .get(repo, prNumber, row.head);
+        } else if (info.state === "CLOSED") {
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='closed',merge_pending_since=NULL,updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state IN ('merge-pending','merge-timeout')`)
+            .run(now(), row.repo, row.pr_number, row.head);
+          events.push(`FLEET_PR_CLOSED ${row.task_key} ${signal} head=${row.head}`);
+          continue;
+        } else if (info.state === "OPEN" && row.state === "merge-pending") {
+          const pendingSince = Date.parse(row.merge_pending_since ?? row.updated_at ?? "");
+          const timeoutMs = Number(config.mergePendingTimeoutMs) > 0 ? Number(config.mergePendingTimeoutMs) : 1_800_000;
+          if (Number.isFinite(pendingSince) && Date.now() - pendingSince >= timeoutMs) {
+            dbHandle.query(`UPDATE fleet_pr_loop SET state='merge-timeout',updated_at=?
+              WHERE repo=? AND pr_number=? AND head=? AND state='merge-pending'`)
+              .run(now(), row.repo, prNumber, row.head);
+            events.push(`FLEET_PR_MERGE_TIMEOUT ${row.task_key} ${signal} head=${row.head} timeout_ms=${timeoutMs}`);
+          }
+        }
+        if (row.state === "merge-pending" || row.state === "merge-timeout") continue;
       }
       if (row.state === "awaiting-review") {
         let info = await prLoopPullRequestInfo(signal, runCommand);
