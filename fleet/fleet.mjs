@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS fleet_review_requests(ts TEXT PRIMARY KEY, channel TE
 CREATE TABLE IF NOT EXISTS fleet_pr_loop(
   repo TEXT NOT NULL, pr_number TEXT NOT NULL, head TEXT NOT NULL, task_key TEXT NOT NULL,
   state TEXT NOT NULL, request_ts TEXT, verdict TEXT, verdict_ts TEXT, merge_sha TEXT, merge_pending_since TEXT,
-  post_lease_token TEXT, post_lease_until TEXT, merge_lease_token TEXT, merge_lease_until TEXT,
+  post_lease_token TEXT, post_lease_until TEXT, reject_lease_token TEXT, reject_lease_until TEXT, reject_sent_at TEXT,
+  merge_lease_token TEXT, merge_lease_until TEXT,
   deploy_lease_token TEXT, deploy_lease_until TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(repo,pr_number,head)
@@ -53,6 +54,9 @@ export function migrateFleetColumns(dbHandle) {
       ["merge_pending_since", "TEXT"],
       ["post_lease_token", "TEXT"],
       ["post_lease_until", "TEXT"],
+      ["reject_lease_token", "TEXT"],
+      ["reject_lease_until", "TEXT"],
+      ["reject_sent_at", "TEXT"],
       ["merge_lease_token", "TEXT"],
       ["merge_lease_until", "TEXT"],
       ["deploy_lease_token", "TEXT"],
@@ -1623,7 +1627,27 @@ async function retryPrLoopReviewPost(dbHandle, row, info, config, postMessage, e
   return true;
 }
 
-async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, sendFollowup) {
+const PR_LOOP_REJECT_LEASE_MS = 120_000;
+
+function claimPrLoopRejection(dbHandle, row, verdict = null) {
+  const token = crypto.randomUUID();
+  const claimedAt = now();
+  const leaseUntil = new Date(Date.now() + PR_LOOP_REJECT_LEASE_MS).toISOString();
+  const changed = dbHandle.transaction(() => verdict
+    ? dbHandle.query(`UPDATE fleet_pr_loop SET state='rejecting',verdict=?,verdict_ts=?,
+        reject_sent_at=NULL,reject_lease_token=?,reject_lease_until=?,updated_at=?
+        WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted')`)
+      .run(verdict.text, verdict.ts, token, leaseUntil, claimedAt, row.repo, row.pr_number, row.head).changes
+    : dbHandle.query(`UPDATE fleet_pr_loop SET state='rejecting',reject_lease_token=?,reject_lease_until=?,updated_at=?
+        WHERE repo=? AND pr_number=? AND head=? AND reject_sent_at IS NULL
+          AND (state='reject-failed' OR (state='rejecting' AND (reject_lease_until IS NULL OR reject_lease_until<=?)))`)
+      .run(token, leaseUntil, claimedAt, row.repo, row.pr_number, row.head, claimedAt).changes
+  ).immediate();
+  return changed === 1 ? token : null;
+}
+
+async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, sendFollowup, rejectLeaseToken) {
+  if (!rejectLeaseToken) throw new Error("REJECT_LEASE_REQUIRED");
   const task = dbHandle.query("SELECT t.cat,c.pane FROM tasks t LEFT JOIN cats c ON c.id=t.cat WHERE t.key=?").get(row.task_key);
   const pane = configuredCatPane(task?.cat, task?.pane);
   if (!pane || pane === "-") throw new Error("task pane unavailable");
@@ -1641,9 +1665,11 @@ async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, sendFollow
     appendHistoryInTransaction(dbHandle, row.task_key, {
       ev: "cursor-reject-followup", signal: `pr:${row.repo}#${row.pr_number}`, head: row.head, text: verdict.text,
     });
-    dbHandle.query(`UPDATE fleet_pr_loop SET state='rejected',verdict=?,verdict_ts=?,updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='rejecting'`)
-      .run(verdict.text, verdict.ts, now(), row.repo, row.pr_number, row.head);
+    const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='rejected',verdict=?,verdict_ts=?,
+      reject_sent_at=?,reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
+      WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+      .run(verdict.text, verdict.ts, now(), now(), row.repo, row.pr_number, row.head, rejectLeaseToken).changes;
+    if (!changed) throw new Error("REJECT_LEASE_LOST");
   }).immediate();
 }
 
@@ -1711,7 +1737,7 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
     const merged = await runCommand([
       "gh", "pr", "merge", row.pr_number, "-R", row.repo, mergeFlag, "--match-head-commit", row.head,
     ], AbortSignal.timeout(30_000));
-    if (merged.exitCode !== 0) throw new Error(`gh exited ${merged.exitCode}`);
+    if (merged.exitCode !== 0) return pending(`merge_command_exit_${merged.exitCode}`);
     const result = await runCommand([
       "gh", "pr", "view", row.pr_number, "-R", row.repo, "--json", "state,headRefOid,mergeCommit",
     ], AbortSignal.timeout(10_000));
@@ -1750,10 +1776,28 @@ function deployMergedPrLoopRow(dbHandle, row, config, io, events, runCommand) {
   if (!["merged", "deploying"].includes(row.state)) return;
   const deployment = configuredRepositoryValue(config.deploy, row.repo);
   if (!deployment) {
-    const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='merged-no-deploy',updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='merged'`)
-      .run(now(), row.repo, row.pr_number, row.head).changes;
-    if (changed) events.push(`FLEET_MERGED_NO_DEPLOY owner=omonyang ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head}`);
+    if (row.state === "merged") {
+      const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='merged-no-deploy',updated_at=?
+        WHERE repo=? AND pr_number=? AND head=? AND state='merged'`)
+        .run(now(), row.repo, row.pr_number, row.head).changes;
+      if (changed) events.push(`FLEET_MERGED_NO_DEPLOY owner=omonyang ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head}`);
+      return;
+    }
+    const deploymentKey = `${row.repo}#${row.pr_number}@${row.head}`;
+    if (activePrLoopDeployments.has(deploymentKey)) return;
+    const checkedAt = now();
+    const changed = dbHandle.transaction(() => dbHandle.query(`UPDATE fleet_pr_loop
+      SET state='deploy-needs-attention',deploy_lease_token=NULL,deploy_lease_until=NULL,updated_at=?
+      WHERE repo=? AND pr_number=? AND head=? AND state='deploying'
+        AND (deploy_lease_until IS NULL OR deploy_lease_until<=?)`)
+      .run(checkedAt, row.repo, row.pr_number, row.head, checkedAt).changes).immediate();
+    if (changed) {
+      appendTaskHistory(dbHandle, row.task_key, {
+        ev: "deploy-needs-attention", signal: `pr:${row.repo}#${row.pr_number}`, head: row.head,
+        merge_sha: row.merge_sha, detail: "deploy_config_removed_after_lease_expired",
+      });
+      events.push(`FLEET_DEPLOY_NEEDS_ATTENTION ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=deploy_config_removed`);
+    }
     return;
   }
   if (!Array.isArray(deployment.argv) || !deployment.argv.length || typeof deployment.healthUrl !== "string") {
@@ -1838,7 +1882,8 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
   const postMessage = io.postMessage ?? defaultPrLoopPost;
   const fetchReplies = io.fetchReplies ?? defaultPrLoopReplies;
   const events = pendingPrLoopDeployEvents.splice(0);
-  const waiting = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE state IN ('awaiting-review','accepted','posting','post-failed')").all();
+  const waiting = dbHandle.query(`SELECT * FROM fleet_pr_loop
+    WHERE state IN ('awaiting-review','accepted','posting','post-failed','merging','merge-pending','merge-timeout')`).all();
   let replies = [];
   let repliesAvailable = waiting.length === 0;
   if (waiting.length) {
@@ -1903,18 +1948,15 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       if (pendingReject && typeof pendingReject === "object") {
         const row = pendingReject.row;
         const verdict = pendingReject.verdict;
-        const claimed = dbHandle.transaction(() => dbHandle.query(`UPDATE fleet_pr_loop
-          SET state='rejecting',verdict=?,verdict_ts=?,updated_at=?
-          WHERE repo=? AND pr_number=? AND head=? AND state IN ('awaiting-review','accepted')`)
-          .run(verdict.text, verdict.ts, now(), row.repo, row.pr_number, row.head).changes === 1).immediate();
-        if (!claimed) continue;
+        const rejectLeaseToken = claimPrLoopRejection(dbHandle, row, verdict);
+        if (!rejectLeaseToken) continue;
         try {
-          await sendPrLoopFollowup(dbHandle, { ...row, state: "rejecting" }, verdict, runCommand, io.sendFollowup);
+          await sendPrLoopFollowup(dbHandle, { ...row, state: "rejecting" }, verdict, runCommand, io.sendFollowup, rejectLeaseToken);
           events.push(`FLEET_PR_REJECT_FOLLOWUP ${row.task_key} ${signal} head=${row.head}`);
         } catch (error) {
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state='rejecting'`)
-            .run(now(), row.repo, row.pr_number, row.head);
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+            .run(now(), row.repo, row.pr_number, row.head, rejectLeaseToken);
           fleetError("PR_LOOP_REJECT", `task=${row.task_key} signal=${signal}`, error);
         }
         rejectedTaskThisCycle = true;
@@ -1924,10 +1966,8 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         AND task_key=? AND state IN ('rejecting','reject-failed') ORDER BY updated_at DESC LIMIT 1`)
         .get(repo, prNumber, task.key);
       if (rejected) {
-        const claimed = dbHandle.transaction(() => dbHandle.query(`UPDATE fleet_pr_loop SET state='rejecting',updated_at=?
-          WHERE repo=? AND pr_number=? AND head=? AND state IN ('rejecting','reject-failed')`)
-          .run(now(), rejected.repo, rejected.pr_number, rejected.head).changes === 1).immediate();
-        if (!claimed) continue;
+        const rejectLeaseToken = claimPrLoopRejection(dbHandle, rejected);
+        if (!rejectLeaseToken) continue;
         try {
           if (!rejected.verdict) throw new Error("stored reject verdict missing");
           await sendPrLoopFollowup(
@@ -1936,12 +1976,13 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
             { kind: "reject", text: rejected.verdict, ts: String(rejected.verdict_ts ?? "") },
             runCommand,
             io.sendFollowup,
+            rejectLeaseToken,
           );
           events.push(`FLEET_PR_REJECT_FOLLOWUP ${rejected.task_key} ${signal} head=${rejected.head}`);
         } catch (error) {
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state='rejecting'`)
-            .run(now(), rejected.repo, rejected.pr_number, rejected.head);
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+            .run(now(), rejected.repo, rejected.pr_number, rejected.head, rejectLeaseToken);
           fleetError("PR_LOOP_REJECT", `task=${rejected.task_key} signal=${signal}`, error);
         }
         rejectedTaskThisCycle = true;
@@ -2092,29 +2133,33 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
           afterTs: row.request_ts,
         });
         if (!verdict) continue;
-        const nextState = verdict.kind === "accept" ? "accepted" : "rejecting";
-        const claimed = dbHandle.transaction(() => {
-          const changed = dbHandle.query(`UPDATE fleet_pr_loop
-            SET state=?,verdict=?,verdict_ts=?,updated_at=?
-            WHERE repo=? AND pr_number=? AND head=? AND state='awaiting-review'`)
-            .run(nextState, verdict.text, verdict.ts, now(), row.repo, row.pr_number, row.head).changes === 1;
-          if (!changed) return false;
-          if (verdict.kind === "accept") {
+        let rejectLeaseToken = null;
+        let claimed;
+        if (verdict.kind === "reject") {
+          rejectLeaseToken = claimPrLoopRejection(dbHandle, row, verdict);
+          claimed = Boolean(rejectLeaseToken);
+        } else {
+          claimed = dbHandle.transaction(() => {
+            const changed = dbHandle.query(`UPDATE fleet_pr_loop
+              SET state='accepted',verdict=?,verdict_ts=?,updated_at=?
+              WHERE repo=? AND pr_number=? AND head=? AND state='awaiting-review'`)
+              .run(verdict.text, verdict.ts, now(), row.repo, row.pr_number, row.head).changes === 1;
+            if (!changed) return false;
             recordTaskClaimEvidenceInTransaction(dbHandle, row.task_key, {
               kind: "cursor-accept", signal, ok: true, head: row.head,
               acceptedPrefix: row.head, actualHead: row.head, detail: "accepted_exact_pr_head",
             });
-          }
-          return true;
-        }).immediate();
+            return true;
+          }).immediate();
+        }
         if (claimed && verdict.kind === "reject") {
           try {
-            await sendPrLoopFollowup(dbHandle, row, verdict, runCommand, io.sendFollowup);
+            await sendPrLoopFollowup(dbHandle, row, verdict, runCommand, io.sendFollowup, rejectLeaseToken);
             events.push(`FLEET_PR_REJECT_FOLLOWUP ${row.task_key} ${signal} head=${row.head}`);
           } catch (error) {
-            dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',updated_at=?
-              WHERE repo=? AND pr_number=? AND head=? AND state='rejecting'`)
-              .run(now(), row.repo, row.pr_number, row.head);
+            dbHandle.query(`UPDATE fleet_pr_loop SET state='reject-failed',reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
+              WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+              .run(now(), row.repo, row.pr_number, row.head, rejectLeaseToken);
             fleetError("PR_LOOP_REJECT", `task=${row.task_key} signal=${signal}`, error);
           }
         } else if (claimed) {
@@ -2124,6 +2169,13 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       row = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
         .get(repo, prNumber, row.head);
       if (row?.state === "accepted") {
+        const currentCycleVerdict = repliesAvailable ? matchPrLoopVerdict(replies, {
+          repo: row.repo,
+          prNumber: row.pr_number,
+          head: row.head,
+          threadTs: config.reviewThreadTs,
+          afterTs: row.request_ts,
+        }) : null;
         const info = await prLoopPullRequestInfo(signal, runCommand);
         if (!info) continue;
         if (info?.state === "MERGED" && info.headRefOid?.toLowerCase() === row.head
@@ -2138,7 +2190,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
             WHERE repo=? AND pr_number=? AND head=? AND state='accepted'`)
             .run(now(), repo, prNumber, row.head);
           events.push(`FLEET_PR_CLOSED ${row.task_key} ${signal} head=${row.head}`);
-        } else if (config.autoMerge && !info.isDraft) {
+        } else if (config.autoMerge && !info.isDraft && currentCycleVerdict?.kind === "accept") {
           const merge = await mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand);
           if (merge) events.push(merge);
         }
