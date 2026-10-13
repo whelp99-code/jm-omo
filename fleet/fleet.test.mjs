@@ -33,7 +33,9 @@ function prLoopDb(task = null) {
   CREATE TABLE cats(id TEXT PRIMARY KEY,pane TEXT);
   CREATE TABLE fleet_pr_loop(
     repo TEXT NOT NULL, pr_number TEXT NOT NULL, head TEXT NOT NULL, task_key TEXT NOT NULL,
-    state TEXT NOT NULL, request_ts TEXT, verdict TEXT, verdict_ts TEXT, merge_sha TEXT, updated_at TEXT NOT NULL,
+    state TEXT NOT NULL, request_ts TEXT, verdict TEXT, verdict_ts TEXT, merge_sha TEXT,
+    merge_lease_token TEXT, merge_lease_until TEXT, deploy_lease_token TEXT, deploy_lease_until TEXT,
+    updated_at TEXT NOT NULL,
     PRIMARY KEY(repo,pr_number,head)
   );`);
   if (task) {
@@ -497,12 +499,16 @@ describe("fleet PR automation", () => {
     expect(ghCalls.some((argv) => argv[1] === "pr" && argv[2] === "merge")).toBe(false);
     expect(posts).toHaveLength(1);
     expect(posts[0]).toMatchObject({ channel: "C0C5Z4SJ309", thread: threadTs });
+    expect(posts[0].text.startsWith("서윤아, Cursor 검수 요청 ")).toBe(true);
     expect(posts[0].text).toContain("https://github.com/owner/repo/pull/52");
     expect(posts[0].text).toContain(head);
     expect(posts[0].text).toContain("owner/repo#52");
     expect(posts[0].text.endsWith("[<@U0B81F5GR6V> 서윤]")).toBe(true);
     expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
       .toBe("accepted");
+    const acceptedEvidence = JSON.parse(db.query("SELECT claim_evidence FROM tasks WHERE key='PRLOOP-REQUEST'").get().claim_evidence);
+    expect(acceptedEvidence[signal]["cursor-accept"])
+      .toMatchObject({ ok: true, head, acceptedPrefix: head, actualHead: head });
     db.close();
   });
 
@@ -872,6 +878,7 @@ describe("fleet PR automation", () => {
     expect(ghCalls.filter((argv) => argv[1] === "pr" && argv[2] === "ready")).toHaveLength(1);
     expect(posts).toHaveLength(1);
     expect(posts[0]).toMatchObject({ channel: "C0C5Z4SJ309", thread: threadTs });
+    expect(posts[0].text.startsWith("서윤아, Cursor 검수 요청 ")).toBe(true);
     expect(posts[0].text).toContain("https://github.com/owner/repo/pull/52");
     expect(posts[0].text).toContain(head);
     expect(posts[0].text).toContain("owner/repo#52");
@@ -1150,7 +1157,8 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     );`);
     migrateFleetColumns(legacy);
     const columns = new Set(legacy.query("PRAGMA table_info(fleet_pr_loop)").all().map((column) => column.name));
-    expect(columns.has("verdict")).toBe(true);
+    expect(["verdict", "merge_lease_token", "merge_lease_until", "deploy_lease_token", "deploy_lease_until"]
+      .every((column) => columns.has(column))).toBe(true);
     legacy.query("INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,updated_at) VALUES('owner/repo','52',?,'MIGRATED','accepted','ACCEPT','1')")
       .run(head);
     expect(legacy.query("SELECT verdict FROM fleet_pr_loop WHERE head=?").get(head).verdict).toBe("ACCEPT");
@@ -1292,6 +1300,118 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     db.close();
   });
 
+  it("keeps the PR-loop cycle alive when the accepted-head lookup fails", async () => {
+    const db = prLoopDb({ key: "PRLOOP-ACCEPTED-LOOKUP-FAIL", done: signal });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,verdict_ts,updated_at)
+      VALUES('owner/repo','52',?,'PRLOOP-ACCEPTED-LOOKUP-FAIL','accepted','ACCEPT','101','1')`).run(head);
+    let viewCount = 0;
+    const events = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      fetchReplies: async () => [],
+      runCommand: async (argv) => {
+        if (argv[1] !== "pr" || argv[2] !== "view") throw new Error(`unexpected command ${argv.join(" ")}`);
+        viewCount++;
+        if (viewCount === 2) return { exitCode: 1, stdout: "" };
+        return { exitCode: 0, stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head }) };
+      },
+    });
+    expect(viewCount).toBe(2);
+    expect(events).toEqual([]);
+    expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("accepted");
+    db.close();
+  });
+
+  it("rechecks an exit-zero auto-merge pending on a later cycle", async () => {
+    const db = prLoopDb({ key: "PRLOOP-CHECKS-PENDING", done: signal });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,verdict_ts,updated_at)
+      VALUES('owner/repo','52',?,'PRLOOP-CHECKS-PENDING','accepted','ACCEPT','101','1')`).run(head);
+    let mergeCalls = 0;
+    let viewsAfterMerge = 0;
+    let merged = false;
+    const runCommand = async (argv) => {
+      if (argv[1] === "pr" && argv[2] === "merge") {
+        mergeCalls++;
+        return { exitCode: 0, stdout: "" };
+      }
+      if (argv[1] === "pr" && argv[2] === "view") {
+        if (mergeCalls) viewsAfterMerge++;
+        if (viewsAfterMerge > 1) merged = true;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            state: merged ? "MERGED" : "OPEN", isDraft: false, headRefOid: head,
+            mergeCommit: merged ? { oid: mergeSha } : null,
+          }),
+        };
+      }
+      throw new Error(`unexpected command ${argv.join(" ")}`);
+    };
+    const first = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      runCommand, fetchReplies: async () => [],
+    });
+    expect(first.some((event) => event.startsWith("FLEET_PR_MERGE_PENDING PRLOOP-CHECKS-PENDING"))).toBe(true);
+    expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("merge-pending");
+    const second = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      runCommand, fetchReplies: async () => [],
+    });
+    expect(mergeCalls).toBe(1);
+    expect(second).toContain(`FLEET_PR_MERGED PRLOOP-CHECKS-PENDING ${signal} head=${head} merge_sha=${mergeSha}`);
+    expect(db.query("SELECT state,merge_sha FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head))
+      .toEqual({ state: "merged-no-deploy", merge_sha: mergeSha });
+    db.close();
+  });
+
+  it("does not throw when auto-merge PR info is temporarily unavailable", async () => {
+    const db = prLoopDb({ key: "PRLOOP-AUTO-MERGE-LOOKUP-FAIL", done: signal });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,verdict_ts,updated_at)
+      VALUES('owner/repo','52',?,'PRLOOP-AUTO-MERGE-LOOKUP-FAIL','accepted','ACCEPT','101','1')`).run(head);
+    let viewCalls = 0;
+    const events = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      fetchReplies: async () => [],
+      runCommand: async (argv) => {
+        if (argv[1] !== "pr" || argv[2] !== "view") throw new Error(`unexpected command ${argv.join(" ")}`);
+        if (++viewCalls === 2) return { exitCode: 1, stdout: "" };
+        return { exitCode: 0, stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head }) };
+      },
+    });
+    expect(events).toEqual([]);
+    expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("accepted");
+    db.close();
+  });
+
+  it("persists ACCEPT evidence that lets verify() reach verified-done", async () => {
+    const key = `PRLOOP-VERIFY-ACCEPT-${crypto.randomUUID()}`;
+    const db = unitDb();
+    db.query(`INSERT INTO tasks(key,cat,title,done,status,sent_at,history,completion_claimed,claim_evidence)
+      VALUES(?,'crm',?,?,'done-claimed','2026-10-12T10:00:00.000Z','[]',1,?)`)
+      .run(key, key, signal, JSON.stringify({
+        [signal]: { "pr-ready": { ok: true, head, actualHead: head, acceptedPrefix: head } },
+      }));
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,updated_at)
+      VALUES('owner/repo','52',?,?,'awaiting-review','100','1')`).run(head, key);
+    await processPrLoopEvents(db, config, {
+      fetchReplies: async () => [{
+        ts: "101", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW",
+        text: `ACCEPT owner/repo#52 head=${head}`,
+      }],
+      runCommand: async () => ({
+        exitCode: 0,
+        stdout: JSON.stringify({ state: "MERGED", isDraft: false, headRefOid: head, mergeCommit: { oid: mergeSha } }),
+      }),
+    });
+    const claimEvidence = JSON.parse(db.query("SELECT claim_evidence FROM tasks WHERE key=?").get(key).claim_evidence);
+    expect(claimEvidence[signal]["cursor-accept"])
+      .toMatchObject({ ok: true, head, acceptedPrefix: head, actualHead: head });
+    const result = await verify(key, async () => ({
+      ok: true, detail: "merged", headRefOid: head, mergeCommit: { oid: mergeSha },
+    }));
+    expect(result).toContain("VERIFIED_DONE");
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("verified-done");
+    db.close();
+  });
+
   it("resumes a deployment row left in deploying after process restart", async () => {
     const db = prLoopDb({ key: "PRLOOP-DEPLOY-RECOVERY", done: signal, status: "verified-done" });
     db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,merge_sha,updated_at)
@@ -1412,6 +1532,221 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
       .toBe("deployed");
     db.close();
+  });
+
+  it("keeps an exit-zero merge pending until GitHub reports MERGED", async () => {
+    const db = prLoopDb({ key: "PRLOOP-MERGE-PENDING", done: signal });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,verdict_ts,updated_at)
+      VALUES('owner/repo','52',?,'PRLOOP-MERGE-PENDING','accepted','ACCEPT','101','1')`).run(head);
+    let mergeCalls = 0;
+    let viewCalls = 0;
+    let merged = false;
+    const runCommand = async (argv) => {
+      if (argv[1] === "pr" && argv[2] === "merge") {
+        mergeCalls++;
+        if (mergeCalls > 1) merged = true;
+        return { exitCode: 0, stdout: "" };
+      }
+      if (argv[1] === "pr" && argv[2] === "view") {
+        viewCalls++;
+        const pending = mergeCalls === 1 && viewCalls >= 4;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            state: merged ? "MERGED" : "OPEN", isDraft: false, headRefOid: head,
+            mergeCommit: merged ? { oid: mergeSha } : null,
+          }),
+        };
+      }
+      throw new Error(`unexpected command ${argv.join(" ")}`);
+    };
+    const first = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      runCommand, fetchReplies: async () => [],
+    });
+    expect(first.some((event) => event.startsWith("FLEET_PR_MERGE_PENDING PRLOOP-MERGE-PENDING"))).toBe(true);
+    expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("merge-pending");
+
+    const second = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      runCommand, fetchReplies: async () => [],
+    });
+    expect(mergeCalls).toBe(2);
+    expect(second).toContain(`FLEET_PR_MERGED PRLOOP-MERGE-PENDING ${signal} head=${head} merge_sha=${mergeSha}`);
+    expect(db.query("SELECT state,merge_sha FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head))
+      .toEqual({ state: "merged-no-deploy", merge_sha: mergeSha });
+    db.close();
+  });
+
+  it("keeps the watch result recoverable when an auto-merge PR lookup fails", async () => {
+    const db = prLoopDb({ key: "PRLOOP-LOOKUP-FAIL", done: signal });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,verdict_ts,updated_at)
+      VALUES('owner/repo','52',?,'PRLOOP-LOOKUP-FAIL','accepted','ACCEPT','101','1')`).run(head);
+    const events = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      fetchReplies: async () => [],
+      runCommand: async () => ({ exitCode: 1, stdout: "" }),
+    });
+    expect(events).toEqual([]);
+    expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("accepted");
+    db.close();
+  });
+
+  it("does not merge sibling PRs after another PR for the same task is rejected", async () => {
+    const secondSignal = "pr:other/repo#53";
+    const secondHead = "ffffffffffffffffffffffffffffffffffffffff";
+    const key = "PRLOOP-SIBLING-REJECT";
+    const db = prLoopDb({ key, done: `${signal};${secondSignal}` });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,verdict_ts,updated_at)
+      VALUES('owner/repo','52',?,?,'accepted','ACCEPT','100','1')`).run(head, key);
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,updated_at)
+      VALUES('other/repo','53',?,?,'awaiting-review','99','1')`).run(secondHead, key);
+    let mergeCalls = 0;
+    const sent = [];
+    const events = await processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      fetchReplies: async () => [{
+        ts: "101", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW",
+        text: `REJECT other/repo#53 head=${secondHead} needs changes`,
+      }],
+      runCommand: async (argv) => {
+        if (argv[1] === "pr" && argv[2] === "merge") mergeCalls++;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            state: "OPEN", isDraft: false, headRefOid: argv.includes("53") ? secondHead : head,
+            body: "Tests: bun test fleet/",
+          }),
+        };
+      },
+      sendFollowup: async (_pane, text) => { sent.push(text); return true; },
+    });
+    expect(mergeCalls).toBe(0);
+    expect(sent).toHaveLength(1);
+    expect(events).toContain(`FLEET_PR_REJECT_FOLLOWUP ${key} ${secondSignal} head=${secondHead}`);
+    expect(db.query("SELECT state FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("accepted");
+    db.close();
+  });
+
+  it("uses database leases to prevent overlapping watch instances from repeating a deployment", async () => {
+    const original = process.env.HOME;
+    let secondWorker;
+    try {
+      process.env.HOME = unitHome;
+      secondWorker = await import(`./fleet.mjs?worker=${crypto.randomUUID()}`);
+    } finally {
+      if (original === undefined) delete process.env.HOME;
+      else process.env.HOME = original;
+    }
+    const db = prLoopDb({ key: "PRLOOP-DEPLOY-LEASE", done: signal, status: "verified-done" });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,merge_sha,updated_at)
+      VALUES('owner/repo','52',?,'PRLOOP-DEPLOY-LEASE','merged',?,'1')`).run(head, mergeSha);
+    const started = deferred();
+    const release = deferred();
+    const finished = deferred();
+    let firstRuns = 0;
+    let secondRuns = 0;
+    const deployConfig = {
+      ...config,
+      deploy: { "owner/repo": { argv: ["./deploy.sh"], healthUrl: "https://service.example/version" } },
+    };
+    const firstCycle = processPrLoopEvents(db, deployConfig, {
+      getMainSha: async () => mergeSha,
+      runDeploy: async () => { firstRuns++; started.resolve(); return release.promise; },
+      checkHealth: async () => ({ status: 200, mergeSha }),
+      onDeploySettled: finished.resolve,
+    });
+    try {
+      expect((await settlesWithin(started.promise)).settled).toBe(true);
+      expect((await settlesWithin(firstCycle)).settled).toBe(true);
+      const secondCycle = await secondWorker.processPrLoopEvents(db, deployConfig, {
+        getMainSha: async () => mergeSha,
+        runDeploy: async () => { secondRuns++; return { exitCode: 0 }; },
+        checkHealth: async () => ({ status: 200, mergeSha }),
+      });
+      expect(secondCycle).toEqual([]);
+      expect(firstRuns).toBe(1);
+      expect(secondRuns).toBe(0);
+      expect(db.query("SELECT state,deploy_lease_until FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+        .toBe("deploying");
+    } finally {
+      release.resolve({ exitCode: 0 });
+    }
+    expect((await settlesWithin(finished.promise)).settled).toBe(true);
+    expect(db.query("SELECT state,deploy_lease_token,deploy_lease_until FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head))
+      .toEqual({ state: "deployed", deploy_lease_token: null, deploy_lease_until: null });
+    db.close();
+  });
+
+  it("uses a database lease to prevent overlapping watch instances from merging twice", async () => {
+    const original = process.env.HOME;
+    let secondWorker;
+    try {
+      process.env.HOME = unitHome;
+      secondWorker = await import(`./fleet.mjs?merge-worker=${crypto.randomUUID()}`);
+    } finally {
+      if (original === undefined) delete process.env.HOME;
+      else process.env.HOME = original;
+    }
+    const db = prLoopDb({ key: "PRLOOP-MERGE-LEASE", done: signal });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,verdict_ts,updated_at)
+      VALUES('owner/repo','52',?,'PRLOOP-MERGE-LEASE','accepted','ACCEPT','101','1')`).run(head);
+    const mergeLookup = deferred();
+    const releaseLookup = deferred();
+    let viewCalls = 0;
+    let merged = false;
+    let mergeCalls = 0;
+    const firstCycle = processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      fetchReplies: async () => [],
+      runCommand: async (argv) => {
+        if (argv[1] === "pr" && argv[2] === "view") {
+          viewCalls++;
+          if (viewCalls === 3) {
+            mergeLookup.resolve();
+            await releaseLookup.promise;
+          }
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              state: merged ? "MERGED" : "OPEN", isDraft: false, headRefOid: head,
+              mergeCommit: merged ? { oid: mergeSha } : null,
+            }),
+          };
+        }
+        if (argv[1] === "pr" && argv[2] === "merge") {
+          mergeCalls++;
+          merged = true;
+          return { exitCode: 0, stdout: "" };
+        }
+        throw new Error(`unexpected command ${argv.join(" ")}`);
+      },
+    });
+    expect((await settlesWithin(mergeLookup.promise)).settled).toBe(true);
+    let secondMergeCalls = 0;
+    const secondCycle = await secondWorker.processPrLoopEvents(db, { ...config, autoMerge: true }, {
+      fetchReplies: async () => [],
+      runCommand: async (argv) => {
+        if (argv[1] === "pr" && argv[2] === "merge") secondMergeCalls++;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head }),
+        };
+      },
+    });
+    expect(secondCycle).toEqual([]);
+    expect(secondMergeCalls).toBe(0);
+    expect(db.query("SELECT state,merge_lease_until FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+      .toBe("merging");
+    releaseLookup.resolve();
+    expect((await settlesWithin(firstCycle)).settled).toBe(true);
+    expect(mergeCalls).toBe(1);
+    expect(db.query("SELECT state,merge_lease_token,merge_lease_until FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head))
+      .toEqual({ state: "merged-no-deploy", merge_lease_token: null, merge_lease_until: null });
+    db.close();
+  });
+
+  it("does not count a Test Plan entry that says not run", () => {
+    expect(hasListedTests("## Test Plan\n- Not run (environment unavailable)\n")).toBe(false);
+    expect(hasListedTests("## Tests\n- bun test fleet/\n")).toBe(true);
   });
 });
 
