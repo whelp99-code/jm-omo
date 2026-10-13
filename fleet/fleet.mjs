@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS fleet_review_requests(ts TEXT PRIMARY KEY, channel TE
 CREATE TABLE IF NOT EXISTS fleet_pr_loop(
   repo TEXT NOT NULL, pr_number TEXT NOT NULL, head TEXT NOT NULL, task_key TEXT NOT NULL,
   state TEXT NOT NULL, request_ts TEXT, verdict TEXT, verdict_ts TEXT, merge_sha TEXT, merge_pending_since TEXT,
-  merge_lease_token TEXT, merge_lease_until TEXT, deploy_lease_token TEXT, deploy_lease_until TEXT,
+  post_lease_token TEXT, post_lease_until TEXT, merge_lease_token TEXT, merge_lease_until TEXT,
+  deploy_lease_token TEXT, deploy_lease_until TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(repo,pr_number,head)
 );`);
@@ -50,6 +51,8 @@ export function migrateFleetColumns(dbHandle) {
     addMissing("fleet_pr_loop", [
       ["verdict", "TEXT"],
       ["merge_pending_since", "TEXT"],
+      ["post_lease_token", "TEXT"],
+      ["post_lease_until", "TEXT"],
       ["merge_lease_token", "TEXT"],
       ["merge_lease_until", "TEXT"],
       ["deploy_lease_token", "TEXT"],
@@ -1509,9 +1512,25 @@ function readPrLoopClaimedHead(task, signal, currentHead) {
 }
 
 function reservePrLoopRequest(dbHandle, info, taskKey) {
-  return dbHandle.transaction(() => dbHandle.query(`INSERT OR IGNORE INTO fleet_pr_loop
-    (repo,pr_number,head,task_key,state,updated_at) VALUES(?,?,?,?,'posting',?)`)
-    .run(info.repo, info.prNumber, info.headRefOid.toLowerCase(), taskKey, now()).changes === 1).immediate();
+  const token = crypto.randomUUID();
+  const leaseUntil = new Date(Date.now() + 30_000).toISOString();
+  const claimed = dbHandle.transaction(() => dbHandle.query(`INSERT OR IGNORE INTO fleet_pr_loop
+    (repo,pr_number,head,task_key,state,post_lease_token,post_lease_until,updated_at)
+    VALUES(?,?,?,?,'posting',?,?,?)`)
+    .run(info.repo, info.prNumber, info.headRefOid.toLowerCase(), taskKey, token, leaseUntil, now()).changes === 1).immediate();
+  return claimed ? token : null;
+}
+
+function claimPrLoopReviewPost(dbHandle, row) {
+  const token = crypto.randomUUID();
+  const claimNow = now();
+  const leaseUntil = new Date(Date.now() + 30_000).toISOString();
+  const claimed = dbHandle.transaction(() => dbHandle.query(`UPDATE fleet_pr_loop
+    SET state='posting',post_lease_token=?,post_lease_until=?,updated_at=?
+    WHERE repo=? AND pr_number=? AND head=?
+      AND (state='post-failed' OR (state='posting' AND (post_lease_until IS NULL OR post_lease_until<=?)))`)
+    .run(token, leaseUntil, claimNow, row.repo, row.pr_number, row.head, claimNow).changes === 1).immediate();
+  return claimed ? token : null;
 }
 
 function buildPrLoopReviewRequest(repo, prNumber, url, head) {
@@ -1534,7 +1553,8 @@ async function postPrLoopRequest(dbHandle, task, info, config, postMessage, even
       `claimed=${claimedHead ?? "missing"} actual=${readyInfo.headRefOid ?? "missing"}`);
     return false;
   }
-  if (!reservePrLoopRequest(dbHandle, readyInfo, task.key)) return true;
+  const postToken = reservePrLoopRequest(dbHandle, readyInfo, task.key);
+  if (!postToken) return true;
   const signal = `pr:${readyInfo.repo}#${readyInfo.prNumber}`;
   const url = readyInfo.url || `https://github.com/${readyInfo.repo}/pull/${readyInfo.prNumber}`;
   const text = buildPrLoopReviewRequest(readyInfo.repo, readyInfo.prNumber, url, claimedHead).text;
@@ -1542,13 +1562,15 @@ async function postPrLoopRequest(dbHandle, task, info, config, postMessage, even
     const posted = await postMessage(config.reviewChannel, config.reviewThreadTs, text);
     if (posted?.ok !== true || !posted.ts) throw new Error(posted?.error || "Slack post returned no timestamp");
     dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-      .run(String(posted.ts), now(), readyInfo.repo, readyInfo.prNumber, claimedHead);
+      ,post_lease_token=NULL,post_lease_until=NULL
+      WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+      .run(String(posted.ts), now(), readyInfo.repo, readyInfo.prNumber, claimedHead, postToken);
     events.push(`FLEET_PR_REVIEW_REQUESTED ${task.key} ${signal} head=${claimedHead} request_ts=${posted.ts}`);
   } catch (error) {
     dbHandle.query(`UPDATE fleet_pr_loop SET state='post-failed',updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-      .run(now(), readyInfo.repo, readyInfo.prNumber, claimedHead);
+      ,post_lease_token=NULL,post_lease_until=NULL
+      WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+      .run(now(), readyInfo.repo, readyInfo.prNumber, claimedHead, postToken);
     fleetError("PR_LOOP_POST", `task=${task.key} signal=${signal}`, error);
   }
   return true;
@@ -1570,23 +1592,23 @@ function existingPrLoopRequestTs(replies, row, threadTs) {
 async function retryPrLoopReviewPost(dbHandle, row, info, config, postMessage, events, runCommand) {
   const readyInfo = await ensurePrLoopReady(info, `pr:${row.repo}#${row.pr_number}`, runCommand);
   if (!readyInfo) return false;
-  const claimed = dbHandle.query(`UPDATE fleet_pr_loop SET state='posting',updated_at=?
-    WHERE repo=? AND pr_number=? AND head=? AND state IN ('posting','post-failed')`)
-    .run(now(), row.repo, row.pr_number, row.head).changes === 1;
-  if (!claimed) return false;
+  const postToken = claimPrLoopReviewPost(dbHandle, row);
+  if (!postToken) return false;
   const url = readyInfo.url || `https://github.com/${row.repo}/pull/${row.pr_number}`;
   const text = buildPrLoopReviewRequest(row.repo, row.pr_number, url, row.head).text;
   try {
     const posted = await postMessage(config.reviewChannel, config.reviewThreadTs, text);
     if (posted?.ok !== true || !posted.ts) throw new Error(posted?.error || "Slack post returned no timestamp");
     dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-      .run(String(posted.ts), now(), row.repo, row.pr_number, row.head);
+      ,post_lease_token=NULL,post_lease_until=NULL
+      WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+      .run(String(posted.ts), now(), row.repo, row.pr_number, row.head, postToken);
     events.push(`FLEET_PR_REVIEW_REQUESTED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} request_ts=${posted.ts}`);
   } catch (error) {
     dbHandle.query(`UPDATE fleet_pr_loop SET state='post-failed',updated_at=?
-      WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-      .run(now(), row.repo, row.pr_number, row.head);
+      ,post_lease_token=NULL,post_lease_until=NULL
+      WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+      .run(now(), row.repo, row.pr_number, row.head, postToken);
     fleetError("PR_LOOP_POST", `task=${row.task_key} signal=pr:${row.repo}#${row.pr_number}`, error);
   }
   return true;
@@ -1951,23 +1973,21 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         }
         info = await ensurePrLoopReady(info, signal, runCommand);
         if (!info) continue;
-        const reserved = dbHandle.transaction(() => dbHandle.query(`INSERT OR IGNORE INTO fleet_pr_loop
-          (repo,pr_number,head,task_key,state,updated_at) VALUES(?,?,?,?,'posting',?)`)
-          .run(repo, prNumber, claimedHead, task.key, now()).changes === 1).immediate();
-        if (reserved) {
+        const postToken = reservePrLoopRequest(dbHandle, info, task.key);
+        if (postToken) {
           const url = info.url || `https://github.com/${repo}/pull/${prNumber}`;
           const text = buildPrLoopReviewRequest(repo, prNumber, url, claimedHead).text;
           try {
             const posted = await postMessage(config.reviewChannel, config.reviewThreadTs, text);
             if (posted?.ok !== true || !posted.ts) throw new Error(posted?.error || "Slack post returned no timestamp");
-            dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,updated_at=?
-              WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-              .run(String(posted.ts), now(), repo, prNumber, claimedHead);
+            dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,post_lease_token=NULL,post_lease_until=NULL,updated_at=?
+              WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+              .run(String(posted.ts), now(), repo, prNumber, claimedHead, postToken);
             events.push(`FLEET_PR_REVIEW_REQUESTED ${task.key} ${signal} head=${claimedHead} request_ts=${posted.ts}`);
           } catch (error) {
-            dbHandle.query(`UPDATE fleet_pr_loop SET state='post-failed',updated_at=?
-              WHERE repo=? AND pr_number=? AND head=? AND state='posting'`)
-              .run(now(), repo, prNumber, claimedHead);
+            dbHandle.query(`UPDATE fleet_pr_loop SET state='post-failed',post_lease_token=NULL,post_lease_until=NULL,updated_at=?
+              WHERE repo=? AND pr_number=? AND head=? AND state='posting' AND post_lease_token=?`)
+              .run(now(), repo, prNumber, claimedHead, postToken);
             fleetError("PR_LOOP_POST", `task=${task.key} signal=${signal}`, error);
           }
         }
@@ -1979,7 +1999,8 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
         if (!repliesAvailable) continue;
         const requestTs = existingPrLoopRequestTs(replies, row, config.reviewThreadTs);
         if (requestTs) {
-          dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,updated_at=?
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='awaiting-review',request_ts=?,
+            post_lease_token=NULL,post_lease_until=NULL,updated_at=?
             WHERE repo=? AND pr_number=? AND head=? AND state IN ('posting','post-failed')`)
             .run(requestTs, now(), row.repo, row.pr_number, row.head);
           events.push(`FLEET_PR_REVIEW_RECOVERED ${row.task_key} ${signal} head=${row.head} request_ts=${requestTs}`);

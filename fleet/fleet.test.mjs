@@ -34,7 +34,8 @@ function prLoopDb(task = null) {
   CREATE TABLE fleet_pr_loop(
     repo TEXT NOT NULL, pr_number TEXT NOT NULL, head TEXT NOT NULL, task_key TEXT NOT NULL,
     state TEXT NOT NULL, request_ts TEXT, verdict TEXT, verdict_ts TEXT, merge_sha TEXT, merge_pending_since TEXT,
-    merge_lease_token TEXT, merge_lease_until TEXT, deploy_lease_token TEXT, deploy_lease_until TEXT,
+    post_lease_token TEXT, post_lease_until TEXT, merge_lease_token TEXT, merge_lease_until TEXT,
+    deploy_lease_token TEXT, deploy_lease_until TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY(repo,pr_number,head)
   );`);
@@ -1157,7 +1158,7 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     );`);
     migrateFleetColumns(legacy);
     const columns = new Set(legacy.query("PRAGMA table_info(fleet_pr_loop)").all().map((column) => column.name));
-    expect(["verdict", "merge_pending_since", "merge_lease_token", "merge_lease_until", "deploy_lease_token", "deploy_lease_until"]
+    expect(["verdict", "merge_pending_since", "post_lease_token", "post_lease_until", "merge_lease_token", "merge_lease_until", "deploy_lease_token", "deploy_lease_until"]
       .every((column) => columns.has(column))).toBe(true);
     legacy.query("INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,verdict,updated_at) VALUES('owner/repo','52',?,'MIGRATED','accepted','ACCEPT','1')")
       .run(head);
@@ -1728,6 +1729,56 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     expect((await settlesWithin(finished.promise)).settled).toBe(true);
     expect(db.query("SELECT state,deploy_lease_token,deploy_lease_until FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head))
       .toEqual({ state: "deployed", deploy_lease_token: null, deploy_lease_until: null });
+    db.close();
+  });
+
+  it("claims a recovered review post once across overlapping watch instances", async () => {
+    const original = process.env.HOME;
+    let secondWorker;
+    try {
+      process.env.HOME = unitHome;
+      secondWorker = await import(`./fleet.mjs?post-worker=${crypto.randomUUID()}`);
+    } finally {
+      if (original === undefined) delete process.env.HOME;
+      else process.env.HOME = original;
+    }
+    const db = prLoopDb({ key: "PRLOOP-POST-LEASE", done: signal });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,updated_at)
+      VALUES('owner/repo','52',?,'PRLOOP-POST-LEASE','posting','1')`).run(head);
+    const started = deferred();
+    const release = deferred();
+    let firstPosts = 0;
+    let secondPosts = 0;
+    const firstCycle = processPrLoopEvents(db, config, {
+      runCommand: async () => prInfo(),
+      fetchReplies: async () => [],
+      postMessage: async () => {
+        firstPosts++;
+        started.resolve();
+        return release.promise;
+      },
+    });
+    try {
+      expect((await settlesWithin(started.promise)).settled).toBe(true);
+      const secondCycle = await secondWorker.processPrLoopEvents(db, config, {
+        runCommand: async () => prInfo(),
+        fetchReplies: async () => [],
+        postMessage: async () => {
+          secondPosts++;
+          return { ok: true, ts: "2026.202" };
+        },
+      });
+      expect(secondCycle).toEqual([]);
+      expect(firstPosts).toBe(1);
+      expect(secondPosts).toBe(0);
+      expect(db.query("SELECT state,post_lease_token FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head).state)
+        .toBe("posting");
+    } finally {
+      release.resolve({ ok: true, ts: "2026.201" });
+    }
+    expect((await settlesWithin(firstCycle)).settled).toBe(true);
+    expect(db.query("SELECT state,request_ts,post_lease_token,post_lease_until FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head))
+      .toEqual({ state: "awaiting-review", request_ts: "2026.201", post_lease_token: null, post_lease_until: null });
     db.close();
   });
 
