@@ -10,7 +10,7 @@ mkdirSync(STATE, { recursive: true });
 const db = new Database(`${STATE}/fleet.sqlite`);
 db.exec(`PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS cats(id TEXT PRIMARY KEY, name TEXT, role TEXT, kind TEXT, pane TEXT, product TEXT, state TEXT, model TEXT, task TEXT, last_seen TEXT, note TEXT);
-CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT, done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT, result TEXT, evidence TEXT, history TEXT DEFAULT '[]', depends_on TEXT, dispatch_type TEXT DEFAULT 'impl', keep_model INTEGER DEFAULT 0, completion_claimed INTEGER NOT NULL DEFAULT 0, send_attempted INTEGER NOT NULL DEFAULT 0, claim_evidence TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT, done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT, result TEXT, evidence TEXT, history TEXT DEFAULT '[]', depends_on TEXT, dispatch_type TEXT DEFAULT 'impl', keep_model INTEGER DEFAULT 0, completion_claimed INTEGER NOT NULL DEFAULT 0, send_attempted INTEGER NOT NULL DEFAULT 0, dispatch_attempt TEXT, claim_evidence TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS dispatch_reservations(pane TEXT PRIMARY KEY, key TEXT UNIQUE NOT NULL, attempt TEXT NOT NULL, reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, recovery_token TEXT, recovery_started_at TEXT);
 CREATE TABLE IF NOT EXISTS fleet_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -32,6 +32,7 @@ export function migrateFleetColumns(dbHandle) {
       ["keep_model", "INTEGER DEFAULT 0"],
       ["completion_claimed", "INTEGER NOT NULL DEFAULT 0"],
       ["send_attempted", "INTEGER NOT NULL DEFAULT 0"],
+      ["dispatch_attempt", "TEXT"],
       ["claim_evidence", "TEXT NOT NULL DEFAULT '{}'"],
     ]);
     addMissing("dispatch_reservations", [
@@ -69,13 +70,40 @@ export function migrateFleetColumns(dbHandle) {
 migrateFleetColumns(db);
 
 const now = () => new Date().toISOString();
+const reportedFleetErrors = new Set();
+function fleetError(kind, context, error) {
+  const message = String(error?.message ?? error ?? "unknown error").replace(/\s+/g, " ").slice(0, 120);
+  const line = `FLEET_${kind}_ERROR ${context} ${message || "unknown error"}`;
+  if (reportedFleetErrors.has(line)) return;
+  reportedFleetErrors.add(line);
+  console.log(line);
+}
+
 const sh = async (cmd) => (await Bun.$`bash -c ${cmd}`.nothrow().quiet()).stdout.toString();
 const read = (pane) => sh(`herdr pane read ${pane} --source visible --format text 2>/dev/null`);
 const readPaneResult = (pane) => executeSignalCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
 const ROUTES = JSON.parse(await Bun.file(new URL("./routes.json", import.meta.url)).text());
-const CURSOR_USER_ID = "U0B81F5GR6V";
-const SLACK_REVIEW_CHANNEL = "C0C6HJM0BV5";
-const REVIEW_REPLY_APP_ID = "A08SKDT6QUW";
+export function resolveFleetConfig(config, env = process.env) {
+  return {
+    ...config,
+    cats: config.cats.map((cat) => {
+      const envKey = `FLEET_CAT_${cat.id.replace(/[^a-z0-9]/gi, "_").toUpperCase()}_PANE`;
+      return { ...cat, pane: env[envKey] || cat.pane };
+    }),
+    slack: {
+      ...config.slack,
+      reviewChannel: env.FLEET_SLACK_REVIEW_CHANNEL || config.slack.reviewChannel,
+      cursorUserId: env.FLEET_CURSOR_USER_ID || config.slack.cursorUserId,
+      reviewReplyAppId: env.FLEET_REVIEW_REPLY_APP_ID || config.slack.reviewReplyAppId,
+    },
+    agentMessengerCredentialPath: env.FLEET_AGENT_MESSENGER_CREDENTIAL_PATH
+      || config.agentMessengerCredentialPath,
+  };
+}
+const CONFIG = resolveFleetConfig(JSON.parse(await Bun.file(new URL("./fleet.config.json", import.meta.url)).text()));
+const CURSOR_USER_ID = CONFIG.slack.cursorUserId;
+const SLACK_REVIEW_CHANNEL = CONFIG.slack.reviewChannel;
+const REVIEW_REPLY_APP_ID = CONFIG.slack.reviewReplyAppId;
 const REVIEW_STALL_MS = 45 * 60 * 1000;
 const USAGE_ALERT_THRESHOLDS = { anthropic: 60, "chatgpt-subscription": 80 };
 const DISPATCH_RESERVATION_TTL_MS = 2 * 60_000;
@@ -87,19 +115,12 @@ function isQuestionStatusLine(line) {
   return /^\s*(?:Question pending|Unanswered)\s*$/i.test(String(line ?? ""));
 }
 
-const CATS = [
-  ["omonyang", "오모냥", "대장: 계획·배분·확인", "captain", "w3:p2", "-"],
-  ["nahee", "나희", "부대장: 대장 대행, 지원", "vice", "-", "-"],
-  ["seoyun", "서윤", "감시·Cursor 검수 전달", "bot", "-", "-"],
-  ["cursor", "Cursor 봇", "독립 검수(ACCEPT/REVISE)", "bot", "-", "-"],
-  ["gajae", "가재", "서버 이전·인프라 실행", "bot", "w2:p1", "-"],
-  ["jarvis", "JARVIS 냥", "JARVIS 개발", "pane", "-", "Orca-JARVIS"],
-  ["sb", "SB 냥", "Second Brain 개발", "pane", "-", "second-brain-app"],
-  ["crm", "CRM 냥", "CRM(core5) 개발", "pane", "-", "ai-crm-project-manager"],
-  ["price", "Price 냥", "Price 개발", "pane", "-", "price-ai-tax"],
-  ["mail", "Mail 냥", "Mail 개발", "pane", "-", "mail-intelligence"],
-  ["jarvis2", "JARVIS 보조 냥", "JARVIS 보조(압축 문제로 휴식)", "pane", "-", "Orca-JARVIS"],
-];
+const CATS = CONFIG.cats.map(({ id, name, role, kind, pane, product }) => [id, name, role, kind, pane, product]);
+const CONFIGURED_CAT_PANES = new Map(CONFIG.cats.map(({ id, pane }) => [id, pane]));
+
+export function configuredCatPane(catId, fallback = null) {
+  return CONFIGURED_CAT_PANES.get(catId) ?? fallback;
+}
 
 export function classify(screen) {
   const L = screen.split("\n");
@@ -116,6 +137,9 @@ export function classify(screen) {
   const output = responseBlock(screen);
   const done = [...output.matchAll(/^\s*(?:[•●⏺✻]\s*)?(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b([^\n]*)$/gm)]
     .filter((m) => !/[<]|또는|<숫자/.test(m[0])).at(-1);
+  const completionTail = done ? `${done[3]}${output.slice(done.index + done[0].length)}`
+    .split(/\n(?:[ \t]*\n|[ \t]*(?:[•●⏺✻]|TASK-[A-Z0-9-]+_(?:DONE|BLOCKED)\b|Working \())/, 1)[0] : "";
+  const completion = completionTail.match(/^\s*attempt=\s*((?:[a-f0-9-]\s*){35}[a-f0-9-])(?:\s+|$)([\s\S]*)$/i);
   const ready = [...output.matchAll(/\b([A-Za-z0-9_.-]+) PR READY head=([0-9a-f]{7,40})\b/gi)].at(-1);
   // Result lines wrap in narrow panes: also look at the latest output block.
   const joined = output.split("\n").slice(-40).map((l) => l.trim()).join(" ");
@@ -126,10 +150,29 @@ export function classify(screen) {
     const screenLines = screen.replace(/\r/g, "").split("\n");
     const marker = screenLines.findLastIndex(isQuestionStatusLine);
     const prompt = screenLines.findLastIndex((line) => /^\s*❯/.test(line));
-    if (marker >= 0) questionText = screenLines.slice(marker + 1, prompt >= marker ? prompt : undefined).join("\n").trim().slice(-800);
-    else questionText = output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3).join("\n").trim().slice(-800);
+    const questionLines = marker >= 0
+      ? screenLines.slice(marker + 1, prompt >= marker ? prompt : undefined)
+      : output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3);
+    questionText = questionLines.map((line) => line.trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(-800);
   }
-  return { state, model, done: done ? { key: done[1], kind: done[2], text: done[3].trim().slice(0, 200) } : null, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
+  return { state, model, done: done ? { key: done[1], kind: done[2], attempt: completion?.[1].replace(/\s/g, "") ?? null, text: (completion?.[2] ?? done[3]).replace(/\s*\n\s*/g, " ").trim().slice(0, 200) } : null, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
+}
+
+export function completionBelongsToDispatchAttempt(task, marker) {
+  if (!task || ["closed", "done-claimed", "verified-done"].includes(task.status) || task.completion_claimed) return false;
+  if (task.key && marker?.key !== task.key) return false;
+  const history = JSON.parse(task.history || "[]");
+  if (!task.dispatch_attempt) {
+    const sentAt = Date.parse(task.sent_at ?? "");
+    if (!Number.isFinite(sentAt) || marker?.attempt) return false;
+    if (task.send_attempted)
+      return ["dispatching", "sent-unconfirmed", "send-failed-unconfirmed", "working"].includes(task.status);
+    if (!["tracked-unconfirmed", "working"].includes(task.status)) return false;
+    const tracked = history.findLast((event) => event.ev === "tracked");
+    const trackAt = Date.parse(tracked?.at ?? task.sent_at ?? "");
+    return Number.isFinite(trackAt) && sentAt >= trackAt;
+  }
+  return marker?.attempt === task.dispatch_attempt && Boolean(task.send_attempted);
 }
 
 function responseBlock(screen) {
@@ -144,18 +187,20 @@ function responseBlock(screen) {
     return response < 0 ? "" : visibleLines.slice(response).join("\n").trimEnd();
   }
   const visible = visibleLines.join("\n").trimEnd();
-  return visible.split(/\n[ \t]*\n/).filter((block) => block.trim()).at(-1) ?? "";
+  return visible.split(/\n[ \t]*\n/)
+    .filter((block) => block.trim() && !/^\s*(?:TPS [\d.]+ tok\/s\b|[─━]+\s*$)/.test(block))
+    .at(-1) ?? "";
 }
 
 const QUESTION_POLICIES = [
   {
     id: "personal-credentials-defer",
-    matches: /(?:재민|jae[\s-]?min)[\s\S]{0,60}(?:비밀번호|password|otp)|(?:비밀번호|password|otp)[\s\S]{0,60}(?:재민|jae[\s-]?min)/i,
+    matches: /^\s*(?:May I use|Can I use) Jaemin's password or OTP now\?\s*$/i,
     answer: "재민의 비밀번호나 OTP는 사용하지 말고 내일로 미뤄.",
   },
   {
     id: "production-auth-prohibited",
-    matches: /(?:운영|production)[\s\S]{0,40}(?:인증|auth(?:entication)?)[\s\S]{0,40}(?:계정|account)|(?:계정|account)[\s\S]{0,40}(?:운영|production)[\s\S]{0,40}(?:인증|auth(?:entication)?)/i,
+    matches: /^\s*(?:Should we use|May I use) the production auth account\?\s*$/i,
     answer: "운영 인증 계정은 사용하지 마.",
   },
 ];
@@ -233,10 +278,75 @@ function log(task, ev) {
 
 export function markTaskBlocked(key, result) {
   return db.transaction(() => {
+    const task = db.query("SELECT status FROM tasks WHERE key=?").get(key);
+    if (["verified-done", "closed"].includes(task?.status)) return false;
     db.query("UPDATE tasks SET status='blocked',result=? WHERE key=?").run(result, key);
     db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
     appendHistoryInTransaction(db, key, { ev: "blocked", text: result });
   }).immediate();
+}
+
+export async function markTaskClosed(key, reason, runCommand = executeSignalCommand) {
+  const detail = String(reason ?? "").trim();
+  if (!detail) return `FLEET_TASK_CLOSE_ERROR ${key || "-"} reason_required`;
+  const current = db.query("SELECT t.status,t.cat,c.pane FROM tasks t LEFT JOIN cats c ON c.id=t.cat WHERE t.key=?").get(key);
+  if (!current) return `FLEET_TASK_CLOSE_ERROR ${key} task_not_found`;
+  if (current.status === "verified-done") return `FLEET_TASK_CLOSE_HOLD ${key} already_verified`;
+  if (current.status === "closed") return `FLEET_TASK_CLOSE_HOLD ${key} already_closed`;
+  let closeReservation = null;
+  let closeToken = null;
+  const releaseCloseClaim = () => {
+    if (closeReservation && closeToken) releaseReservationRecovery(db, closeReservation, closeToken);
+  };
+  if (["dispatching", "sent-unconfirmed", "send-failed-unconfirmed"].includes(current.status)) {
+    closeReservation = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key=?").get(key) ?? null;
+    const pane = closeReservation?.pane ?? configuredCatPane(current.cat, current.pane);
+    if (!pane || pane === "-") return `FLEET_TASK_CLOSE_ERROR ${key} pane_unavailable`;
+    if (closeReservation) {
+      closeToken = crypto.randomUUID();
+      const claimed = db.query(`UPDATE dispatch_reservations SET recovery_token=?,recovery_started_at=?
+        WHERE pane=? AND key=? AND attempt=? AND recovery_token IS NULL`)
+        .run(closeToken, now(), closeReservation.pane, key, closeReservation.attempt).changes;
+      if (!claimed) return `FLEET_TASK_CLOSE_ERROR ${key} reservation_busy`;
+    }
+    let screen;
+    try {
+      screen = await runCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
+    } catch {
+      releaseCloseClaim();
+      return `FLEET_TASK_CLOSE_ERROR ${key} pane_read_failed`;
+    }
+    if (screen.exitCode !== 0 || !screen.stdout.trim()
+      || !["idle", "model-picker"].includes(classify(screen.stdout).state)) {
+      releaseCloseClaim();
+      return `FLEET_TASK_CLOSE_ERROR ${key} pane_not_safe_to_clear`;
+    }
+    if (!await clearPaneInput(pane, runCommand)) {
+      releaseCloseClaim();
+      return `FLEET_TASK_CLOSE_ERROR ${key} input_cleanup_unverified`;
+    }
+  }
+  const result = db.transaction(() => {
+    const task = db.query("SELECT status FROM tasks WHERE key=?").get(key);
+    if (!task) return `FLEET_TASK_CLOSE_ERROR ${key} task_not_found`;
+    if (task.status === "verified-done") return `FLEET_TASK_CLOSE_HOLD ${key} already_verified`;
+    if (task.status === "closed") return `FLEET_TASK_CLOSE_HOLD ${key} already_closed`;
+    if (closeReservation && closeToken) {
+      const removed = db.query(`DELETE FROM dispatch_reservations
+        WHERE pane=? AND key=? AND attempt=? AND recovery_token=?`)
+        .run(closeReservation.pane, key, closeReservation.attempt, closeToken).changes;
+      if (!removed) return `FLEET_TASK_CLOSE_ERROR ${key} reservation_changed`;
+      closeReservation = null;
+      closeToken = null;
+    }
+    db.query("UPDATE tasks SET status='closed',result=?,ended_at=? WHERE key=?").run(detail, now(), key);
+    if (!closeToken) db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
+    db.query("UPDATE cats SET task=NULL WHERE task=?").run(key);
+    appendHistoryInTransaction(db, key, { ev: "closed", reason: detail });
+    return `FLEET_TASK_CLOSED ${key} reason=${detail}`;
+  }).immediate();
+  releaseCloseClaim();
+  return result;
 }
 
 export function markTaskPromptLost(key, attempt) {
@@ -252,8 +362,9 @@ export function recordDispatchSendAttempt(dbHandle, pane, key, attempt) {
     const reservation = dbHandle.query("SELECT key,attempt,recovery_token FROM dispatch_reservations WHERE pane=?").get(pane);
     const task = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(key);
     if (reservation?.key !== key || reservation.attempt !== attempt || reservation.recovery_token || task?.status !== "dispatching") return false;
-    dbHandle.query("UPDATE tasks SET send_attempted=1 WHERE key=? AND status='dispatching'").run(key);
-    appendHistoryInTransaction(dbHandle, key, { ev: "send-attempted", attempt });
+    const sentAt = now();
+    dbHandle.query("UPDATE tasks SET send_attempted=1,sent_at=? WHERE key=? AND status='dispatching'").run(sentAt, key);
+    appendHistoryInTransaction(dbHandle, key, { ev: "send-attempted", attempt, at: sentAt });
     return true;
   }).immediate();
 }
@@ -265,7 +376,7 @@ export function claimExpiredReservationRecovery(dbHandle, reservation, nowMs = D
       FROM dispatch_reservations WHERE pane=? AND key=? AND attempt=?`).get(reservation.pane, reservation.key, reservation.attempt);
     if (!current || current.reserved_at !== reservation.reserved_at) return null;
     const task = dbHandle.query("SELECT status,send_attempted FROM tasks WHERE key=?").get(reservation.key);
-    if (task?.status !== "dispatching" || task.send_attempted) return null;
+    if (!["dispatching", "dispatch-error"].includes(task?.status) || task.send_attempted) return null;
     const reservedAt = Date.parse(current.reserved_at);
     if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) return null;
     const recoveryStartedAt = Date.parse(current.recovery_started_at || "");
@@ -286,7 +397,7 @@ export function claimPickerRecoveryImmediatelyBeforeEscape(dbHandle, reservation
       WHERE pane=? AND key=? AND attempt=?`).get(reservation.pane, reservation.key, reservation.attempt);
     if (!current || current.reserved_at !== reservation.reserved_at) return null;
     const task = dbHandle.query("SELECT status,send_attempted FROM tasks WHERE key=?").get(reservation.key);
-    if (task?.status !== "dispatching") return null;
+    if (!["dispatching", "dispatch-error"].includes(task?.status)) return null;
     const reservedAt = Date.parse(current.reserved_at);
     if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) return null;
     const recoveryStartedAt = Date.parse(current.recovery_started_at || "");
@@ -308,7 +419,7 @@ export function reservationLeaseExpiredAndOwned(dbHandle, reservation, nowMs = D
       WHERE pane=? AND key=? AND attempt=?`).get(reservation.pane, reservation.key, reservation.attempt);
     if (!current || current.reserved_at !== reservation.reserved_at) return false;
     const task = dbHandle.query("SELECT status,send_attempted FROM tasks WHERE key=?").get(reservation.key);
-    if (!["dispatching", "send-failed-unconfirmed"].includes(task?.status)) return false;
+    if (!["dispatching", "dispatch-error", "send-failed-unconfirmed"].includes(task?.status)) return false;
     const reservedAt = Date.parse(current.reserved_at);
     if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) return false;
     const recoveryStartedAt = Date.parse(current.recovery_started_at || "");
@@ -349,7 +460,7 @@ export function reservationExpiredAndOwned(dbHandle, reservation, nowMs = Date.n
       WHERE pane=? AND key=? AND attempt=?`).get(reservation.pane, reservation.key, reservation.attempt);
     if (!current || current.reserved_at !== reservation.reserved_at) return false;
     const task = dbHandle.query("SELECT status,history,send_attempted FROM tasks WHERE key=?").get(reservation.key);
-    if (task?.status !== "dispatching") return false;
+    if (!["dispatching", "dispatch-error"].includes(task?.status)) return false;
     const reservedAt = Date.parse(current.reserved_at);
     if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) return false;
     const recoveryStartedAt = Date.parse(current.recovery_started_at || "");
@@ -368,14 +479,14 @@ export function recoverDispatchReservation(dbHandle, reservation, paneState, now
       if (current.recovery_token !== reservation.recoveryToken) return null;
     } else if (current.recovery_token) return null;
     const task = dbHandle.query("SELECT status,history,send_attempted FROM tasks WHERE key=?").get(reservation.key);
-    if (!["dispatching", "send-failed-unconfirmed"].includes(task?.status)) return null;
+    if (!["dispatching", "dispatch-error", "send-failed-unconfirmed"].includes(task?.status)) return null;
     const reservedAt = Date.parse(current.reserved_at);
     if (!Number.isFinite(reservedAt) || nowMs - reservedAt < DISPATCH_RESERVATION_TTL_MS) return null;
     const history = JSON.parse(task.history || "[]");
     const sendAttempted = Boolean(task.send_attempted) || history.some((event) => event.ev === "send-attempted" && event.attempt === reservation.attempt);
     if (paneState === "working" || paneState === "question" || paneState === "compacting" || paneState === "provider-error") {
       const status = sendAttempted ? "send-failed-unconfirmed" : "sent-unconfirmed";
-      const changed = dbHandle.query("UPDATE tasks SET status=? WHERE key=? AND status IN ('dispatching','send-failed-unconfirmed') AND status!=?")
+      const changed = dbHandle.query("UPDATE tasks SET status=? WHERE key=? AND status IN ('dispatching','dispatch-error','send-failed-unconfirmed') AND status!=?")
         .run(status, reservation.key, status).changes;
       if (changed) appendHistoryInTransaction(dbHandle, reservation.key, { ev: status, attempt: reservation.attempt });
       return null;
@@ -385,7 +496,7 @@ export function recoverDispatchReservation(dbHandle, reservation, paneState, now
         WHERE pane=? AND key=? AND attempt=? AND reserved_at=? AND recovery_token IS ?`)
         .run(reservation.pane, reservation.key, reservation.attempt, reservation.reserved_at, reservation.recoveryToken ?? null).changes;
       if (!deleted) return null;
-      dbHandle.query("UPDATE tasks SET status='prompt-lost' WHERE key=? AND status IN ('dispatching','send-failed-unconfirmed')").run(reservation.key);
+      dbHandle.query("UPDATE tasks SET status='prompt-lost' WHERE key=? AND status IN ('dispatching','dispatch-error','send-failed-unconfirmed')").run(reservation.key);
       appendHistoryInTransaction(dbHandle, reservation.key, { ev: "prompt-lost", attempt: reservation.attempt });
       return `FLEET_PROMPT_LOST ${reservation.key} pane=${reservation.pane} reservation_released`;
     }
@@ -395,7 +506,7 @@ export function recoverDispatchReservation(dbHandle, reservation, paneState, now
       WHERE pane=? AND key=? AND attempt=? AND reserved_at=? AND recovery_token IS ?`)
       .run(reservation.pane, reservation.key, reservation.attempt, reservation.reserved_at, reservation.recoveryToken ?? null).changes;
     if (!deleted) return null;
-    dbHandle.query("UPDATE tasks SET status='dispatch-interrupted',result='dispatch process stopped before confirming send' WHERE key=? AND status IN ('dispatching','send-failed-unconfirmed')").run(reservation.key);
+    dbHandle.query("UPDATE tasks SET status='dispatch-interrupted',result='dispatch process stopped before confirming send' WHERE key=? AND status IN ('dispatching','dispatch-error','send-failed-unconfirmed')").run(reservation.key);
     appendHistoryInTransaction(dbHandle, reservation.key, { ev: "dispatch-interrupted", attempt: reservation.attempt });
     return `FLEET_DISPATCH_INTERRUPTED ${reservation.key} pane=${reservation.pane} reservation_released`;
   }).immediate();
@@ -433,8 +544,8 @@ export async function reconcileFailedDispatch(dbHandle, reservation, paneRead, r
 
 export async function recoverInterruptedDispatches(dbHandle, paneRows, nowMs = Date.now(), runCommand = executeSignalCommand) {
   const paneStates = new Map(paneRows.map((row) => [row.id, row.state]));
-  const reservations = dbHandle.query(`SELECT r.pane,r.key,r.attempt,r.reserved_at,t.cat
-    FROM dispatch_reservations r JOIN tasks t ON t.key=r.key WHERE t.status IN ('dispatching','send-failed-unconfirmed')`).all();
+  const reservations = dbHandle.query(`SELECT r.pane,r.key,r.attempt,r.reserved_at,t.cat,t.status
+    FROM dispatch_reservations r JOIN tasks t ON t.key=r.key WHERE t.status IN ('dispatching','dispatch-error','send-failed-unconfirmed')`).all();
   const events = [];
   for (const reservation of reservations.filter((item) => paneStates.has(item.cat))) {
     let recoveryToken = null;
@@ -443,25 +554,17 @@ export async function recoverInterruptedDispatches(dbHandle, paneRows, nowMs = D
       if (initial.exitCode !== 0 || !initial.stdout.trim()) continue;
       const snapshot = classify(initial.stdout);
       let state = snapshot.state;
-      if (state === "idle" && snapshot.done?.key === reservation.key) continue;
-      if (state === "model-picker") {
+      if (state === "idle" && snapshot.done?.key === reservation.key && snapshot.done.attempt === reservation.attempt
+        && reservation.status !== "dispatch-error") continue;
+      if (state === "model-picker" || reservation.status === "dispatch-error") {
+        if (reservation.status === "dispatch-error" && !["idle", "model-picker"].includes(state)) continue;
         recoveryToken = claimPickerRecoveryImmediatelyBeforeEscape(dbHandle, reservation, nowMs);
         if (!recoveryToken) continue;
-        const escape = await runCommand(["herdr", "pane", "send-keys", reservation.pane, "Escape"]);
-        if (escape.exitCode !== 0) {
+        if (!await clearPaneInput(reservation.pane, runCommand)) {
           releaseReservationRecovery(dbHandle, reservation, recoveryToken);
           continue;
         }
-        const screen = await runCommand(["herdr", "pane", "read", reservation.pane, "--source", "visible", "--format", "text"]);
-        if (screen.exitCode !== 0 || !screen.stdout.trim()) {
-          releaseReservationRecovery(dbHandle, reservation, recoveryToken);
-          continue;
-        }
-        state = classify(screen.stdout).state;
-        if (state !== "idle") {
-          releaseReservationRecovery(dbHandle, reservation, recoveryToken);
-          continue;
-        }
+        state = "idle";
       }
       const current = dbHandle.query("SELECT reserved_at,recovery_token FROM dispatch_reservations WHERE pane=? AND key=? AND attempt=?")
         .get(reservation.pane, reservation.key, reservation.attempt);
@@ -505,13 +608,15 @@ async function init() {
 
 async function refresh() {
   const out = [];
-  for (const c of db.query("SELECT * FROM cats WHERE pane!='-'").all()) {
+  for (const c of db.query("SELECT * FROM cats").all()) {
+    const pane = configuredCatPane(c.id, c.pane);
+    if (pane === "-") continue;
     try {
-      const screen = await readPaneResult(c.pane);
+      const screen = await readPaneResult(pane);
       if (screen.exitCode !== 0 || !screen.stdout.trim()) throw new Error(`pane read failed: exit ${screen.exitCode}`);
       const s = classify(screen.stdout);
       db.query("UPDATE cats SET state=?, model=?, last_seen=? WHERE id=?").run(s.state, s.model, now(), c.id);
-      out.push({ ...c, ...s });
+      out.push({ ...c, pane, ...s });
     } catch (error) {
       console.log(`FLEET_REFRESH_ERROR ${c.id} ${error?.message ?? error}`);
       db.query("UPDATE cats SET state='unknown',model='' WHERE id=?").run(c.id);
@@ -521,7 +626,7 @@ async function refresh() {
   return out;
 }
 
-// Owner C0C6HJM0BV5:1791553182.735709: watch Claude/Codex usage so limits never stop development.
+// Owner via the configured review channel: watch Claude/Codex usage so limits never stop development.
 // Claude quota is shared with the captain, so cats only fall back to it while it is low.
 export function parseUsageTick(text) {
   const tick = String(text).split("\n").filter((line) => /\bUSAGE_TICK\b/.test(line)).at(-1);
@@ -548,7 +653,10 @@ export function usageLimitEvents(tick, previous = new Map()) {
 }
 
 async function usageTick() {
-  const usageText = await Bun.file(`${process.env.HOME}/.omo/omonyang/usage-watch.log`).text().catch(() => "");
+  const usageText = await Bun.file(`${process.env.HOME}/.omo/omonyang/usage-watch.log`).text().catch((error) => {
+    fleetError("USAGE_READ", "usage-watch.log", error);
+    return "";
+  });
   return parseUsageTick(usageText);
 }
 
@@ -567,39 +675,127 @@ async function pickModel(type) {
   return { ...ROUTES.cursorFallback, usage: u };
 }
 
-async function switchModel(pane, want) {
-  const before = classify(await read(pane)).model;
+function promptLineContains(screen, text) {
+  const input = String(screen).replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
+  return Boolean(input?.includes(text));
+}
+
+function promptLineIsEmpty(screen) {
+  const input = String(screen).replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
+  return Boolean(input && /^\s*❯\s*$/.test(input));
+}
+
+async function clearPaneInput(pane, runCommand = executeSignalCommand) {
+  const sendKey = async (key) => {
+    try {
+      return (await runCommand(
+        ["herdr", "pane", "send-keys", pane, key],
+        AbortSignal.timeout(1000),
+      )).exitCode === 0;
+    } catch (error) {
+      fleetError("PANE_CLEANUP", `pane=${pane} key=${key}`, error);
+      return false;
+    }
+  };
+  const escaped = await sendKey("Escape");
+  const cleared = await sendKey("ctrl+u");
+  const empty = await waitForPaneScreen(pane, promptLineIsEmpty, runCommand, 1000);
+  return escaped && cleared && Boolean(empty);
+}
+
+export async function waitForPaneScreen(pane, predicate, runCommand = executeSignalCommand, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const remaining = deadline - Date.now();
+    let result;
+    try {
+      result = await runCommand(
+        ["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"],
+        AbortSignal.timeout(Math.max(1, remaining)),
+      );
+    } catch (error) {
+      fleetError("PANE_WAIT", `pane=${pane}`, error);
+      return null;
+    }
+    if (result.exitCode === 0 && result.stdout.trim() && predicate(result.stdout)) return result.stdout;
+    if (Date.now() >= deadline) break;
+    await Bun.sleep(Math.max(0, Math.min(50, deadline - Date.now())));
+  }
+  return null;
+}
+
+export async function switchModel(pane, want, runCommand = executeSignalCommand, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  const initial = await runCommand(
+    ["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"],
+    AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+  );
+  if (initial.exitCode !== 0 || !initial.stdout.trim()) {
+    fleetError("MODEL_SWITCH_READ", `pane=${pane}`, `exit ${initial.exitCode}`);
+    return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (pane read failed)`;
+  }
+  const before = classify(initial.stdout).model;
   if (before.startsWith(want.model)) return `MODEL_OK ${want.model}`;
-  // Verified sequence: open the picker, wait for the catalog, type the bare model name, pick the first match.
-  await Bun.$`herdr pane send-text ${pane} /model`.nothrow().quiet();
-  await Bun.sleep(700);
-  await Bun.$`herdr pane send-keys ${pane} Enter`.nothrow().quiet();
-  await Bun.sleep(3500);
-  await Bun.$`herdr pane send-text ${pane} ${want.model}`.nothrow().quiet();
-  await Bun.sleep(1500);
-  const pick = await read(pane);
-  if (!new RegExp(`\u2192\\s+${want.model.replace(/\./g, "\\.")} \\[${want.provider}\\]`).test(pick)) {
-    await Bun.$`herdr pane send-keys ${pane} Escape`.nothrow().quiet();
-    return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (not first in picker)`;
+  const send = async (step, argv) => {
+    try {
+      const result = await runCommand(argv, AbortSignal.timeout(Math.max(1, deadline - Date.now())));
+      if (result.exitCode === 0) return true;
+      fleetError("MODEL_SWITCH_COMMAND", `pane=${pane} step=${step}`, `exit ${result.exitCode}`);
+      return false;
+    } catch (error) {
+      fleetError("MODEL_SWITCH_COMMAND", `pane=${pane} step=${step}`, error);
+      return false;
+    }
+  };
+  const wait = (predicate) => waitForPaneScreen(pane, predicate, runCommand, Math.max(0, deadline - Date.now()));
+  const timeout = (phase) => {
+    fleetError("MODEL_SWITCH_TIMEOUT", `pane=${pane} phase=${phase}`, "screen predicate not reached");
+    return `MODEL_SWITCH_TIMEOUT ${pane} phase=${phase}`;
+  };
+  const failCleanly = async (failure) => {
+    if (await clearPaneInput(pane, runCommand)) return failure;
+    fleetError("MODEL_SWITCH_CLEANUP", `pane=${pane}`, "input line empty state not verified");
+    return `MODEL_SWITCH_DIRTY ${pane} ${failure} cleanup-unverified`;
+  };
+  const timeoutAndClean = async (phase) => failCleanly(timeout(phase));
+  const commandFailure = (step) => `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (${step} failed)`;
+  if (!await send("open-picker", ["herdr", "pane", "send-text", pane, "/model"])) {
+    return failCleanly(commandFailure("picker command"));
   }
-  await Bun.$`herdr pane send-keys ${pane} Enter`.nothrow().quiet();
-  let after = "";
-  for (let i = 0; i < 8; i++) {
-    await Bun.sleep(2000);
-    after = classify(await read(pane)).model;
-    if (after.startsWith(want.model)) break;
+  if (!await wait((screen) => promptLineContains(screen, "/model"))) {
+    return timeoutAndClean("picker-open");
   }
-  if (!after.startsWith(want.model)) {
-    await Bun.$`herdr pane send-keys ${pane} Escape`.nothrow().quiet();
-    await Bun.sleep(300);
-    await Bun.$`herdr pane send-keys ${pane} ctrl+u`.nothrow().quiet();
-    return `MODEL_SWITCH_FAILED ${pane} want=${want.model} now=${after}`;
+  if (!await send("submit-picker-command", ["herdr", "pane", "send-keys", pane, "Enter"])) {
+    return failCleanly(commandFailure("picker submit"));
   }
-  if (want.thinking && !after.endsWith(`:${want.thinking}`)) {
-    await Bun.$`herdr pane send-text ${pane} ${`/thinking ${want.thinking}`}`.nothrow().quiet();
-    await Bun.sleep(700);
-    await Bun.$`herdr pane send-keys ${pane} Enter`.nothrow().quiet();
+  if (!await wait((screen) => classify(screen).state === "model-picker")) {
+    return timeoutAndClean("catalog");
   }
+  if (!await send("filter-model", ["herdr", "pane", "send-text", pane, want.model])) {
+    return failCleanly(commandFailure("model filter"));
+  }
+  const pick = await wait((screen) => screen.split(/\r?\n/).some((line) =>
+    line.includes(want.model) && line.includes(`[${want.provider}]`)));
+  if (!pick) {
+    return timeoutAndClean("model-row");
+  }
+  if (!await send("select-model", ["herdr", "pane", "send-keys", pane, "Enter"])) {
+    return failCleanly(commandFailure("model selection"));
+  }
+  let after = await wait((screen) => classify(screen).model.startsWith(want.model));
+  if (!after) return timeoutAndClean("model-change");
+  if (want.thinking && !classify(after).model.endsWith(`:${want.thinking}`)) {
+    if (!await send("set-thinking", ["herdr", "pane", "send-text", pane, `/thinking ${want.thinking}`])) {
+      return failCleanly(commandFailure("thinking command"));
+    }
+    if (!await wait((screen) => promptLineContains(screen, `/thinking ${want.thinking}`))) return timeoutAndClean("thinking-command");
+    if (!await send("submit-thinking", ["herdr", "pane", "send-keys", pane, "Enter"])) {
+      return failCleanly(commandFailure("thinking submit"));
+    }
+    after = await wait((screen) => classify(screen).model.endsWith(`:${want.thinking}`));
+    if (!after) return timeoutAndClean("thinking-change");
+  }
+  if (!await wait(promptLineIsEmpty)) return timeoutAndClean("input-clear");
   return `MODEL_SWITCHED ${before} -> ${want.provider}/${want.model}`;
 }
 
@@ -608,7 +804,10 @@ export async function fetchSlackThreadReplies(roots, fetchThread, signal, concur
   for (let offset = 0; offset < roots.length; offset += concurrency) {
     if (signal.aborted) return null;
     const batch = await Promise.all(roots.slice(offset, offset + concurrency).map(async (root) => {
-      try { return await fetchThread(root, signal); } catch { return null; }
+      try { return await fetchThread(root, signal); } catch (error) {
+        fleetError("SLACK_THREAD", `root=${root.ts}`, error);
+        return null;
+      }
     }));
     if (batch.some((thread) => thread === null)) return null;
     replies.push(...batch.flat());
@@ -626,9 +825,8 @@ export function slackHistoryParams(since) {
 
 async function slackHistory(since) {
   const deadline = AbortSignal.timeout(SLACK_HISTORY_TIMEOUT_MS);
-  const nodeRoot = await commandOutput("npm", ["root", "-g"], process.cwd(), deadline);
-  if (!nodeRoot || deadline.aborted) return null;
-  const credentialPath = join(nodeRoot, "agent-messenger/dist/src/platforms/slackbot/credential-manager.js");
+  const credentialPath = CONFIG.agentMessengerCredentialPath;
+  if (!credentialPath || deadline.aborted) return null;
   const { SlackBotCredentialManager } = await import(credentialPath);
   const credentials = new SlackBotCredentialManager().getCredentials();
   const creds = await Promise.race([
@@ -832,7 +1030,8 @@ export async function reviewStallEvents(nowMs, alerted, fetchMessages = slackHis
   let messages;
   try {
     messages = await fetchMessages(since);
-  } catch {
+  } catch (error) {
+    fleetError("SLACK_REVIEW_STALL", `since=${since}`, error);
     return [];
   }
   if (!messages) return [];
@@ -848,7 +1047,10 @@ export async function pollReviewStalls(dbHandle, nowMs = Date.now(), fetchMessag
   const cursor = dbHandle.query("SELECT value FROM fleet_state WHERE key='slack-review-cursor'").get()?.value
     ?? ((nowMs - SLACK_HISTORY_BOOTSTRAP_DAYS * 24 * 60 * 60_000) / 1000).toFixed(6);
   let messages;
-  try { messages = await fetchMessages(cursor); } catch { return []; }
+  try { messages = await fetchMessages(cursor); } catch (error) {
+    fleetError("SLACK_REVIEW_POLL", `cursor=${cursor}`, error);
+    return [];
+  }
   if (!messages) return [];
   const requests = messages.filter(isReviewRequest);
   for (const request of requests) {
@@ -895,9 +1097,13 @@ async function pullRequestHead(prSignal, abortSignal = AbortSignal.timeout(10000
   if (!pr) return null;
   try {
     const result = await runCommand(["gh", "pr", "view", pr.prNumber, "--repo", pr.repo, "--json", "headRefOid"], abortSignal);
-    if (result.exitCode !== 0) return null;
+    if (result.exitCode !== 0) {
+      fleetError("PR_HEAD", `signal=${prSignal}`, `gh exited ${result.exitCode}`);
+      return null;
+    }
     return JSON.parse(result.stdout).headRefOid ?? null;
-  } catch {
+  } catch (error) {
+    fleetError("PR_HEAD", `signal=${prSignal}`, error);
     return null;
   }
 }
@@ -911,10 +1117,14 @@ async function checkRunsForHead(repo, head, abortSignal = AbortSignal.timeout(10
       signal: abortSignal,
     });
     const [text, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    if (exitCode !== 0) return null;
+    if (exitCode !== 0) {
+      fleetError("PR_CHECK_RUNS", `repo=${repo} head=${head.slice(0, 12)}`, `gh exited ${exitCode}`);
+      return null;
+    }
     const data = JSON.parse(text);
     return Array.isArray(data.check_runs) ? data.check_runs : [];
-  } catch {
+  } catch (error) {
+    fleetError("PR_CHECK_RUNS", `repo=${repo} head=${head.slice(0, 12)}`, error);
     return null;
   }
 }
@@ -945,7 +1155,9 @@ export async function bugbotLimitEvents(dbHandle, previous, getCheckRuns = pullR
       for (const signal of task.done.split(";").map((part) => part.trim())) {
         if (parsePullRequestSignal(signal) && !targets.has(signal)) targets.set(signal, task.key);
       }
-    } catch {}
+    } catch (error) {
+      fleetError("BUGBOT_TASK", `task=${task.key}`, error);
+    }
   }
   const events = [];
   const entries = [...targets];
@@ -962,7 +1174,8 @@ export async function bugbotLimitEvents(dbHandle, previous, getCheckRuns = pullR
         return limited && !wasLimited
           ? `FLEET_BUGBOT_LIMIT ${taskKey} ${signal.slice(3)} head=${result.head.slice(0, 7)} reason=usage_limit_reached`
           : null;
-      } catch {
+      } catch (error) {
+        fleetError("BUGBOT_LOOKUP", `task=${taskKey} signal=${signal}`, error);
         return null;
       }
     }));
@@ -997,7 +1210,9 @@ export async function verifyClaims(text, task, checks = {}) {
     try {
       const head = await getPrHead(signal);
       if (typeof head === "string" && /^[a-f0-9]{40}$/i.test(head)) actualHead = head.toLowerCase();
-    } catch {}
+    } catch (error) {
+      fleetError("PR_HEAD_VERIFY", `signal=${signal}`, error);
+    }
     heads.set(signal, actualHead);
     return actualHead;
   };
@@ -1017,7 +1232,9 @@ export async function verifyClaims(text, task, checks = {}) {
       : null;
     let ok = false;
     if (normalizedHead && task?.sent_at) {
-      try { ok = await checkSlackHead(normalizedHead, task.sent_at, pr); } catch {}
+      try { ok = await checkSlackHead(normalizedHead, task.sent_at, pr); } catch (error) {
+        fleetError("SLACK_ACCEPT_CHECK", `signal=${signal ?? "unknown"}`, error);
+      }
     }
     results.push({
       kind: "cursor-accept",
@@ -1062,17 +1279,20 @@ function queueDispatch(catId, key, prompt, options, reason) {
   const { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after } = options;
   db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,done,status,sent_at,depends_on,dispatch_type,keep_model)
     VALUES(?,?,?,?,?,?,'waiting',?,?,?,?)
-    ON CONFLICT(key) DO UPDATE SET cat=excluded.cat, title=excluded.title, prompt=excluded.prompt, skill=excluded.skill, done=excluded.done, status='waiting', sent_at=excluded.sent_at, result=NULL, evidence=NULL, depends_on=excluded.depends_on, dispatch_type=excluded.dispatch_type, keep_model=excluded.keep_model, completion_claimed=0, send_attempted=0, claim_evidence='{}'`)
+    ON CONFLICT(key) DO UPDATE SET cat=excluded.cat, title=excluded.title, prompt=excluded.prompt, skill=excluded.skill, done=excluded.done, status='waiting', sent_at=excluded.sent_at, result=NULL, evidence=NULL, depends_on=excluded.depends_on, dispatch_type=excluded.dispatch_type, keep_model=excluded.keep_model, completion_claimed=0, send_attempted=0, dispatch_attempt=NULL, claim_evidence='{}'`)
     .run(key, catId, title || key, prompt, skill, done, now(), after || null, type, keepModel ? 1 : 0);
   log(key, { ev: after ? "dependency-wait" : "dispatch-wait", after: after || null, reason });
   return after ? `FLEET_DEPENDENCY_WAIT ${key} after=${after} ${reason}` : `FLEET_DISPATCH_WAIT ${key} cat=${catId} ${reason}`;
 }
 
 // Verified send (Dori panes.ts idea): only into an idle agent prompt, one send, then confirm the agent actually started.
-export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after = "", runCommand = executeSignalCommand, sleep = Bun.sleep, switchPaneModel = switchModel } = {}) {
+export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw", done = "", title = "", keepModel = false, after = "", runCommand = executeSignalCommand, sleep = Bun.sleep, switchPaneModel } = {}) {
   if (typeof key !== "string" || !key.trim()) throw new Error("INVALID_TASK_KEY");
   const c = db.query("SELECT * FROM cats WHERE id=?").get(catId);
-  if (!c || c.pane === "-") throw new Error(`cat ${catId} has no pane`);
+  if (!c) throw new Error(`cat ${catId} has no pane`);
+  c.pane = configuredCatPane(catId, c.pane);
+  if (c.pane === "-") throw new Error(`cat ${catId} has no pane`);
+  const applyPaneModel = switchPaneModel ?? ((pane, want) => switchModel(pane, want, runCommand));
   const paneRead = async () => runCommand(["herdr", "pane", "read", c.pane, "--source", "visible", "--format", "text"]);
   let existing = db.query("SELECT cat,status FROM tasks WHERE key=?").get(key);
   if (existing?.status === "dispatching") {
@@ -1080,6 +1300,15 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     await recoverInterruptedDispatches(db, [{ id: catId, state: screen.exitCode === 0 ? classify(screen.stdout).state : "unknown" }]);
     existing = db.query("SELECT cat,status FROM tasks WHERE key=?").get(key);
   }
+  const retainedReservation = db.query("SELECT pane FROM dispatch_reservations WHERE key=?").get(key);
+  if (retainedReservation && existing?.cat === catId && existing.status === "waiting") {
+    const detail = "queued retry found a retained pane reservation";
+    db.query("UPDATE tasks SET status='dispatch-error',result=? WHERE key=? AND status='waiting'").run(detail, key);
+    log(key, { ev: "dispatch-error", detail });
+    existing.status = "dispatch-error";
+  }
+  if (retainedReservation && existing?.cat === catId && existing.status === "dispatch-error")
+    return `DISPATCH_HOLD ${catId} reservation-retained; not queued`;
   if (existing && (existing.cat !== catId || !["waiting", "dispatch-interrupted", "dispatch-error", "dispatch-held", "dispatch-failed-before-send"].includes(existing.status))) return `DISPATCH_HOLD ${catId} duplicate-key; not sent`;
   if (!(await Bun.file(prompt).exists())) throw new Error(`prompt file missing: ${prompt}`);
   if (after) {
@@ -1096,20 +1325,21 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
   const claim = db.transaction(() => {
     const existing = db.query("SELECT key,cat,status FROM tasks WHERE key=?").get(key);
     if (existing && (existing.cat !== catId || !["waiting", "dispatch-interrupted", "dispatch-error", "dispatch-held", "dispatch-failed-before-send"].includes(existing.status))) return { hold: "duplicate-key" };
-    if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)) return { hold: "pane-reserved" };
+    if (db.query(`SELECT r.key FROM dispatch_reservations r JOIN tasks t ON t.key=r.key
+      WHERE r.pane=? OR t.cat=? LIMIT 1`).get(c.pane, catId)) return { hold: "pane-reserved" };
     const active = db.query(`SELECT t.key FROM tasks t JOIN cats c ON c.id=t.cat
-      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
+      WHERE (c.pane=? OR t.cat=?) AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','closed','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, catId, key);
     if (active) return { hold: "prior-task-unresolved" };
     const attempt = crypto.randomUUID();
     const model = want ? `${want.provider}/${want.model}:${want.thinking}` : "kept";
     if (existing) {
       db.query(`UPDATE tasks SET title=?,prompt=?,skill=?,model=?,done=?,status='dispatching',sent_at=?,started_at=NULL,ended_at=NULL,result=NULL,evidence=NULL,
-        depends_on=?,dispatch_type=?,keep_model=?,completion_claimed=0,send_attempted=0,claim_evidence='{}' WHERE key=?`)
-        .run(title || key, prompt, skill, model, done, now(), after || null, type, keepModel ? 1 : 0, key);
+        depends_on=?,dispatch_type=?,keep_model=?,completion_claimed=0,send_attempted=0,dispatch_attempt=?,claim_evidence='{}' WHERE key=?`)
+        .run(title || key, prompt, skill, model, done, now(), after || null, type, keepModel ? 1 : 0, attempt, key);
     } else {
-      db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,model,done,status,sent_at,depends_on,dispatch_type,keep_model,history)
-        VALUES(?,?,?,?,?,?,?,'dispatching',?,?,?,?,?)`)
-        .run(key, catId, title || key, prompt, skill, model, done, now(), after || null, type, keepModel ? 1 : 0, "[]");
+      db.query(`INSERT INTO tasks(key,cat,title,prompt,skill,model,done,status,sent_at,depends_on,dispatch_type,keep_model,dispatch_attempt,history)
+        VALUES(?,?,?,?,?,?,?,'dispatching',?,?,?,?,?,?)`)
+        .run(key, catId, title || key, prompt, skill, model, done, now(), after || null, type, keepModel ? 1 : 0, attempt, "[]");
     }
     db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at,recovery_token,recovery_started_at) VALUES(?,?,?, ?,NULL,NULL)").run(c.pane, key, attempt, now());
     db.query("UPDATE cats SET task=? WHERE id=?").run(key, catId);
@@ -1132,11 +1362,18 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
       try {
         db.query("UPDATE dispatch_reservations SET reserved_at=? WHERE pane=? AND key=? AND attempt=? AND recovery_token IS NULL")
           .run(now(), c.pane, key, attempt);
-      } catch {}
+      } catch (error) {
+        fleetError("DISPATCH_LEASE_HEARTBEAT", `task=${key} attempt=${attempt}`, error);
+      }
     }, 30_000);
     leaseHeartbeat.unref?.();
-    const modelNote = keepModel ? "MODEL_KEPT" : await switchPaneModel(c.pane, want);
-    if (modelNote.startsWith("MODEL_SWITCH_FAILED")) {
+    const modelNote = keepModel ? "MODEL_KEPT" : await applyPaneModel(c.pane, want);
+    if (modelNote.startsWith("MODEL_SWITCH_FAILED") || modelNote.startsWith("MODEL_SWITCH_TIMEOUT") || modelNote.startsWith("MODEL_SWITCH_DIRTY")) {
+      if (modelNote.startsWith("MODEL_SWITCH_DIRTY")) {
+        db.query("UPDATE tasks SET status='dispatch-error',result=? WHERE key=? AND status='dispatching'").run(modelNote, key);
+        log(key, { ev: "dispatch-error", attempt, detail: modelNote });
+        return `DISPATCH_ERROR ${catId} ${key}: model switch input cleanup unverified; reservation retained`;
+      }
       if (!releaseUnsent("dispatch-held")) return `DISPATCH_HOLD ${catId} reservation-expired; not sent`;
       return modelNote;
     }
@@ -1147,7 +1384,7 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     }
     if (!ownsReservation()) return `DISPATCH_HOLD ${catId} reservation-expired; not sent`;
     const head = `${key} [attempt=${attempt} skill:${skill}${done ? ` | Done= ${done}` : ""}]`;
-    const msg = `${head}: 지시문 파일 ${prompt} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 ${key}_DONE <한 줄 요약> 또는 ${key}_BLOCKED reason=<한 줄>.`;
+    const msg = `${head}: 지시문 파일 ${prompt} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 ${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.`;
     if (!recordDispatchSendAttempt(db, c.pane, key, attempt)) return `DISPATCH_HOLD ${catId} reservation-reclaimed; not sent`;
     sendAttempted = true;
     const text = await runCommand(["herdr", "pane", "send-text", c.pane, msg]);
@@ -1156,13 +1393,15 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     enterAttempted = true;
     const enter = await runCommand(["herdr", "pane", "send-keys", c.pane, "Enter"]);
     if (enter.exitCode !== 0) throw new Error("SEND_ENTER_FAILED");
-    db.query("UPDATE tasks SET status='sent-unconfirmed',sent_at=?,model=? WHERE key=?").run(now(), model, key);
+    db.query("UPDATE tasks SET status='sent-unconfirmed',model=? WHERE key=?").run(model, key);
     log(key, { ev: "sent-unconfirmed", attempt });
     for (let i = 0; i < 12; i++) {
       const screen = await paneRead();
       const state = screen.exitCode === 0 ? classify(screen.stdout).state : "unknown";
       if (state === "working") {
-        db.query("UPDATE tasks SET status='working',started_at=? WHERE key=?").run(now(), key);
+        const observedAt = now();
+        db.query("UPDATE tasks SET status='working',started_at=? WHERE key=? AND dispatch_attempt=?")
+          .run(observedAt, key, attempt);
         log(key, { ev: "started", attempt });
         return `DISPATCH_OK ${catId} ${key} started (${modelNote})`;
       }
@@ -1174,14 +1413,17 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     }
     log(key, { ev: "unconfirmed", attempt });
     return `DISPATCH_UNCONFIRMED ${catId} ${key}: no Working within 60s (watch keeps checking)`;
-  } catch {
+  } catch (error) {
+    fleetError("DISPATCH", `task=${key} attempt=${attempt}`, error);
     if (sendAttempted) {
       if (enterAttempted) {
         for (let i = 0; i < 12; i++) {
           const screen = await paneRead();
           const state = screen.exitCode === 0 && screen.stdout.trim() ? classify(screen.stdout).state : "unknown";
           if (state === "working") {
-            db.query("UPDATE tasks SET status='working',started_at=? WHERE key=?").run(now(), key);
+            const observedAt = now();
+            db.query("UPDATE tasks SET status='working',started_at=? WHERE key=? AND dispatch_attempt=?")
+              .run(observedAt, key, attempt);
             log(key, { ev: "started-after-enter-error", attempt });
             return `DISPATCH_OK ${catId} ${key} started after Enter error`;
           }
@@ -1192,7 +1434,10 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
           if (i < 11) await sleep(5000);
         }
       }
-      const released = await reconcileFailedDispatch(db, { pane: c.pane, key, attempt }, paneRead, runCommand).catch(() => false);
+      const released = await reconcileFailedDispatch(db, { pane: c.pane, key, attempt }, paneRead, runCommand).catch((error) => {
+        fleetError("DISPATCH_RECONCILE", `task=${key} attempt=${attempt}`, error);
+        return false;
+      });
       if (!released) {
         db.query("UPDATE tasks SET status='send-failed-unconfirmed' WHERE key=?").run(key);
         log(key, { ev: "send-failed-unconfirmed", attempt });
@@ -1232,7 +1477,9 @@ export async function dispatchWaitingTasks(dbHandle, paneRows, dispatchTask = di
         const current = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(task.key);
         const status = current?.status === "waiting" ? "dispatch-error" : "send-failed-unconfirmed";
         dbHandle.query("UPDATE tasks SET status=?,result=? WHERE key=?").run(status, detail, task.key);
-        try { logOn(dbHandle, task.key, { ev: status, detail }); } catch {}
+        try { logOn(dbHandle, task.key, { ev: status, detail }); } catch (error) {
+          fleetError("DISPATCH_HISTORY", `task=${task.key}`, error);
+        }
         events.push(`FLEET_DISPATCH_ERROR ${task.key} ${detail}`);
       } catch (recordError) {
         events.push(`FLEET_DISPATCH_ERROR ${task.key} ${detail}; record failed: ${String(recordError?.message ?? recordError).slice(0, 100)}`);
@@ -1259,7 +1506,10 @@ export async function checkSignal(sig, runCommand = executeSignalCommand) {
   if ((m = sig.match(/^pr:([\w.-]+\/[\w.-]+)#(\d+)$/))) {
     const command = await runCommand(["gh", "pr", "view", m[2], "--repo", m[1], "--json", "state,mergeCommit,headRefOid"]);
     let j = {};
-    try { j = JSON.parse(command.stdout || "{}"); } catch {}
+    // Malformed GitHub JSON intentionally falls back to {} and fails the MERGED check below.
+    try { j = JSON.parse(command.stdout || "{}"); } catch (error) {
+      fleetError("PR_SIGNAL_JSON", `signal=${sig}`, error);
+    }
     return {
       ok: command.exitCode === 0 && j.state === "MERGED",
       detail: command.exitCode !== 0 ? `exit ${command.exitCode}` : j.state === "MERGED" ? `merged ${j.mergeCommit?.oid?.slice(0, 8)}` : `state=${j.state ?? "unknown"}`,
@@ -1286,6 +1536,7 @@ export async function verify(key, check = checkSignal) {
   const t = db.query("SELECT * FROM tasks WHERE key=?").get(key);
   if (!t) throw new Error(`no task ${key}`);
   if (t.status === "verified-done") return `VERIFIED_DONE ${key}: already verified`;
+  if (t.status === "closed") return `VERIFY_CLOSED ${key}: task is terminal`;
   const history = JSON.parse(t.history || "[]");
   const hasCompletionClaim = Boolean(t.completion_claimed) || t.status === "done-claimed";
   if (t.status !== "done-claimed" && !(t.status === "not-done" && hasCompletionClaim)) return `VERIFY_UNCONFIRMED ${key}: worker completion claim missing`;
@@ -1341,11 +1592,16 @@ export async function verify(key, check = checkSignal) {
     })),
     signals: res.map((result) => ({ signal: result.s, ok: result.ok, detail: result.detail, headRefOid: result.headRefOid, mergeCommit: result.mergeCommit, httpCode: result.httpCode })),
   });
-  db.transaction(() => {
+  const terminal = db.transaction(() => {
+    const current = db.query("SELECT status FROM tasks WHERE key=?").get(key);
+    if (["closed", "verified-done"].includes(current?.status)) return current.status;
     db.query("UPDATE tasks SET status=?, evidence=?, ended_at=? WHERE key=?").run(ok ? "verified-done" : "not-done", evidence, ok ? now() : null, key);
     if (ok) db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
+    appendHistoryInTransaction(db, key, { ev: ok ? "verified" : "not-done", detail: evidence });
+    return null;
   }).immediate();
-  log(key, { ev: ok ? "verified" : "not-done", detail: evidence });
+  if (terminal === "closed") return `VERIFY_CLOSED ${key}: task is terminal`;
+  if (terminal === "verified-done") return `VERIFIED_DONE ${key}: already verified`;
   return `${ok ? "VERIFIED_DONE" : "NOT_DONE"} ${key}: ${evidence}`;
 }
 
@@ -1377,10 +1633,12 @@ export async function track(key, cat, done, title) {
     const c = db.query("SELECT * FROM cats WHERE id=?").get(cat);
     if (!c) throw new Error("NO_CAT");
     if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)
-      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
+      || db.query(`SELECT key FROM tasks WHERE cat=? AND status NOT IN ('verified-done','blocked','closed','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(cat)) {
       return `TRACK_HOLD ${key}: prior-task-unresolved`;
     }
     db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,?,?,?,'tracked-unconfirmed',?)").run(key, cat, title || key, done || "", now());
+    appendHistoryInTransaction(db, key, { ev: "tracked" });
+    db.query("UPDATE tasks SET sent_at=? WHERE key=?").run(now(), key);
     db.query("UPDATE cats SET task=? WHERE id=?").run(key, cat);
     return `TRACKED_UNCONFIRMED ${key} on ${cat}`;
   }).immediate();
@@ -1412,7 +1670,8 @@ async function commandOutput(command, args, cwd, signal = AbortSignal.timeout(10
     });
     const [text, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
     return exitCode === 0 ? text.trim() : null;
-  } catch {
+  } catch (error) {
+    fleetError("COMMAND", `${command} ${args[0] ?? ""}`, error);
     return null;
   }
 }
@@ -1426,7 +1685,10 @@ async function pullRequestInfo(repo, number, repoRoot) {
   const fields = "number,title,url,state,isDraft,headRefOid,reviewDecision,statusCheckRollup";
   const text = await commandOutput("gh", ["pr", "view", String(number), "--repo", repo, "--json", fields], repoRoot);
   if (!text) return null;
-  try { return JSON.parse(text); } catch { return null; }
+  try { return JSON.parse(text); } catch (error) {
+    fleetError("PR_INFO_JSON", `repo=${repo} number=${number}`, error);
+    return null;
+  }
 }
 
 async function pullRequestsForBranch(repo, branch, repoRoot) {
@@ -1436,7 +1698,8 @@ async function pullRequestsForBranch(repo, branch, repoRoot) {
   try {
     const data = JSON.parse(text);
     return Array.isArray(data) ? data : null;
-  } catch {
+  } catch (error) {
+    fleetError("PR_LIST_JSON", `repo=${repo} branch=${branch}`, error);
     return null;
   }
 }
@@ -1478,7 +1741,9 @@ async function board() {
       for (const signal of task.done.split(";").map((part) => part.trim())) {
         if (parsePullRequestSignal(signal) && !signals.has(signal)) signals.set(signal, task.key);
       }
-    } catch {}
+    } catch (error) {
+      fleetError("BOARD_TASK", `task=${task.key}`, error);
+    }
   }
 
   const pullRequests = [];
@@ -1488,7 +1753,9 @@ async function board() {
       const info = await pullRequestInfo(target.repo, target.prNumber, repoRoot);
       const checkRuns = info?.headRefOid ? await checkRunsForHead(target.repo, info.headRefOid) : null;
       pullRequests.push({ target, source, info, checkRuns });
-    } catch {}
+    } catch (error) {
+      fleetError("BOARD_PR", `signal=${signal}`, error);
+    }
   }
   const bySignal = new Map(pullRequests.map((pr) => [`pr:${pr.target.repo}#${pr.target.prNumber}`, pr]));
   const prior = repo ? bySignal.get(`pr:${repo}#2`) : null;
@@ -1551,6 +1818,25 @@ async function board() {
   ].join("\n");
 }
 
+function markTaskObservedWorking(dbHandle, key) {
+  const task = dbHandle.query("SELECT status,started_at,sent_at,history,dispatch_attempt,send_attempted FROM tasks WHERE key=?").get(key);
+  if (!task || !["dispatching", "sent-unconfirmed", "send-failed-unconfirmed", "tracked-unconfirmed", "working"].includes(task.status)) return false;
+  const sent = task.dispatch_attempt && task.send_attempted
+    ? JSON.parse(task.history || "[]").findLast((event) => event.ev === "send-attempted" && event.attempt === task.dispatch_attempt)
+    : null;
+  const sendAt = Date.parse(sent?.at ?? "");
+  const sentAt = Date.parse(task.sent_at ?? "");
+  const refreshSentAt = Boolean(task.dispatch_attempt && task.send_attempted
+    && (!task.started_at || (Number.isFinite(sendAt) && (!Number.isFinite(sentAt) || sentAt < sendAt))));
+  const newlyWorking = task.status !== "working" || !task.started_at;
+  if (!newlyWorking && !refreshSentAt) return false;
+  const observedAt = now();
+  dbHandle.query(`UPDATE tasks SET status='working',started_at=COALESCE(started_at,?),
+    sent_at=CASE WHEN ? THEN ? ELSE sent_at END WHERE key=?`)
+    .run(observedAt, refreshSentAt ? 1 : 0, sent?.at ?? observedAt, key);
+  return newlyWorking;
+}
+
 // Watch: emits only transitions. Gajae: surface recovery_hold / speech suppressed with reason.
 async function watch(intervalSec = 30) {
   const last = new Map();
@@ -1564,25 +1850,31 @@ async function watch(intervalSec = 30) {
       for (const event of await recoverInterruptedDispatches(db, rows)) console.log(event);
       for (const r of rows) {
         try {
-        const sig = JSON.stringify({ state: r.state, doneKey: r.done?.key ?? "", doneKind: r.done?.kind ?? "", doneText: r.done?.text ?? "", readyLine: r.readyLine ?? "", readyHead: r.ready?.head ?? "", claimText: r.claimText ?? "", questionText: r.questionText ?? "" });
+        const sig = JSON.stringify({ task: r.task, state: r.state, doneKey: r.done?.key ?? "", doneKind: r.done?.kind ?? "", doneAttempt: r.done?.attempt ?? "", doneText: r.done?.text ?? "", readyLine: r.readyLine ?? "", readyHead: r.ready?.head ?? "", claimText: r.claimText ?? "", questionText: r.questionText ?? "" });
         const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
         if (!previous || last.get(r.id) !== sig) {
           if (previous && r.state !== previous.state && r.id !== "omonyang") console.log(`FLEET_STATE ${r.id} ${previous.state} -> ${r.state}`);
+          if (r.task && r.state === "working" && markTaskObservedWorking(db, r.task)) console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
+          const doneTask = r.done ? db.query("SELECT cat,status,sent_at,history,dispatch_attempt,send_attempted,completion_claimed FROM tasks WHERE key=?").get(r.done.key) : null;
           const doneChanged = r.id !== "omonyang" && r.done
-            && (!previous || r.done.key !== previous.doneKey || r.done.kind !== previous.doneKind);
+            && (!previous || previous.task !== r.task || r.done.key !== previous.doneKey || r.done.kind !== previous.doneKind || r.done.attempt !== previous.doneAttempt)
+            && doneTask?.cat === r.id && completionBelongsToDispatchAttempt(doneTask, r.done);
           const readyChanged = r.ready && (!previous || r.ready.head !== previous.readyHead);
           const readyLineChanged = r.readyLine && (!previous || r.readyLine !== previous.readyLine);
           const claimTextChanged = r.claimText && (!previous || r.claimText !== previous.claimText);
           if (doneChanged) {
-            console.log(`FLEET_TASK_${r.done.kind} ${r.id} ${r.done.key} ${r.done.text}`);
-            if (r.done.kind === "BLOCKED") markTaskBlocked(r.done.key, r.done.text);
-            else {
-              const currentTask = db.query("SELECT status FROM tasks WHERE key=?").get(r.done.key);
-              if (currentTask?.status !== "verified-done") {
-                db.query("UPDATE tasks SET status='done-claimed', result=?, completion_claimed=1 WHERE key=?").run(r.done.text, r.done.key);
-                log(r.done.key, { ev: "done-claimed", text: r.done.text });
-              }
-            }
+            const recorded = r.done.kind === "BLOCKED"
+              ? markTaskBlocked(r.done.key, r.done.text) !== false
+              : db.transaction(() => {
+                const currentTask = db.query("SELECT status,completion_claimed FROM tasks WHERE key=?").get(r.done.key);
+                if (!currentTask || ["verified-done", "closed"].includes(currentTask.status) || currentTask.completion_claimed) return false;
+                const changed = db.query("UPDATE tasks SET status='done-claimed',result=?,completion_claimed=1 WHERE key=? AND status NOT IN ('verified-done','closed') AND completion_claimed=0")
+                  .run(r.done.text, r.done.key).changes;
+                if (!changed) return false;
+                appendHistoryInTransaction(db, r.done.key, { ev: "done-claimed", text: r.done.text });
+                return true;
+              }).immediate();
+            if (recorded) console.log(`FLEET_TASK_${r.done.kind} ${r.id} ${r.done.key} ${r.done.text}`);
           }
           if (doneChanged || readyChanged || readyLineChanged || claimTextChanged) {
             const taskKey = r.done?.key ?? r.task;
@@ -1606,8 +1898,13 @@ async function watch(intervalSec = 30) {
           const policy = questionPolicy(r.questionText || "");
           if (policy) {
             let answered = false;
-            try { answered = await answerPaneQuestion(r.pane, r.questionText, policy.answer); } catch {}
+            try {
+              answered = await answerPaneQuestion(r.pane, r.questionText, policy.answer);
+            } catch (error) {
+              fleetError("AUTO_ANSWER", `cat=${r.id} task=${taskKey} policy=${policy.id}`, error);
+            }
             if (answered) {
+              console.log(`FLEET_AUTO_ANSWER ${r.id} ${taskKey} policy=${policy.id}`);
               console.log(`FLEET_QUESTION_ANSWERED ${r.id} ${taskKey} policy=${policy.id}`);
               if (taskKey !== "-") log(taskKey, { ev: "question-auto-answer", policy: policy.id });
             } else {
@@ -1623,10 +1920,6 @@ async function watch(intervalSec = 30) {
         if (!retryQuestion) last.set(r.id, sig);
         if (r.task) {
           const t = db.query("SELECT status,sent_at FROM tasks WHERE key=?").get(r.task);
-          if (["sent-unconfirmed", "send-failed-unconfirmed", "tracked-unconfirmed"].includes(t?.status) && r.state === "working") {
-            db.query("UPDATE tasks SET status='working', started_at=? WHERE key=?").run(now(), r.task);
-            console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
-          }
           if (["sent", "sent-unconfirmed", "send-failed-unconfirmed", "working"].includes(t?.status)) {
             if (r.state === "compaction-failed") { markTaskPromptLost(r.task); console.log(`FLEET_PROMPT_LOST ${r.id} ${r.task}`); }
           }
@@ -1670,11 +1963,12 @@ if (import.meta.main) {
     status, report, board,
     dispatch: () => dispatch(a[0], a[1], a[2], { type: opt("type"), skill: opt("skill"), done: opt("done"), title: opt("title"), keepModel: a.includes("--keep-model"), after: opt("after") }),
     track: () => track(a[0], a[1], opt("done"), opt("title")),
+    close: () => markTaskClosed(a[0], a.slice(1).join(" ")),
     verify: () => verify(a[0]),
     tasks: async () => db.query("SELECT key,cat,status,depends_on,skill,model,done,evidence FROM tasks ORDER BY sent_at DESC LIMIT 20").all().map((t) => JSON.stringify(t)).join("\n"),
     beat: async () => JSON.stringify(db.query("SELECT * FROM beats").all()),
     routes: async () => JSON.stringify(ROUTES, null, 1),
     watch: () => watch(Number(a[0] || 30)),
-  }[cmd] ?? (async () => "usage: fleet init|status|report|board|dispatch <cat> <KEY> <prompt> [--after <KEY>] [--type plan|impl|review|secure|quick] [--skill ulw|ulw-loop|mass-ulw|ulw-plan|ulw-execute|ulw-research] [--done 'pr:o/r#N;url:..=200;cmd:..'] [--keep-model]|track <KEY> <cat> --done ..|verify <KEY>|tasks|beat|routes|watch [sec]"))();
+  }[cmd] ?? (async () => "usage: fleet init|status|report|board|dispatch <cat> <KEY> <prompt> [--after <KEY>] [--type plan|impl|review|secure|quick] [--skill ulw|ulw-loop|mass-ulw|ulw-plan|ulw-execute|ulw-research] [--done 'pr:o/r#N;url:..=200;cmd:..'] [--keep-model]|track <KEY> <cat> --done ..|close <KEY> <reason>|verify <KEY>|tasks|beat|routes|watch [sec]"))();
   if (out !== undefined) console.log(out);
 }

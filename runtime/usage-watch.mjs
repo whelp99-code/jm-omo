@@ -8,6 +8,8 @@
 //  2) OmO temporary secondary is the approved Codex model (gpt-6.1-sol); do not auto-revert to Opus
 //     merely because a usage read looks low.
 //  3) Auto-return to Opus only after a successful real Opus model call (not usage-header HTTP 200).
+import { SELF_POLICY_ENABLED } from "./usage-policy.mjs";
+
 const INTERVAL = 10 * 60 * 1000;
 const LIMIT = 0.95;
 const FALLBACK = {
@@ -87,6 +89,7 @@ async function sendCmd(text, confirm) {
 }
 
 async function selfPolicy(usage) {
+  if (!SELF_POLICY_ENABLED) return;
   let screen = await sh(`herdr pane read ${SELF_PANE} --source visible --format text`);
   if (/esc to interrupt/.test(screen) || usage.anthropic === undefined) return;
   const cur = footerSel(screen);

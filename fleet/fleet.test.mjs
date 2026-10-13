@@ -3,15 +3,22 @@ import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch as watchFs, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SELF_POLICY_ENABLED } from "../runtime/usage-policy.mjs";
 
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, verify, verifyClaims } = await import("./fleet.mjs");
+const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, pairReviewReplies, pollReviewStalls, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
 afterAll(() => rmSync(unitHome, { recursive: true, force: true }));
+
+describe("usage-watch policy", () => {
+  it("keeps self-policy disabled for the JARVIS pane", () => {
+    expect(SELF_POLICY_ENABLED).toBe(false);
+  });
+});
 
 function unitDb() {
   return new Database(join(unitHome, ".local", "state", "omonyang", "fleet.sqlite"));
@@ -58,7 +65,7 @@ async function runBlockedDispatch(paneScreen) {
     writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then printf '%s\\n' \"$PANE_SCREEN\"; fi\n");
     chmodSync(herdrPath, 0o755);
     const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
-    const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, HERDR_LOG: herdrLog, PANE_SCREEN: paneScreen };
+    const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, HERDR_LOG: herdrLog, PANE_SCREEN: paneScreen, FLEET_CAT_CRM_PANE: "w6:p1" };
     const proc = Bun.spawn(["bun", fleetPath, "dispatch", "crm", "CHILD", prompt, "--keep-model"], {
       cwd: new URL("..", import.meta.url).pathname,
       env,
@@ -124,6 +131,7 @@ async function runRawUtf8Dispatch() {
       HERDR_LOG: herdrLog,
       HERDR_SEND_BYTES: sendBytesPath,
       SENT_MARK: sentMark,
+      FLEET_CAT_CRM_PANE: "w6:p1",
     };
     proc = Bun.spawn(["bun", fleetPath, "dispatch", "crm", "UTF8-QA", prompt, "--keep-model"], {
       cwd: new URL("..", import.meta.url).pathname,
@@ -153,7 +161,7 @@ async function runRawUtf8Dispatch() {
   }
 }
 
-async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], dispatchAttempt = "", taskSentAt = "", reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", fleetEnv = {}, waitForOutput = "", trackAfterHeartbeat = false, failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
   const state = join(home, ".local", "state", "omonyang");
   const bin = join(home, "bin");
@@ -173,17 +181,21 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   CREATE TABLE tasks(
     key TEXT PRIMARY KEY, cat TEXT, title TEXT, prompt TEXT, skill TEXT, model TEXT,
     done TEXT, status TEXT, sent_at TEXT, started_at TEXT, ended_at TEXT,
-    result TEXT, evidence TEXT, history TEXT DEFAULT '[]'
+    result TEXT, evidence TEXT, history TEXT DEFAULT '[]', completion_claimed INTEGER DEFAULT 0,
+    send_attempted INTEGER DEFAULT 0, dispatch_attempt TEXT
   );
   CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);
   CREATE TABLE dispatch_reservations(pane TEXT PRIMARY KEY,key TEXT UNIQUE NOT NULL,attempt TEXT NOT NULL,reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
   const taskKey = catTask || (prDone ? "PR-TASK" : "");
-  if (taskKey) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at,history) VALUES(?,'crm',?,?,?,?,?)")
+  if (taskKey && !trackAfterHeartbeat) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at,history) VALUES(?,'crm',?,?,?,?,?)")
     .run(taskKey, taskKey, prDone, taskStatus, new Date().toISOString(), JSON.stringify(taskHistory));
-  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture',?,?)").run(catState, taskKey || null);
+  if (taskKey && taskSentAt) db.query("UPDATE tasks SET sent_at=? WHERE key=?").run(taskSentAt, taskKey);
+  if (taskKey && dispatchAttempt) db.query("UPDATE tasks SET dispatch_attempt=?,send_attempted=1,sent_at=? WHERE key=?")
+    .run(dispatchAttempt, taskSentAt || new Date(Date.now() + 1000).toISOString(), taskKey);
+  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture',?,?)").run(catState, trackAfterHeartbeat ? null : taskKey || null);
   if (reservation && taskKey) {
-    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES('w6:p1',?,'fixture-attempt',?)")
-      .run(taskKey, new Date(Date.now() - reservationAgeMs).toISOString());
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES('w6:p1',?,?,?)")
+      .run(taskKey, dispatchAttempt || "fixture-attempt", new Date(Date.now() - reservationAgeMs).toISOString());
   }
   db.close();
   writeFileSync(join(usageDir, "usage-watch.log"), usageTick ? `${usageTick}\n` : "");
@@ -201,6 +213,8 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
 
   const env = {
     ...process.env,
+    FLEET_CAT_CRM_PANE: "w6:p1",
+    ...fleetEnv,
     HOME: home,
     PATH: `${bin}:${process.env.PATH}`,
     HERDR_LOG: herdrLog,
@@ -252,6 +266,13 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     if (heartbeat) {
       await heartbeat;
       clearTimeout(heartbeatTimeout);
+      if (trackAfterHeartbeat) {
+        const assigning = new Database(dbPath);
+        assigning.query("INSERT INTO tasks(key,cat,title,status,sent_at,history) VALUES(?,'crm',?,'tracked-unconfirmed',?,'[]')")
+          .run(taskKey, taskKey, new Date().toISOString());
+        assigning.query("UPDATE cats SET task=? WHERE id='crm'").run(taskKey);
+        assigning.close();
+      }
       if (waitForOutput) await outputPromise;
       proc.kill();
     }
@@ -259,7 +280,10 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     proc = undefined;
     const herdrCalls = existsSync(herdrLog) ? readFileSync(herdrLog, "utf8").trim().split("\n") : [];
     const stored = new Database(dbPath);
-    const storedTaskStatus = taskKey ? stored.query("SELECT status FROM tasks WHERE key=?").get(taskKey)?.status : null;
+    const storedTask = taskKey ? stored.query("SELECT status,sent_at,history,dispatch_attempt,send_attempted FROM tasks WHERE key=?").get(taskKey) : null;
+    const storedTaskStatus = storedTask?.status ?? null;
+    const storedTaskHistory = JSON.parse(storedTask?.history || "[]");
+    const storedCatPane = stored.query("SELECT pane FROM cats WHERE id='crm'").get()?.pane ?? null;
     const reservationLeft = taskKey ? Boolean(stored.query("SELECT key FROM dispatch_reservations WHERE key=?").get(taskKey)) : false;
     stored.close();
     return {
@@ -267,6 +291,11 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
       stderr,
       exitCode,
       taskStatus: storedTaskStatus,
+      taskSentAt: storedTask?.sent_at ?? null,
+      taskDispatchAttempt: storedTask?.dispatch_attempt ?? null,
+      taskSendAttempted: storedTask?.send_attempted ?? 0,
+      taskHistory: storedTaskHistory,
+      catPane: storedCatPane,
       reservationLeft,
       ghCalls: existsSync(ghLog) ? readFileSync(ghLog, "utf8").trim().split("\n") : [],
       herdrCalls,
@@ -291,6 +320,329 @@ async function runWatchCycle(options = {}) {
 async function runFleetBoard(options = {}) {
   return runFleetCommand({ ...options, command: ["board"] });
 }
+
+describe("fleet configuration", () => {
+  it("loads pane defaults into init and applies the documented environment overrides", async () => {
+    const defaults = JSON.parse(readFileSync(new URL("./fleet.config.json", import.meta.url), "utf8"));
+    const config = resolveFleetConfig(defaults, {
+      FLEET_CAT_CRM_PANE: "w9:p4",
+      FLEET_SLACK_REVIEW_CHANNEL: "C_TEST",
+      FLEET_CURSOR_USER_ID: "U_TEST",
+      FLEET_REVIEW_REPLY_APP_ID: "A_TEST",
+      FLEET_AGENT_MESSENGER_CREDENTIAL_PATH: "/tmp/credential-manager.js",
+    });
+    expect(config.cats.find((cat) => cat.id === "crm").pane).toBe("w9:p4");
+    expect(config.slack).toEqual({
+      reviewChannel: "C_TEST",
+      cursorUserId: "U_TEST",
+      reviewReplyAppId: "A_TEST",
+    });
+    expect(config.agentMessengerCredentialPath).toBe("/tmp/credential-manager.js");
+    const panes = Object.fromEntries(defaults.cats.map((cat) => [cat.id, cat.pane]));
+    expect(panes).toMatchObject({
+      omonyang: "w3:p2",
+      gajae: "w2:p1",
+      jarvis: "w5:p1",
+      sb: "w5:p2",
+      price: "w5:p3",
+      crm: "w5:p4",
+      mail: "w5:p5",
+      omodev: "-",
+      jarvis2: "-",
+    });
+    expect(defaults.agentMessengerCredentialPath.startsWith("/")).toBe(true);
+
+    const initialized = await runFleetCommand({
+      command: ["init"],
+      fleetEnv: { FLEET_CAT_CRM_PANE: "w9:p4" },
+    });
+    expect(initialized.exitCode).toBe(0);
+    expect(initialized.catPane).toBe("w9:p4");
+  });
+
+  it("uses the configured captain pane for dispatch writes despite a stale database pane", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "captain-pane-prompt.txt");
+    writeFileSync(prompt, "captain pane config fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('omonyang','Captain','w5:p1')").run();
+    db.close();
+    let sent = false;
+    const calls = [];
+    const result = await dispatch("omonyang", "CAPTAIN-PANE-CONFIG", prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async (argv) => {
+        calls.push(argv);
+        if (argv[2] === "send-keys" && argv[4] === "Enter") sent = true;
+        return {
+          exitCode: 0,
+          stdout: argv[2] === "read" ? sent ? "Working (1s)\n❯" : "Idle\n❯" : "",
+        };
+      },
+    });
+    expect(result).toContain("DISPATCH_OK omonyang CAPTAIN-PANE-CONFIG");
+    expect(calls.filter((argv) => argv[2] === "read" || argv[2] === "send-text" || argv[2] === "send-keys")
+      .every((argv) => argv[3] === "w3:p2")).toBe(true);
+    expect(calls.some((argv) => argv[3] === "w5:p1")).toBe(false);
+  });
+});
+
+describe("fleet model-switch waits", () => {
+  it("advances only after the picker, catalog, and selected model appear", async () => {
+    let stage = 0;
+    const calls = [];
+    const screen = () => [
+      "Idle\n⚡ claude-haiku:off\n❯",
+      "Idle\n⚡ claude-haiku:off\n❯ /model",
+      "Select model\n→ claude-sonnet [anthropic]\n❯",
+      "Select model\n→ claude-sonnet [anthropic]\n❯",
+      "Idle\n⚡ claude-sonnet:high\n❯",
+    ][stage];
+    const runCommand = async (argv) => {
+      calls.push(argv);
+      if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
+      if (argv[2] === "send-text" && argv[4] === "/model") stage = 1;
+      else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 1) stage = 2;
+      else if (argv[2] === "send-text" && argv[4] === "claude-sonnet") stage = 3;
+      else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 3) stage = 4;
+      return { exitCode: 0, stdout: "" };
+    };
+    const result = await switchModel("w-model:p1", {
+      provider: "anthropic",
+      model: "claude-sonnet",
+      thinking: "high",
+    }, runCommand, 1000);
+    expect(result).toBe("MODEL_SWITCHED claude-haiku:off -> anthropic/claude-sonnet");
+    expect(calls.filter((argv) => argv[2] === "send-text").map((argv) => argv[4])).toEqual(["/model", "claude-sonnet"]);
+    expect(calls.filter((argv) => argv[2] === "send-keys").map((argv) => argv[4])).toEqual(["Enter", "Enter"]);
+  });
+
+  it("returns a distinct timeout when the picker screen never appears", async () => {
+    const result = await switchModel("w-timeout:p1", {
+      provider: "anthropic",
+      model: "claude-sonnet",
+      thinking: "high",
+    }, async (argv) => ({
+      exitCode: 0,
+      stdout: argv[2] === "read" ? "Idle\n⚡ claude-haiku:off\n❯" : "",
+    }), 0);
+    expect(result).toBe("MODEL_SWITCH_TIMEOUT w-timeout:p1 phase=picker-open");
+  });
+
+  async function runFailure(failureAt, failClear = false) {
+    let stage = "initial";
+    let input = "";
+    const calls = [];
+    const model = "gpt-6-astra";
+    const screen = () => {
+      if (stage === "catalog" || stage === "filtered") return `Select model\n→ ${model} [chatgpt-subscription]\n❯ ${input}`;
+      if (stage === "model-row-unavailable") return `Select model\n→ claude-haiku [anthropic]\n❯ ${input}`;
+      if (stage === "model-change-unavailable") return "Idle\n⚡ claude-haiku:off\n❯";
+      if (stage === "thinking-command-unavailable") return `Idle\n⚡ ${model}:high\n❯`;
+      if (stage === "thinking-transition") return `Idle\n⚡ ${model}:high\n❯ ${input}`;
+      if (stage === "input-clear") return `Idle\n⚡ ${model}:xhigh\n❯ ${input}`;
+      if (stage === "thinking-command" || stage === "selected") return `Idle\n⚡ ${model}:high\n❯ ${input}`;
+      if (stage === "picker-command") return `Idle\n⚡ claude-haiku:off\n❯ ${input}`;
+      return `Idle\n⚡ claude-haiku:off\n❯ ${input}`;
+    };
+    const runCommand = async (argv) => {
+      calls.push(argv);
+      if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
+      if (argv[2] === "send-text") {
+        if (argv[4] === "/model") {
+          if (failureAt !== "picker-open") {
+            input = "/model";
+            stage = "picker-command";
+          }
+        } else if (argv[4] === model) {
+          input = model;
+          stage = failureAt === "model-row" ? "model-row-unavailable" : "filtered";
+        } else if (argv[4] === "/thinking xhigh") {
+          input = "/thinking xhigh";
+          stage = failureAt === "thinking-command" ? "thinking-command-unavailable" : "thinking-command";
+          if (failureAt === "thinking-command") return { exitCode: 1, stdout: "" };
+        }
+        return { exitCode: 0, stdout: "" };
+      }
+      if (argv[2] === "send-keys" && argv[4] === "Escape") {
+        stage = "selected";
+        return { exitCode: 0, stdout: "" };
+      }
+      if (argv[2] === "send-keys" && argv[4] === "ctrl+u") {
+        if (!failClear) input = "";
+        return { exitCode: failClear ? 1 : 0, stdout: "" };
+      }
+      if (argv[2] === "send-keys" && argv[4] === "Enter") {
+        if (stage === "picker-command") {
+          if (failureAt === "picker-submit") return { exitCode: 1, stdout: "" };
+          input = "";
+          stage = failureAt === "catalog" ? "picker-command" : "catalog";
+        } else if (stage === "filtered") {
+          if (failureAt === "model-select") return { exitCode: 1, stdout: "" };
+          input = "";
+          stage = failureAt === "model-change" ? "model-change-unavailable" : "selected";
+        } else if (stage === "thinking-command") {
+          if (failureAt === "thinking-submit") return { exitCode: 1, stdout: "" };
+          stage = failureAt === "thinking-change" ? "thinking-transition" : "input-clear";
+        }
+        return { exitCode: 0, stdout: "" };
+      }
+      throw new Error(`unexpected command ${argv.join(" ")}`);
+    };
+    const result = await switchModel("w-model-failure:p1", {
+      provider: "chatgpt-subscription",
+      model,
+      thinking: "xhigh",
+    }, runCommand, 0);
+    return { result, calls, screen: screen() };
+  }
+
+  for (const failureAt of [
+    "picker-open", "picker-submit", "catalog", "model-row", "model-select",
+    "model-change", "thinking-command", "thinking-submit", "thinking-change", "input-clear",
+  ]) {
+    it(`cleans the picker input after the ${failureAt} failure`, async () => {
+      const { result, calls, screen } = await runFailure(failureAt);
+      expect(result).not.toContain("MODEL_SWITCH_DIRTY");
+      const escape = calls.findIndex((argv) => argv[2] === "send-keys" && argv[4] === "Escape");
+      const clear = calls.findIndex((argv) => argv[2] === "send-keys" && argv[4] === "ctrl+u");
+      expect(escape).toBeGreaterThanOrEqual(0);
+      expect(clear).toBeGreaterThan(escape);
+      expect(calls.slice(clear + 1).some((argv) => argv[2] === "read")).toBe(true);
+      expect(screen).toMatch(/❯\s*$/);
+    });
+  }
+
+  it("reports dirty input when ctrl+u or empty-input verification fails", async () => {
+    const { result, calls } = await runFailure("thinking-change", true);
+    expect(result).toContain("MODEL_SWITCH_DIRTY");
+    expect(calls.some((argv) => argv[2] === "send-keys" && argv[4] === "Escape")).toBe(true);
+    expect(calls.some((argv) => argv[2] === "send-keys" && argv[4] === "ctrl+u")).toBe(true);
+  });
+
+  it("retains the reservation and marks dispatch-error when model-switch cleanup is unverified", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "dirty-switch-prompt.txt");
+    writeFileSync(prompt, "must not append to dirty pane input\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('dirty-switch-cat','Dirty Switch','w-dirty-switch:p1')").run();
+    db.close();
+
+    const result = await dispatch("dirty-switch-cat", "DIRTY-SWITCH", prompt, {
+      type: "secure",
+      runCommand: async (argv) => ({ exitCode: 0, stdout: argv[2] === "read" ? "Idle\n⚡ claude-haiku:off\n❯" : "" }),
+      switchPaneModel: async () => "MODEL_SWITCH_DIRTY w-dirty-switch:p1 cleanup-unverified",
+    });
+    expect(result).toContain("DISPATCH_ERROR dirty-switch-cat DIRTY-SWITCH");
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key='DIRTY-SWITCH'").get().status).toBe("dispatch-error");
+    expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-dirty-switch:p1'").get().key).toBe("DIRTY-SWITCH");
+    stored.close();
+  });
+
+  for (const status of ["dispatch-error", "waiting"]) {
+    it(`keeps a retained reservation recoverable when retrying a ${status} task`, async () => {
+      const db = unitDb();
+      const key = `TASK-REQUEUE-DIRTY-${status.toUpperCase()}`;
+      const cat = `requeue-dirty-${status}`;
+      const pane = `w-requeue-${status}:p1`;
+      const prompt = join(unitHome, `${key}.txt`);
+      const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+      writeFileSync(prompt, "do not queue while dirty pane reservation remains\n");
+      db.query("INSERT INTO cats(id,name,pane,task) VALUES(?,?,?,?)").run(cat, cat, pane, key);
+      db.query("INSERT INTO tasks(key,cat,status) VALUES(?,?,?)").run(key, cat, status);
+      db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+        .run(pane, key, `requeue-attempt-${status}`, reservedAt);
+      db.close();
+
+      const retryCommands = [];
+      expect(await dispatch(cat, key, prompt, {
+        keepModel: true,
+        runCommand: async argv => { retryCommands.push(argv); return { exitCode: 0, stdout: "Select model\n→ model [provider]\n❯" }; },
+      })).toBe(`DISPATCH_HOLD ${cat} reservation-retained; not queued`);
+      expect(retryCommands).toEqual([]);
+      const retained = unitDb();
+      expect(retained.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("dispatch-error");
+      expect(retained.query("SELECT pane FROM dispatch_reservations WHERE key=?").get(key).pane).toBe(pane);
+      retained.close();
+
+      let reads = 0;
+      const recovered = unitDb();
+      const events = await recoverInterruptedDispatches(recovered, [{ id: cat, state: "model-picker" }],
+        Date.parse(reservedAt) + 11 * 60_000, async argv => {
+          if (argv[2] === "read") return { exitCode: 0, stdout: ++reads === 1 ? "Select model\n→ model [provider]\n❯" : "Idle\n❯" };
+          return { exitCode: 0, stdout: "" };
+        });
+      expect(events).toEqual([`FLEET_DISPATCH_INTERRUPTED ${key} pane=${pane} reservation_released`]);
+      expect(recovered.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("dispatch-interrupted");
+      expect(recovered.query("SELECT key FROM dispatch_reservations WHERE key=?").get(key)).toBeNull();
+      recovered.close();
+    });
+  }
+
+  it("waits for an empty prompt after xhigh confirmation before sending the task", async () => {
+    const db = unitDb();
+    const pane = "w-mail-hardening:p1";
+    const prompt = join(unitHome, "mail-jarvis-reader-prompt.txt");
+    writeFileSync(prompt, "mail JARVIS reader fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('mail-hardening-cat','Mail Hardening',?)").run(pane);
+    db.close();
+
+    let phase = "initial";
+    let thinkingReads = 0;
+    const timeline = [];
+    const concatenatedInput = "/thinking xhighTASK-MAIL-JARVIS-READER-20261012 [attempt=fixture]:";
+    const runCommand = async (argv) => {
+      if (argv[2] === "read") {
+        let stdout;
+        if (phase === "initial") stdout = "Idle\n⚡ claude-haiku:off\n❯";
+        else if (phase === "model-command") stdout = "Idle\n⚡ claude-haiku:off\n❯ /model";
+        else if (phase === "catalog" || phase === "filtered") stdout = "Select model\n→ gpt-6-astra [chatgpt-subscription]\n❯";
+        else if (phase === "selected") stdout = "Idle\n⚡ gpt-6-astra:high\n❯";
+        else if (phase === "thinking-command") stdout = "Idle\n⚡ gpt-6-astra:high\n❯ /thinking xhigh";
+        else if (phase === "thinking-transition") {
+          thinkingReads++;
+          stdout = thinkingReads <= 2
+            ? `Error: Unknown thinking level "xhighTASK-MAIL-JARVIS-READER-20261012 [attempt=fixture]:"\nIdle\n⚡ gpt-6-astra:xhigh\n❯ ${concatenatedInput}`
+            : "Idle\n⚡ gpt-6-astra:xhigh\n❯";
+        } else stdout = "Working (1s)\n❯";
+        timeline.push({ kind: "read", stdout });
+        return { exitCode: 0, stdout };
+      }
+      if (argv[2] === "send-text") {
+        timeline.push({ kind: "send-text", text: argv[4] });
+        if (argv[4] === "/model") phase = "model-command";
+        else if (argv[4] === "gpt-6-astra") phase = "filtered";
+        else if (argv[4] === "/thinking xhigh") phase = "thinking-command";
+        else if (argv[4].startsWith("TASK-MAIL-JARVIS-READER-20261012 [attempt=")) phase = "task-sent";
+        return { exitCode: 0, stdout: "" };
+      }
+      if (argv[2] === "send-keys" && argv[4] === "Enter") {
+        if (phase === "model-command") phase = "catalog";
+        else if (phase === "filtered") phase = "selected";
+        else if (phase === "thinking-command") phase = "thinking-transition";
+        else if (phase === "task-sent") phase = "working";
+        timeline.push({ kind: "enter", phase });
+        return { exitCode: 0, stdout: "" };
+      }
+      throw new Error(`unexpected herdr command: ${argv.join(" ")}`);
+    };
+    const result = await dispatch("mail-hardening-cat", "TASK-MAIL-JARVIS-READER-20261012", prompt, {
+      type: "secure",
+      runCommand,
+      sleep: async () => {},
+      switchPaneModel: (targetPane, want) => switchModel(targetPane, want, runCommand, 1000),
+    });
+    const concatRead = timeline.findIndex((event) => event.kind === "read" && event.stdout.includes(concatenatedInput));
+    const emptyRead = timeline.findIndex((event, index) => index > concatRead
+      && event.kind === "read" && /❯\s*$/.test(event.stdout));
+    const taskSend = timeline.findIndex((event) => event.kind === "send-text"
+      && event.text.startsWith("TASK-MAIL-JARVIS-READER-20261012 [attempt="));
+    expect(result).toContain("DISPATCH_OK mail-hardening-cat TASK-MAIL-JARVIS-READER-20261012");
+    expect(concatRead).toBeGreaterThanOrEqual(0);
+    expect(emptyRead).toBeGreaterThan(concatRead);
+    expect(taskSend).toBeGreaterThan(emptyRead);
+  });
+});
 
 describe("fleet dependency dispatch", () => {
   it("waits for verified predecessor and idle pane, then dispatches exactly once", async () => {
@@ -442,6 +794,76 @@ describe("fleet dispatch reservations", () => {
     const stored = unitDb();
     expect(stored.query("SELECT status FROM tasks WHERE key='FAILED-ENTER'").get().status).toBe("send-failed-unconfirmed");
     expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-failed-enter:p1'").get()).toBeNull();
+    stored.close();
+  });
+
+  it("preserves sent_at after successful Enter and late Working observation", async () => {
+    const db = unitDb();
+    const key = "TASK-SUCCESSFUL-ENTER-LATE-WORKING";
+    const prompt = join(unitHome, `${key}.txt`);
+    writeFileSync(prompt, "synthetic late Working fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('late-working-cat','Late Working','late-working:p1')").run();
+    db.close();
+    let entered = false;
+    let polls = 0;
+    expect(await dispatch("late-working-cat", key, prompt, {
+      keepModel: true,
+      runCommand: async argv => {
+        if (argv[2] === "read") return { exitCode: 0, stdout: entered && ++polls === 3 ? "Working (1s)\n❯" : "Idle\n❯" };
+        if (argv[2] === "send-keys" && argv[4] === "Enter") entered = true;
+        return { exitCode: 0, stdout: "" };
+      },
+      sleep: async () => {},
+    })).toContain(`DISPATCH_OK late-working-cat ${key} started`);
+    const stored = unitDb();
+    const task = stored.query("SELECT sent_at,started_at,status,history FROM tasks WHERE key=?").get(key);
+    const send = JSON.parse(task.history).findLast(event => event.ev === "send-attempted");
+    expect(polls).toBe(3);
+    expect(task.status).toBe("working");
+    expect(task.sent_at).toBe(send.at);
+    expect(task.started_at).not.toBeNull();
+    stored.close();
+  });
+
+  it("preserves the current attempt send time when Enter fails but the pane starts", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "started-after-enter-error-prompt.txt");
+    const pane = "w-started-after-enter-error:p1";
+    const key = "TASK-STARTED-AFTER-ENTER-ERROR";
+    writeFileSync(prompt, "started after Enter failure fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('started-after-enter-error-cat','Started After Enter Error',?)").run(pane);
+    db.close();
+
+    let started = false;
+    let attempt = "";
+    const runCommand = async (argv) => {
+      if (argv[2] === "read") {
+        return {
+          exitCode: 0,
+          stdout: started
+            ? `Working (1s)\n⏺ Work completed\n${key}_DONE attempt=${attempt} finished\n\n❯`
+            : "Idle\n❯",
+        };
+      }
+      if (argv[2] === "send-text") attempt = argv[4].match(/\[attempt=([a-f0-9-]{36})\b/)?.[1] ?? "";
+      if (argv[2] === "send-keys" && argv[4] === "Enter") {
+        started = true;
+        return { exitCode: 1, stdout: "" };
+      }
+      return { exitCode: 0, stdout: "" };
+    };
+    expect(await dispatch("started-after-enter-error-cat", key, prompt, {
+      keepModel: true,
+      runCommand,
+      sleep: async () => {},
+    })).toContain(`DISPATCH_OK started-after-enter-error-cat ${key} started after Enter error`);
+
+    const stored = unitDb();
+    const task = stored.query("SELECT * FROM tasks WHERE key=?").get(key);
+    const send = JSON.parse(task.history).findLast((event) => event.ev === "send-attempted");
+    expect(task.dispatch_attempt).toBe(attempt);
+    expect(Date.parse(task.sent_at)).toBeGreaterThanOrEqual(Date.parse(send.at));
+    expect(completionBelongsToDispatchAttempt(task, classify(`Working (1s)\n⏺ Work completed\n${key}_DONE attempt=${attempt} finished\n\n❯`).done)).toBe(true);
     stored.close();
   });
 
@@ -820,11 +1242,61 @@ describe("fleet dispatch reservations", () => {
     expect(calls.map((argv) => argv.slice(1, 4))).toEqual([
       ["pane", "read", "w-picker:p1"],
       ["pane", "send-keys", "w-picker:p1"],
+      ["pane", "send-keys", "w-picker:p1"],
       ["pane", "read", "w-picker:p1"],
     ]);
+    expect(calls.map((argv) => argv[4]).filter((key) => key === "Escape" || key === "ctrl+u"))
+      .toEqual(["Escape", "ctrl+u"]);
     expect(events).toEqual(["FLEET_DISPATCH_INTERRUPTED PICKER-TASK pane=w-picker:p1 reservation_released"]);
     expect(recovered.query("SELECT key FROM dispatch_reservations WHERE pane='w-picker:p1'").get()).toBeNull();
     recovered.close();
+  });
+
+  it("recovers a dirty dispatch-error reservation only after input is empty", async () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('dirty-recovery-cat','Dirty Recovery','w-dirty-recovery:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,result,history) VALUES('DIRTY-RECOVERY','dirty-recovery-cat','dispatch-error','cleanup failed','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-dirty-recovery:p1", "DIRTY-RECOVERY", "dirty-recovery-attempt", reservedAt);
+    let input = "/thinking xhigh";
+    const calls = [];
+    const events = await recoverInterruptedDispatches(db, [{ id: "dirty-recovery-cat", state: "idle" }],
+      Date.parse(reservedAt) + 11 * 60_000, async (argv) => {
+        calls.push(argv);
+        if (argv[2] === "read") return { exitCode: 0, stdout: `Idle\n❯ ${input}` };
+        if (argv[2] === "send-keys" && argv[4] === "ctrl+u") input = "";
+        return { exitCode: 0, stdout: "" };
+      });
+    expect(calls.map((argv) => argv[2] === "read" ? "read" : argv[4])).toEqual(["read", "Escape", "ctrl+u", "read"]);
+    expect(events).toEqual(["FLEET_DISPATCH_INTERRUPTED DIRTY-RECOVERY pane=w-dirty-recovery:p1 reservation_released"]);
+    expect(db.query("SELECT status FROM tasks WHERE key='DIRTY-RECOVERY'").get().status).toBe("dispatch-interrupted");
+    expect(db.query("SELECT key FROM dispatch_reservations WHERE key='DIRTY-RECOVERY'").get()).toBeNull();
+    db.close();
+  });
+
+  it("keeps dispatch-error recovery reserved when cleanup cannot verify empty input", async () => {
+    const db = unitDb();
+    const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('dirty-recovery-fail-cat','Dirty Recovery Fail','w-dirty-recovery-fail:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,result,history) VALUES('DIRTY-RECOVERY-FAIL','dirty-recovery-fail-cat','dispatch-error','cleanup failed','[]')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+      .run("w-dirty-recovery-fail:p1", "DIRTY-RECOVERY-FAIL", "dirty-recovery-fail-attempt", reservedAt);
+    let cleared = false;
+    const events = await recoverInterruptedDispatches(db, [{ id: "dirty-recovery-fail-cat", state: "idle" }],
+      Date.parse(reservedAt) + 11 * 60_000, async (argv) => {
+        if (argv[2] === "read") {
+          if (cleared) throw new Error("screen unavailable");
+          return { exitCode: 0, stdout: "Idle\n❯ /thinking xhigh" };
+        }
+        if (argv[2] === "send-keys" && argv[4] === "ctrl+u") cleared = true;
+        return { exitCode: 0, stdout: "" };
+      });
+    expect(events).toEqual([]);
+    expect(db.query("SELECT status FROM tasks WHERE key='DIRTY-RECOVERY-FAIL'").get().status).toBe("dispatch-error");
+    expect(db.query("SELECT key,recovery_token FROM dispatch_reservations WHERE key='DIRTY-RECOVERY-FAIL'").get())
+      .toEqual({ key: "DIRTY-RECOVERY-FAIL", recovery_token: null });
+    db.close();
   });
 
   it("does not escape a model picker while its reservation is fresh", async () => {
@@ -967,6 +1439,218 @@ describe("fleet dispatch reservations", () => {
     expect(result).toContain("DISPATCH_OK blocked-release-cat AFTER-BLOCKED");
   });
 
+  it("closes a task with a required reason and releases its active pane", async () => {
+    const db = unitDb();
+    const prompt = join(unitHome, "closed-release-prompt.txt");
+    writeFileSync(prompt, "dispatch after a closed task\n");
+    db.query("INSERT INTO cats(id,name,pane,task) VALUES('closed-release-cat','Closed Release','w-closed:p1','CLOSED-OLD')").run();
+    db.query("INSERT INTO tasks(key,cat,status) VALUES('CLOSED-OLD','closed-release-cat','working')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('w-closed:p1','CLOSED-OLD','attempt-closed')").run();
+    db.close();
+
+    expect(await markTaskClosed("CLOSED-OLD", "owner closed stale acloud task"))
+      .toBe("FLEET_TASK_CLOSED CLOSED-OLD reason=owner closed stale acloud task");
+    expect(await markTaskClosed("CLOSED-OLD", "")).toBe("FLEET_TASK_CLOSE_ERROR CLOSED-OLD reason_required");
+    const stored = unitDb();
+    expect(stored.query("SELECT status,result FROM tasks WHERE key='CLOSED-OLD'").get())
+      .toEqual({ status: "closed", result: "owner closed stale acloud task" });
+    expect(stored.query("SELECT key FROM dispatch_reservations WHERE pane='w-closed:p1'").get()).toBeNull();
+    expect(stored.query("SELECT task FROM cats WHERE id='closed-release-cat'").get().task).toBeNull();
+    expect(JSON.parse(stored.query("SELECT history FROM tasks WHERE key='CLOSED-OLD'").get().history)
+      .some((event) => event.ev === "closed" && event.reason === "owner closed stale acloud task")).toBe(true);
+    stored.close();
+
+    let reads = 0;
+    const dispatched = await dispatch("closed-release-cat", "AFTER-CLOSED", prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async (argv) => ({
+        exitCode: 0,
+        stdout: argv[2] === "read" ? (++reads < 3 ? "Idle\n❯" : "Working (1s)\n❯") : "",
+      }),
+    });
+    expect(dispatched).toContain("DISPATCH_OK closed-release-cat AFTER-CLOSED");
+  });
+
+  for (const status of ["dispatching", "sent-unconfirmed", "send-failed-unconfirmed"]) {
+    it(`clears and verifies pane input before closing a ${status} task`, async () => {
+      const db = unitDb();
+      const pane = `w-close-${status}:p1`;
+      const key = `CLOSE-${status.toUpperCase()}`;
+      db.query("INSERT INTO cats(id,name,pane,task) VALUES(?,?,?,?)").run(key, key, pane, key);
+      db.query("INSERT INTO tasks(key,cat,status) VALUES(?,?,?)").run(key, key, status);
+      db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,?,?)").run(pane, key, `attempt-${status}`);
+      db.close();
+
+      let input = "/thinking xhigh";
+      const calls = [];
+      const runCommand = async (argv) => {
+        calls.push(argv);
+        if (argv[2] === "read") return { exitCode: 0, stdout: `Idle\n❯ ${input}` };
+        if (argv[2] === "send-keys" && argv[4] === "ctrl+u") input = "";
+        return { exitCode: 0, stdout: "" };
+      };
+      expect(await markTaskClosed(key, "owner cancelled pending task", runCommand))
+        .toBe(`FLEET_TASK_CLOSED ${key} reason=owner cancelled pending task`);
+      const escape = calls.findIndex((argv) => argv[2] === "send-keys" && argv[4] === "Escape");
+      const clear = calls.findIndex((argv) => argv[2] === "send-keys" && argv[4] === "ctrl+u");
+      expect(escape).toBeGreaterThanOrEqual(0);
+      expect(clear).toBeGreaterThan(escape);
+      expect(calls.slice(clear + 1).some((argv) => argv[2] === "read")).toBe(true);
+      const stored = unitDb();
+      expect(stored.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("closed");
+      expect(stored.query("SELECT key FROM dispatch_reservations WHERE key=?").get(key)).toBeNull();
+      stored.close();
+    });
+  }
+
+  for (const reserved of [false, true]) {
+    it(`holds dispatch after a configured pane move with ${reserved ? "an old reservation" : "unresolved work"}`, async () => {
+      const db = unitDb();
+      const previous = db.query("SELECT * FROM cats WHERE id='crm'").get();
+      const key = `STALE-PANE-${reserved}`;
+      const nextKey = `${key}-NEXT`;
+      const prompt = join(unitHome, `${key}.txt`);
+      writeFileSync(prompt, "synthetic stale pane fixture\n");
+      db.query(`INSERT INTO cats(id,name,pane,task) VALUES('crm','CRM','old-configured-pane',?)
+        ON CONFLICT(id) DO UPDATE SET pane=excluded.pane,task=excluded.task`).run(key);
+      db.query("INSERT INTO tasks(key,cat,status) VALUES(?,'crm',?)").run(key, reserved ? "send-failed-unconfirmed" : "working");
+      if (reserved) db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('old-configured-pane',?,'stale-pane-attempt')").run(key);
+      const calls = [];
+      try {
+        const result = await dispatch("crm", nextKey, prompt, {
+          keepModel: true,
+          sleep: async () => {},
+          runCommand: async argv => {
+            calls.push(argv);
+            return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+          },
+        });
+        expect(result).toBe(`DISPATCH_HOLD crm ${reserved ? "pane-reserved" : "prior-task-unresolved"}; not sent`);
+        expect(calls.every(argv => argv[2] === "read" && argv[3] !== "old-configured-pane")).toBe(true);
+        expect(db.query("SELECT key FROM tasks WHERE key=?").get(nextKey)).toBeNull();
+        expect(db.query("SELECT task FROM cats WHERE id='crm'").get().task).toBe(key);
+        if (reserved) expect(db.query("SELECT key FROM dispatch_reservations WHERE key=?").get(key)?.key).toBe(key);
+      } finally {
+        db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
+        db.query("DELETE FROM tasks WHERE key IN (?,?)").run(key, nextKey);
+        if (previous) db.query("UPDATE cats SET pane=?,task=? WHERE id='crm'").run(previous.pane, previous.task);
+        else db.query("DELETE FROM cats WHERE id='crm'").run();
+        db.close();
+      }
+    });
+  }
+
+  it("retains a sent-unconfirmed reservation when input cleanup fails", async () => {
+    const db = unitDb();
+    const key = "TASK-SENT-UNCONFIRMED-CLEANUP-FAILURE";
+    const pane = "uncertain-close:p1";
+    db.query("INSERT INTO cats(id,name,pane,task) VALUES(?,'Uncertain Close',?,?)").run(key, pane, key);
+    db.query("INSERT INTO tasks(key,cat,status) VALUES(?,?,'sent-unconfirmed')").run(key, key);
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,?,'uncertain-close-attempt')").run(pane, key);
+    db.close();
+    const calls = [];
+    expect(await markTaskClosed(key, "owner cancelled uncertain input", async argv => {
+      calls.push(argv);
+      if (argv[2] === "read") return { exitCode: 0, stdout: "Idle\n❯ stale instruction" };
+      return { exitCode: argv[4] === "ctrl+u" ? 1 : 0, stdout: "" };
+    })).toBe(`FLEET_TASK_CLOSE_ERROR ${key} input_cleanup_unverified`);
+    expect(calls.some(argv => argv[4] === "ctrl+u")).toBe(true);
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("sent-unconfirmed");
+    expect(stored.query("SELECT task FROM cats WHERE id=?").get(key).task).toBe(key);
+    expect(stored.query("SELECT key,attempt,recovery_token FROM dispatch_reservations WHERE key=?").get(key))
+      .toEqual({ key, attempt: "uncertain-close-attempt", recovery_token: null });
+    expect(JSON.parse(stored.query("SELECT history FROM tasks WHERE key=?").get(key).history).some(event => event.ev === "closed")).toBe(false);
+    stored.close();
+  });
+
+  it("clears the reservation pane rather than the current configured pane on close", async () => {
+    const db = unitDb();
+    const reservationPane = "w5:p1";
+    db.query(`INSERT INTO cats(id,name,pane,task) VALUES('omonyang','Captain','w3:p2','CLOSE-OLD-PANE')
+      ON CONFLICT(id) DO UPDATE SET pane=excluded.pane,task=excluded.task`).run();
+    db.query("INSERT INTO tasks(key,cat,status) VALUES('CLOSE-OLD-PANE','omonyang','dispatching')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,'CLOSE-OLD-PANE','old-pane-attempt')").run(reservationPane);
+    db.close();
+
+    let input = "/thinking xhigh";
+    const calls = [];
+    const runCommand = async (argv) => {
+      calls.push(argv);
+      if (argv[2] === "read") return { exitCode: 0, stdout: `Idle\n❯ ${input}` };
+      if (argv[2] === "send-keys" && argv[4] === "ctrl+u") input = "";
+      return { exitCode: 0, stdout: "" };
+    };
+    expect(await markTaskClosed("CLOSE-OLD-PANE", "owner cancelled pending task", runCommand))
+      .toBe("FLEET_TASK_CLOSED CLOSE-OLD-PANE reason=owner cancelled pending task");
+    expect(calls.every((argv) => argv[3] === reservationPane)).toBe(true);
+    const stored = unitDb();
+    expect(stored.query("SELECT key FROM dispatch_reservations WHERE key='CLOSE-OLD-PANE'").get()).toBeNull();
+    stored.close();
+  });
+
+  it("keeps a pending close and reservation when empty input cannot be verified", async () => {
+    const db = unitDb();
+    const pane = "w-close-dirty:p1";
+    db.query("INSERT INTO cats(id,name,pane,task) VALUES('CLOSE-DIRTY','Close Dirty',?,'CLOSE-DIRTY')").run(pane);
+    db.query("INSERT INTO tasks(key,cat,status) VALUES('CLOSE-DIRTY','CLOSE-DIRTY','dispatching')").run();
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,'CLOSE-DIRTY','attempt-close-dirty')").run(pane);
+    db.close();
+
+    const runCommand = async (argv) => {
+      if (argv[2] === "read") {
+        if (runCommand.cleared) throw new Error("screen unreadable after clear");
+        return { exitCode: 0, stdout: "Idle\n❯ /thinking xhigh" };
+      }
+      if (argv[2] === "send-keys" && argv[4] === "ctrl+u") runCommand.cleared = true;
+      return { exitCode: 0, stdout: "" };
+    };
+    expect(await markTaskClosed("CLOSE-DIRTY", "owner cancelled pending task", runCommand))
+      .toBe("FLEET_TASK_CLOSE_ERROR CLOSE-DIRTY input_cleanup_unverified");
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key='CLOSE-DIRTY'").get().status).toBe("dispatching");
+    expect(stored.query("SELECT recovery_token FROM dispatch_reservations WHERE key='CLOSE-DIRTY'").get().recovery_token).toBeNull();
+    stored.close();
+  });
+
+  it("does not let blocked completion overwrite a closed task", async () => {
+    const db = unitDb();
+    db.query("INSERT INTO tasks(key,status,result) VALUES('CLOSED-TERMINAL','closed','owner closed it')").run();
+    db.close();
+    expect(markTaskBlocked("CLOSED-TERMINAL", "stale blocked marker")).toBe(false);
+    expect((await markTaskClosed("CLOSED-TERMINAL", "second close")).startsWith("FLEET_TASK_CLOSE_HOLD")).toBe(true);
+    const stored = unitDb();
+    expect(stored.query("SELECT status,result FROM tasks WHERE key='CLOSED-TERMINAL'").get())
+      .toEqual({ status: "closed", result: "owner closed it" });
+    stored.close();
+  });
+
+  it("exposes manual close through the fleet command", async () => {
+    const result = await runFleetCommand({
+      catTask: "CLOSE-VIA-CLI",
+      taskStatus: "working",
+      command: ["close", "CLOSE-VIA-CLI", "owner", "closed", "stale", "task"],
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toContain("FLEET_TASK_CLOSED CLOSE-VIA-CLI reason=owner closed stale task");
+    expect(result.taskStatus).toBe("closed");
+    expect(result.taskHistory.some((event) => event.ev === "closed" && event.reason === "owner closed stale task")).toBe(true);
+  });
+
+  it("does not treat a closed task as a prior unresolved track", async () => {
+    const db = unitDb();
+    db.query("INSERT INTO cats(id,name,pane) VALUES('closed-track-cat','Closed Track','w-closed-track:p1')").run();
+    db.query("INSERT INTO tasks(key,cat,status,result) VALUES('CLOSED-TRACK-OLD','closed-track-cat','closed','owner closed it')").run();
+    expect(await track("TASK-AFTER-CLOSED-TRACK", "closed-track-cat", "cmd:true", "new work"))
+      .toBe("TRACKED_UNCONFIRMED TASK-AFTER-CLOSED-TRACK on closed-track-cat");
+    const tracked = db.query("SELECT * FROM tasks WHERE key='TASK-AFTER-CLOSED-TRACK'").get();
+    expect(tracked.status).toBe("tracked-unconfirmed");
+    expect(completionBelongsToDispatchAttempt(tracked, classify("⏺ Tracked work complete\nTASK-AFTER-CLOSED-TRACK_DONE finished\n\n❯").done)).toBe(true);
+    expect(JSON.parse(tracked.history).some((event) => event.ev === "tracked")).toBe(true);
+    db.close();
+  });
+
   it("releases a prompt-lost task reservation so the pane can take a new dispatch", async () => {
     const db = unitDb();
     const prompt = join(unitHome, "prompt-lost-release-prompt.txt");
@@ -1022,6 +1706,23 @@ describe("fleet completion classification", () => {
     expect(classify(screen).done).toBeNull();
   });
 
+  for (const kind of ["DONE", "BLOCKED"]) {
+    for (const suffix of [
+      "\nattempt=12345678-1234-4234-8234-123456789abc finished",
+      " attempt=\n12345678-1234-4234-8234-123456789abc finished",
+      " attempt=12345678-1234-4234-\n8234-123456789abc finished",
+    ]) {
+      it(`recognizes a wrapped ${kind} attempt ID (${JSON.stringify(suffix)})`, () => {
+        const done = classify(`⏺ Completed response\nTASK-WRAPPED_${kind}${suffix}\n\n❯`).done;
+        expect(done).toEqual({ key: "TASK-WRAPPED", kind, attempt: "12345678-1234-4234-8234-123456789abc", text: "finished" });
+        expect(completionBelongsToDispatchAttempt({ status: "working", dispatch_attempt: done.attempt, send_attempted: 1, history: "[]" }, done)).toBe(true);
+      });
+    }
+  }
+  it("does not borrow an attempt ID from a separate response after a completion marker", () => {
+    expect(classify("⏺ Completed response\nTASK-WRAPPED_DONE\n⏺ Different response\nattempt=12345678-1234-4234-8234-123456789abc unrelated\n\n❯").done?.attempt).toBeNull();
+  });
+
   it("recognizes a final completion line above the input prompt", () => {
     const screen = [
       "❯ Complete the task and return a final result",
@@ -1031,7 +1732,32 @@ describe("fleet completion classification", () => {
       "",
       "❯",
     ].join("\n");
-    expect(classify(screen).done).toEqual({ key: "TASK-X", kind: "DONE", text: "finished" });
+    expect(classify(screen).done).toEqual({ key: "TASK-X", kind: "DONE", attempt: null, text: "finished" });
+  });
+
+  it("finds a completion marker before Omo throughput and advances its task", async () => {
+    const attempt = "10000000-0000-4000-8000-000000000001";
+    const screen = [
+      "⏺ Response block",
+      "",
+      `TASK-X-1_DONE attempt=${attempt} summary`,
+      "",
+      " TPS 35.3 tok/s. Cache hit 96.5%, 659.5s",
+      "",
+      "────",
+      "❯",
+    ].join("\n");
+    expect(classify(screen).done).toEqual({ key: "TASK-X-1", kind: "DONE", attempt, text: "summary" });
+    const result = await runWatchCycle({
+      catTask: "TASK-X-1",
+      taskStatus: "working",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-12T00:00:00.000Z" }],
+      taskSentAt: "2026-10-12T00:00:01.000Z",
+      paneScreen: screen,
+    });
+    expect(result.output).toContain("FLEET_TASK_DONE crm TASK-X-1 summary");
+    expect(result.taskStatus).toBe("done-claimed");
   });
 
   it("keeps working-state classification and limits PR READY parsing to the latest response", () => {
@@ -1055,6 +1781,30 @@ describe("fleet completion classification", () => {
 });
 
 describe("fleet completion claim verification", () => {
+  for (const ok of [true, false]) {
+    it(`keeps owner closure terminal during an asynchronous ${ok ? "passing" : "failing"} verification`, async () => {
+      const db = unitDb();
+      const key = `VERIFY-CLOSED-DURING-CHECK-${ok}`;
+      db.query("INSERT INTO tasks(key,cat,done,status,completion_claimed) VALUES(?,'verify-race-cat','cmd:synthetic','done-claimed',1)").run(key);
+      db.close();
+      let started;
+      const checking = new Promise(resolve => { started = resolve; });
+      let finish;
+      const pending = new Promise(resolve => { finish = resolve; });
+      const verification = verify(key, async () => { started(); await pending; return { ok, detail: "synthetic check" }; });
+      await checking;
+      expect(await markTaskClosed(key, "owner closed during check")).toContain(`FLEET_TASK_CLOSED ${key}`);
+      finish();
+      expect(await verification).toBe(`VERIFY_CLOSED ${key}: task is terminal`);
+      const stored = unitDb();
+      const task = stored.query("SELECT status,result,evidence,history FROM tasks WHERE key=?").get(key);
+      expect(task.status).toBe("closed");
+      expect(task.result).toBe("owner closed during check");
+      expect(task.evidence).toBeNull();
+      expect(JSON.parse(task.history).some(event => ["verified", "not-done"].includes(event.ev))).toBe(false);
+      stored.close();
+    });
+  }
   it("re-verifies not-done tasks with prior completion claims during watch polling", async () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE tasks(key TEXT,done TEXT,status TEXT,completion_claimed INTEGER)");
@@ -1263,6 +2013,34 @@ describe("fleet completion claim verification", () => {
       stdout: JSON.stringify({ state: "MERGED", headRefOid: "short", mergeCommit: { oid: "short" } }),
     }));
     expect(failed).toMatchObject({ ok: false, headRefOid: undefined, mergeCommit: undefined });
+  });
+
+  it("records bounded, deduplicated context for swallowed PR and Slack errors", async () => {
+    const lines = [];
+    const originalLog = console.log;
+    const head = "abcdef0123456789abcdef0123456789abcdef01";
+    const task = {
+      key: "VERIFY-ERROR-LOG",
+      sent_at: "2026-10-12T10:00:00.000Z",
+      done: "pr:owner/repo#97",
+    };
+    console.log = (...args) => lines.push(args.join(" "));
+    try {
+      const failHead = async () => { throw new Error("g".repeat(200)); };
+      await verifyClaims(`Cursor ACCEPT head=${head.slice(0, 8)}`, task, { getPrHead: failHead });
+      await verifyClaims(`Cursor ACCEPT head=${head.slice(0, 8)}`, task, { getPrHead: failHead });
+      await verifyClaims(`Cursor ACCEPT head=${head.slice(0, 8)}`, task, {
+        getPrHead: async () => head,
+        slackHasHead: async () => { throw new Error("Slack request timeout"); },
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    const headErrors = lines.filter((line) => line.startsWith("FLEET_PR_HEAD_VERIFY_ERROR signal=pr:owner/repo#97 "));
+    expect(headErrors).toHaveLength(1);
+    const errorPrefix = "FLEET_PR_HEAD_VERIFY_ERROR signal=pr:owner/repo#97 ";
+    expect(headErrors[0].slice(errorPrefix.length)).toHaveLength(120);
+    expect(lines.some((line) => line === "FLEET_SLACK_ACCEPT_CHECK_ERROR signal=pr:owner/repo#97 Slack request timeout")).toBe(true);
   });
 
   it("rejects unsupported and credential-bearing curl URLs without executing them", async () => {
@@ -1804,7 +2582,7 @@ describe("fleet dispatch CLI persistence", () => {
       const prompt = join(home, "child-prompt.txt");
       writeFileSync(prompt, "synthetic fleet prompt\n");
       const fleetPath = new URL("./fleet.mjs", import.meta.url).pathname;
-      const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, HERDR_LOG: herdrLog };
+      const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, HERDR_LOG: herdrLog, FLEET_CAT_CRM_PANE: "w6:p1" };
       const proc = Bun.spawn(["bun", fleetPath, "dispatch", "crm", "CHILD", prompt, "--after", "PARENT"], {
         cwd: new URL("..", import.meta.url).pathname,
         env,
@@ -1853,6 +2631,21 @@ describe("fleet dispatch CLI persistence", () => {
   });
 });
 describe("fleet watch sent-unconfirmed recheck", () => {
+  for (const completed of [false, true]) {
+    it(`observes a newly tracked task on an unchanged ${completed ? "completed" : "working"} screen`, async () => {
+      const key = `TASK-TRACK-UNCHANGED-${completed ? "COMPLETED" : "WORKING"}`;
+      const expected = completed ? `FLEET_TASK_DONE crm ${key}` : `FLEET_TASK_STARTED crm ${key}`;
+      const result = await runWatchCycle({
+        catTask: key,
+        trackAfterHeartbeat: true,
+        waitForOutput: expected,
+        command: ["watch", "0"],
+        paneScreen: completed ? `Working (1s)\n⏺ Completed response\n${key}_DONE finished\n\n❯` : "Working (1s)\n❯",
+      });
+      expect(result.output).toContain(expected);
+      expect(result.taskStatus).toBe(completed ? "done-claimed" : "working");
+    });
+  }
   it("marks a late Working pane as started without resending", async () => {
     const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unconfirmed-"));
     const state = join(home, ".local", "state", "omonyang");
@@ -1941,18 +2734,126 @@ describe("fleet working-task compaction recovery", () => {
 
 describe("fleet usage and Bugbot alerts", () => {
   it("honors an idle completion marker before reconciling an expired send reservation", async () => {
+    const attempt = "20000000-0000-4000-8000-000000000002";
     const result = await runWatchCycle({
       catTask: "TASK-DONE-ON-RESTART",
       taskStatus: "send-failed-unconfirmed",
-      taskHistory: [{ ev: "send-attempted", attempt: "fixture-attempt" }],
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-12T00:00:00.000Z" }],
+      taskSentAt: "2026-10-12T00:00:01.000Z",
       reservation: true,
       reservationAgeMs: 10 * 60_000,
-      paneScreen: "⏺ The work is complete.\nTASK-DONE-ON-RESTART_DONE finished\n\n❯",
+      paneScreen: `⏺ The work is complete.\nTASK-DONE-ON-RESTART_DONE attempt=${attempt} finished\n\n❯`,
     });
     expect(result.output).toContain("FLEET_TASK_DONE crm TASK-DONE-ON-RESTART finished");
     expect(result.taskStatus).toBe("done-claimed");
     expect(result.herdrWrites).toEqual([]);
     expect(result.reservationLeft).toBe(true);
+  });
+
+  it("accepts an attemptless DONE after startup migrates a legacy sent task", async () => {
+    const result = await runWatchCycle({
+      catTask: "TASK-LEGACY-DONE-AFTER-MIGRATION",
+      taskStatus: "working",
+      taskHistory: [{ ev: "send-attempted", attempt: "old-version-attempt", at: "2026-10-12T00:00:00.000Z" }],
+      taskSentAt: "2026-10-12T00:00:01.000Z",
+      paneScreen: "⏺ Legacy worker completed\nTASK-LEGACY-DONE-AFTER-MIGRATION_DONE finished\n\n❯",
+    });
+    expect(result.output).toContain("FLEET_TASK_DONE crm TASK-LEGACY-DONE-AFTER-MIGRATION finished");
+    expect(result.taskStatus).toBe("done-claimed");
+    expect(result.taskDispatchAttempt).toBeNull();
+    expect(result.taskSendAttempted).toBe(1);
+  });
+
+  it("recovers an idle reservation when the same-key DONE belongs to an older attempt", async () => {
+    const currentAttempt = "70000000-0000-4000-8000-000000000007";
+    const staleAttempt = "80000000-0000-4000-8000-000000000008";
+    const result = await runWatchCycle({
+      catTask: "TASK-STALE-DONE-RECOVERY",
+      taskStatus: "dispatching",
+      dispatchAttempt: currentAttempt,
+      taskHistory: [{ ev: "send-attempted", attempt: currentAttempt, at: "2026-10-12T00:00:00.000Z" }],
+      taskSentAt: "2026-10-12T00:00:01.000Z",
+      reservation: true,
+      reservationAgeMs: 10 * 60_000,
+      paneScreen: `⏺ Old response\nTASK-STALE-DONE-RECOVERY_DONE attempt=${staleAttempt} old result\n\n❯`,
+    });
+    expect(result.output).toContain("FLEET_SEND_FAILED_UNCONFIRMED TASK-STALE-DONE-RECOVERY");
+    expect(result.output).not.toContain("FLEET_TASK_DONE crm TASK-STALE-DONE-RECOVERY");
+    expect(result.taskStatus).toBe("send-failed-unconfirmed");
+    expect(result.reservationLeft).toBe(false);
+    expect(result.herdrWrites).toContain("pane send-keys w6:p1 ctrl+u");
+  });
+
+  it("ignores a DONE marker from an earlier dispatch attempt after restart", async () => {
+    const result = await runWatchCycle({
+      catTask: "STALE-ATTEMPT-DONE",
+      taskStatus: "working",
+      dispatchAttempt: "30000000-0000-4000-8000-000000000003",
+      taskHistory: [{ ev: "send-attempted", attempt: "30000000-0000-4000-8000-000000000003", at: "2026-10-12T00:00:00.000Z" }],
+      taskSentAt: "2026-10-12T00:00:01.000Z",
+      paneScreen: "⏺ Prior response\nSTALE-ATTEMPT-DONE_DONE attempt=20000000-0000-4000-8000-000000000002 finished\n\n❯",
+    });
+    expect(result.output).not.toContain("FLEET_TASK_DONE crm STALE-ATTEMPT-DONE");
+    expect(result.taskStatus).toBe("working");
+  });
+
+  it("ignores a legacy DONE marker without the dispatch attempt ID", async () => {
+    const attempt = "50000000-0000-4000-8000-000000000005";
+    const result = await runWatchCycle({
+      catTask: "LEGACY-DONE-MARKER",
+      taskStatus: "working",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-12T00:00:00.000Z" }],
+      taskSentAt: "2026-10-12T00:00:01.000Z",
+      paneScreen: "⏺ Prior response\nLEGACY-DONE-MARKER_DONE finished\n\n❯",
+    });
+    expect(result.output).not.toContain("FLEET_TASK_DONE crm LEGACY-DONE-MARKER");
+    expect(result.taskStatus).toBe("working");
+  });
+
+  for (const kind of ["DONE", "BLOCKED"]) {
+    it(`accepts a ${kind} marker for a tracked task by key and track time`, async () => {
+      const key = `TASK-TRACKED-${kind}`;
+      const result = await runWatchCycle({
+        catTask: key,
+        taskStatus: "tracked-unconfirmed",
+        taskHistory: kind === "DONE" ? [] : [{ ev: "tracked", at: "2026-10-12T00:00:00.000Z" }],
+        taskSentAt: "2026-10-12T00:00:01.000Z",
+        paneScreen: `Working (1s)\n⏺ Tracked response\n${key}_${kind} tracked result\n\n❯`,
+      });
+      expect(result.output).toContain(`FLEET_TASK_${kind} crm ${key} tracked result`);
+      expect(result.taskStatus).toBe(kind === "DONE" ? "done-claimed" : "blocked");
+    });
+  }
+
+  it("accepts a matching attempt after Enter fails when the pane is observed working", async () => {
+    const attempt = "60000000-0000-4000-8000-000000000006";
+    const result = await runWatchCycle({
+      catTask: "TASK-EARLY-DONE-MARKER",
+      taskStatus: "send-failed-unconfirmed",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-12T00:00:01.000Z" }],
+      taskSentAt: "2026-10-12T00:00:00.000Z",
+      paneScreen: `Working (1s)\n⏺ Prior response\nTASK-EARLY-DONE-MARKER_DONE attempt=${attempt} finished\n\n❯`,
+    });
+    expect(result.output).toContain("FLEET_TASK_DONE crm TASK-EARLY-DONE-MARKER finished");
+    expect(result.taskStatus).toBe("done-claimed");
+    expect(result.taskSentAt).toBe("2026-10-12T00:00:01.000Z");
+  });
+
+  it("keeps a closed task terminal when its prior DONE marker remains visible after restart", async () => {
+    const attempt = "40000000-0000-4000-8000-000000000004";
+    const result = await runWatchCycle({
+      catTask: "CLOSED-DONE-REPLAY",
+      taskStatus: "closed",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-12T00:00:00.000Z" }],
+      taskSentAt: "2026-10-12T00:00:01.000Z",
+      paneScreen: `⏺ Prior response\nCLOSED-DONE-REPLAY_DONE attempt=${attempt} stale result\n\n❯`,
+    });
+    expect(result.output).not.toContain("FLEET_TASK_DONE crm CLOSED-DONE-REPLAY");
+    expect(result.taskStatus).toBe("closed");
   });
 
   it("re-verifies not-done PR tasks during a watch cycle", async () => {
@@ -2109,25 +3010,49 @@ describe("fleet question policy", () => {
     expect(classified.questionText).toBe("Can I use the staging account password?");
     expect(questionPolicy(classified.questionText)).toBeNull();
     expect(questionPolicy("May I use the production auth account?")?.id).toBe("production-auth-prohibited");
+    expect(questionPolicy("Should we use the production auth account for this one?")).toBeNull();
+    expect(questionPolicy("May I use Jaemin's password or OTP now? before the release?")).toBeNull();
   });
 
-  it("keeps unanswered words inside the question instead of treating them as status markers", async () => {
+  it("joins a wrapped pending question before applying an exact policy", async () => {
+    const question = "May I use Jaemin's password\nor OTP now?";
+    const screen = `Question pending\n${question}\n❯`;
+    const classified = classify(screen);
+    expect(classified.questionText).toBe("May I use Jaemin's password or OTP now?");
+    expect(questionPolicy(classified.questionText)?.id).toBe("personal-credentials-defer");
+
+    const result = await runWatchCycle({
+      catTask: "Q-WRAPPED-POLICY",
+      paneScreen: screen,
+    });
+    expect(result.output).toContain("FLEET_AUTO_ANSWER crm Q-WRAPPED-POLICY policy=personal-credentials-defer");
+    expect(result.herdrWrites).toHaveLength(2);
+  });
+
+  it("keeps unanswered words inside a near-miss question and does not auto-answer it", async () => {
     const question = "May I use the production auth account for this unanswered issue?";
     const classified = classify(`Question pending\n${question}\n❯`);
     expect(classified.state).toBe("question");
     expect(classified.questionText).toBe(question);
-    expect(questionPolicy(classified.questionText)?.id).toBe("production-auth-prohibited");
+    expect(questionPolicy(classified.questionText)).toBeNull();
 
     const result = await runWatchCycle({
       catTask: "Q-UNANSWERED-WORD",
       paneScreen: `Question pending\n${question}\n❯`,
     });
-    expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-UNANSWERED-WORD policy=production-auth-prohibited");
-    expect(result.herdrWrites).toEqual([
-      "pane send-text w6:p1 운영 인증 계정은 사용하지 마.",
-      "pane send-keys w6:p1 Enter",
-    ]);
+    expect(result.output).toContain("FLEET_QUESTION_NOTIFY owner=omonyang crm Q-UNANSWERED-WORD");
+    expect(result.herdrWrites).toEqual([]);
     expect(classify("This is still an unanswered issue\n❯").state).toBe("idle");
+  });
+
+  it("does not answer an exact allowlisted prompt unless the pane is in question state", async () => {
+    const calls = [];
+    const answered = await answerPaneQuestion("w6:p1", "Should we use the production auth account?", "Do not use it.", async (argv) => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: "Should we use the production auth account?\n❯" };
+    });
+    expect(answered).toBe(false);
+    expect(calls).toEqual([["herdr", "pane", "read", "w6:p1", "--source", "visible", "--format", "text"]]);
   });
 
   it("retries an allowlisted answer after a transient send failure", async () => {
@@ -2157,6 +3082,18 @@ describe("fleet question policy", () => {
     expect(calls).toEqual([["herdr", "pane", "read", "w6:p1", "--source", "visible", "--format", "text"]]);
   });
 
+  it("does not auto-answer near-miss policy prompts", async () => {
+    const question = "Should we use the production auth account for this unanswered issue?";
+    expect(questionPolicy(question)).toBeNull();
+    const result = await runWatchCycle({
+      catTask: "Q-NEAR-MISS",
+      paneScreen: `Question pending\n${question}\n❯`,
+    });
+    expect(result.output).toContain("FLEET_QUESTION_NOTIFY owner=omonyang crm Q-NEAR-MISS");
+    expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
+    expect(result.herdrWrites).toEqual([]);
+  });
+
   it("defers personal password or OTP use and answers through the fake pane", async () => {
     const result = await runWatchCycle({
       catTask: "Q-PERSONAL",
@@ -2175,6 +3112,10 @@ describe("fleet question policy", () => {
       paneScreen: "Question pending\nShould we use the production auth account?\n❯",
     });
     expect(result.output).toContain("FLEET_QUESTION_ANSWERED crm Q-PRODUCTION policy=production-auth-prohibited");
+    expect(result.output).toContain("FLEET_AUTO_ANSWER crm Q-PRODUCTION policy=production-auth-prohibited");
+    expect(result.taskHistory.some((event) => event.ev === "question-auto-answer" && event.policy === "production-auth-prohibited")).toBe(true);
+    expect(result.output).toContain("FLEET_AUTO_ANSWER crm Q-PRODUCTION policy=production-auth-prohibited");
+    expect(result.taskHistory.some((event) => event.ev === "question-auto-answer" && event.policy === "production-auth-prohibited")).toBe(true);
     expect(result.herdrWrites).toEqual([
       "pane send-text w6:p1 운영 인증 계정은 사용하지 마.",
       "pane send-keys w6:p1 Enter",
@@ -2192,6 +3133,17 @@ describe("fleet question policy", () => {
 });
 
 describe("fleet text board", () => {
+  it("omits closed PR tasks from active board review lists", async () => {
+    const board = await runFleetBoard({
+      catTask: "CLOSED-PR",
+      taskStatus: "closed",
+      prDone: "pr:whelp99-code/jm-omo#78",
+    });
+    expect(board.exitCode).toBe(0);
+    expect(board.output).not.toContain("#78 OPEN draft");
+    expect(board.output).not.toContain("FLEET_BUGBOT_LIMIT CLOSED-PR");
+  });
+
   it("persists unknown cat state after a pane read failure", async () => {
     const result = await runFleetCommand({
       catState: "working",
@@ -2234,7 +3186,7 @@ describe("fleet UTF-8 dispatch and prompt isolation", () => {
     const result = await runRawUtf8Dispatch();
     const sentMessage = result.sendBytes.subarray(0, result.sendBytes.length - 1).toString("utf8");
     const attempt = sentMessage.match(/^UTF8-QA \[attempt=([0-9a-f-]{36}) skill:ulw\]:/)?.[1];
-    const expectedMessage = `UTF8-QA [attempt=${attempt} skill:ulw]: 지시문 파일 ${result.prompt} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 UTF8-QA_DONE <한 줄 요약> 또는 UTF8-QA_BLOCKED reason=<한 줄>.`;
+    const expectedMessage = `UTF8-QA [attempt=${attempt} skill:ulw]: 지시문 파일 ${result.prompt} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 UTF8-QA_DONE attempt=${attempt} <한 줄 요약> 또는 UTF8-QA_BLOCKED attempt=${attempt} reason=<한 줄>.`;
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("DISPATCH_OK crm UTF8-QA started (MODEL_KEPT)");

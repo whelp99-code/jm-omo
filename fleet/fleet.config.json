@@ -1,0 +1,106 @@
+{
+  "cats": [
+    {
+      "id": "omonyang",
+      "name": "오모냥",
+      "role": "대장: 계획·배분·확인",
+      "kind": "captain",
+      "pane": "w3:p2",
+      "product": "-"
+    },
+    {
+      "id": "nahee",
+      "name": "나희",
+      "role": "부대장: 대장 대행, 지원",
+      "kind": "vice",
+      "pane": "-",
+      "product": "-"
+    },
+    {
+      "id": "seoyun",
+      "name": "서윤",
+      "role": "감시·Cursor 검수 전달",
+      "kind": "bot",
+      "pane": "-",
+      "product": "-"
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor 봇",
+      "role": "독립 검수(ACCEPT/REVISE)",
+      "kind": "bot",
+      "pane": "-",
+      "product": "-"
+    },
+    {
+      "id": "gajae",
+      "name": "가재",
+      "role": "서버 이전·인프라 실행",
+      "kind": "bot",
+      "pane": "w2:p1",
+      "product": "-"
+    },
+    {
+      "id": "jarvis",
+      "name": "JARVIS 냥",
+      "role": "JARVIS 개발",
+      "kind": "pane",
+      "pane": "w5:p1",
+      "product": "Orca-JARVIS"
+    },
+    {
+      "id": "sb",
+      "name": "SB 냥",
+      "role": "Second Brain 개발",
+      "kind": "pane",
+      "pane": "w5:p2",
+      "product": "second-brain-app"
+    },
+    {
+      "id": "crm",
+      "name": "CRM 냥",
+      "role": "CRM(core5) 개발",
+      "kind": "pane",
+      "pane": "w5:p4",
+      "product": "ai-crm-project-manager"
+    },
+    {
+      "id": "price",
+      "name": "Price 냥",
+      "role": "Price 개발",
+      "kind": "pane",
+      "pane": "w5:p3",
+      "product": "price-ai-tax"
+    },
+    {
+      "id": "mail",
+      "name": "Mail 냥",
+      "role": "Mail 개발",
+      "kind": "pane",
+      "pane": "w5:p5",
+      "product": "mail-intelligence"
+    },
+    {
+      "id": "jarvis2",
+      "name": "JARVIS 보조 냥",
+      "role": "JARVIS 보조(압축 문제로 휴식)",
+      "kind": "pane",
+      "pane": "-",
+      "product": "Orca-JARVIS"
+    },
+    {
+      "id": "omodev",
+      "name": "OmO Dev",
+      "role": "OmO development",
+      "kind": "pane",
+      "pane": "-",
+      "product": "-"
+    }
+  ],
+  "slack": {
+    "reviewChannel": "C0C6HJM0BV5",
+    "cursorUserId": "U0B81F5GR6V",
+    "reviewReplyAppId": "A08SKDT6QUW"
+  },
+  "agentMessengerCredentialPath": "/home/jm/.nvm/versions/node/v24.19.0/lib/node_modules/agent-messenger/dist/src/platforms/slackbot/credential-manager.js"
+}

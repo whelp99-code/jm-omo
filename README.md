@@ -24,16 +24,25 @@
 - **감시**: `fleet watch 30` — 상태 변화·완료/막힘 줄·PR READY·가재 recovery_hold/suppressed를 `FLEET_*` 이벤트로. 30초마다 `captain-heartbeat.json` 갱신.
 - **대장·부대장**: heartbeat 30분 끊김 또는 대장 한도 소진 → 나희가 같은 장부로 대행 (`fleet/VICE-CAPTAIN.md`).
 
+### Fleet configuration
+
+`fleet/fleet.config.json` is loaded when `fleet.mjs` starts. Its `cats` array defines each cat's `id`, display `name`, `role`, `kind`, `pane`, and `product`; `fleet init` upserts these configured panes into the fleet database. The `slack` object holds `reviewChannel`, `cursorUserId`, and `reviewReplyAppId`. `agentMessengerCredentialPath` is the absolute path to the global agent-messenger Slack credential manager.
+
+Environment overrides are `FLEET_CAT_<ID>_PANE` (for example, `FLEET_CAT_CRM_PANE`), `FLEET_SLACK_REVIEW_CHANNEL`, `FLEET_CURSOR_USER_ID`, `FLEET_REVIEW_REPLY_APP_ID`, and `FLEET_AGENT_MESSENGER_CREDENTIAL_PATH`.
+
 ```bash
 cd fleet
 bun fleet.mjs init
 bun fleet.mjs dispatch crm TASK-X /path/TASK-X.txt --type impl --skill ulw --done 'pr:whelp99-code/ai-crm-project-manager#58'
 bun fleet.mjs verify TASK-X
+bun fleet.mjs close TASK-X "owner closed stale task"
 bun fleet.mjs report
 ```
 
+`fleet close <KEY> <reason>` manually closes a task, records the reason, releases its pane reservation, and removes it from the cat's active task slot. Closed tasks do not block later dispatches or appear in active PR polling.
+
 ## 지켜야 할 규칙 (요약)
-- 머지 근거는 Cursor 봇(U0B81F5GR6V) 본인 글의 ACCEPT/APPROVE만, head 고정 머지.
+- 머지 근거는 `fleet.config.json`에 지정된 Cursor 봇의 본인 글 ACCEPT/APPROVE만, head 고정 머지.
 - 결재(돈·세무 전송·외부 발송·Notion 금액/상태)는 재민 직접 승인만.
 - 비밀값은 출력·채팅 금지, 파일째 이동(0600). 새 봇 생성 금지. 오모냥 모델 변경 금지.
 - 기계 확인은 최소 조건이고, 그 위에 독립 검수와 실사용 확인.
