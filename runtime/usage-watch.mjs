@@ -87,6 +87,8 @@ async function sendCmd(text, confirm) {
 }
 
 async function selfPolicy(usage) {
+  // Disabled 2026-10-13: JARVIS owns w5:p1; fleet usage checks must not switch it.
+  return;
   let screen = await sh(`herdr pane read ${SELF_PANE} --source visible --format text`);
   if (/esc to interrupt/.test(screen) || usage.anthropic === undefined) return;
   const cur = footerSel(screen);

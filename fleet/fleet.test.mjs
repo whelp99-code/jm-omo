@@ -273,7 +273,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     proc = undefined;
     const herdrCalls = existsSync(herdrLog) ? readFileSync(herdrLog, "utf8").trim().split("\n") : [];
     const stored = new Database(dbPath);
-    const storedTask = taskKey ? stored.query("SELECT status,sent_at,history FROM tasks WHERE key=?").get(taskKey) : null;
+    const storedTask = taskKey ? stored.query("SELECT status,sent_at,history,dispatch_attempt,send_attempted FROM tasks WHERE key=?").get(taskKey) : null;
     const storedTaskStatus = storedTask?.status ?? null;
     const storedTaskHistory = JSON.parse(storedTask?.history || "[]");
     const storedCatPane = stored.query("SELECT pane FROM cats WHERE id='crm'").get()?.pane ?? null;
@@ -2832,7 +2832,7 @@ describe("fleet usage and Bugbot alerts", () => {
     });
     expect(result.output).toContain("FLEET_TASK_DONE crm TASK-EARLY-DONE-MARKER finished");
     expect(result.taskStatus).toBe("done-claimed");
-    expect(Date.parse(result.taskSentAt)).toBeGreaterThan(Date.parse("2026-10-12T00:00:01.000Z"));
+    expect(result.taskSentAt).toBe("2026-10-12T00:00:01.000Z");
   });
 
   it("keeps a closed task terminal when its prior DONE marker remains visible after restart", async () => {
