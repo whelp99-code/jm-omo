@@ -154,7 +154,7 @@ async function runRawUtf8Dispatch() {
   }
 }
 
-async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], dispatchAttempt = "", taskSentAt = "", reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", fleetEnv = {}, waitForOutput = "", failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], dispatchAttempt = "", taskSentAt = "", reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", fleetEnv = {}, waitForOutput = "", trackAfterHeartbeat = false, failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
   const state = join(home, ".local", "state", "omonyang");
   const bin = join(home, "bin");
@@ -180,12 +180,12 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);
   CREATE TABLE dispatch_reservations(pane TEXT PRIMARY KEY,key TEXT UNIQUE NOT NULL,attempt TEXT NOT NULL,reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
   const taskKey = catTask || (prDone ? "PR-TASK" : "");
-  if (taskKey) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at,history) VALUES(?,'crm',?,?,?,?,?)")
+  if (taskKey && !trackAfterHeartbeat) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at,history) VALUES(?,'crm',?,?,?,?,?)")
     .run(taskKey, taskKey, prDone, taskStatus, new Date().toISOString(), JSON.stringify(taskHistory));
   if (taskKey && taskSentAt) db.query("UPDATE tasks SET sent_at=? WHERE key=?").run(taskSentAt, taskKey);
   if (taskKey && dispatchAttempt) db.query("UPDATE tasks SET dispatch_attempt=?,send_attempted=1,sent_at=? WHERE key=?")
     .run(dispatchAttempt, taskSentAt || new Date(Date.now() + 1000).toISOString(), taskKey);
-  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture',?,?)").run(catState, taskKey || null);
+  db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture',?,?)").run(catState, trackAfterHeartbeat ? null : taskKey || null);
   if (reservation && taskKey) {
     db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES('w6:p1',?,?,?)")
       .run(taskKey, dispatchAttempt || "fixture-attempt", new Date(Date.now() - reservationAgeMs).toISOString());
@@ -259,6 +259,13 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     if (heartbeat) {
       await heartbeat;
       clearTimeout(heartbeatTimeout);
+      if (trackAfterHeartbeat) {
+        const assigning = new Database(dbPath);
+        assigning.query("INSERT INTO tasks(key,cat,title,status,sent_at,history) VALUES(?,'crm',?,'tracked-unconfirmed',?,'[]')")
+          .run(taskKey, taskKey, new Date().toISOString());
+        assigning.query("UPDATE cats SET task=? WHERE id='crm'").run(taskKey);
+        assigning.close();
+      }
       if (waitForOutput) await outputPromise;
       proc.kill();
     }
@@ -278,6 +285,8 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
       exitCode,
       taskStatus: storedTaskStatus,
       taskSentAt: storedTask?.sent_at ?? null,
+      taskDispatchAttempt: storedTask?.dispatch_attempt ?? null,
+      taskSendAttempted: storedTask?.send_attempted ?? 0,
       taskHistory: storedTaskHistory,
       catPane: storedCatPane,
       reservationLeft,
@@ -523,6 +532,46 @@ describe("fleet model-switch waits", () => {
     stored.close();
   });
 
+  for (const status of ["dispatch-error", "waiting"]) {
+    it(`keeps a retained reservation recoverable when retrying a ${status} task`, async () => {
+      const db = unitDb();
+      const key = `TASK-REQUEUE-DIRTY-${status.toUpperCase()}`;
+      const cat = `requeue-dirty-${status}`;
+      const pane = `w-requeue-${status}:p1`;
+      const prompt = join(unitHome, `${key}.txt`);
+      const reservedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+      writeFileSync(prompt, "do not queue while dirty pane reservation remains\n");
+      db.query("INSERT INTO cats(id,name,pane,task) VALUES(?,?,?,?)").run(cat, cat, pane, key);
+      db.query("INSERT INTO tasks(key,cat,status) VALUES(?,?,?)").run(key, cat, status);
+      db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES(?,?,?,?)")
+        .run(pane, key, `requeue-attempt-${status}`, reservedAt);
+      db.close();
+
+      const retryCommands = [];
+      expect(await dispatch(cat, key, prompt, {
+        keepModel: true,
+        runCommand: async argv => { retryCommands.push(argv); return { exitCode: 0, stdout: "Select model\n→ model [provider]\n❯" }; },
+      })).toBe(`DISPATCH_HOLD ${cat} reservation-retained; not queued`);
+      expect(retryCommands).toEqual([]);
+      const retained = unitDb();
+      expect(retained.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("dispatch-error");
+      expect(retained.query("SELECT pane FROM dispatch_reservations WHERE key=?").get(key).pane).toBe(pane);
+      retained.close();
+
+      let reads = 0;
+      const recovered = unitDb();
+      const events = await recoverInterruptedDispatches(recovered, [{ id: cat, state: "model-picker" }],
+        Date.parse(reservedAt) + 11 * 60_000, async argv => {
+          if (argv[2] === "read") return { exitCode: 0, stdout: ++reads === 1 ? "Select model\n→ model [provider]\n❯" : "Idle\n❯" };
+          return { exitCode: 0, stdout: "" };
+        });
+      expect(events).toEqual([`FLEET_DISPATCH_INTERRUPTED ${key} pane=${pane} reservation_released`]);
+      expect(recovered.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("dispatch-interrupted");
+      expect(recovered.query("SELECT key FROM dispatch_reservations WHERE key=?").get(key)).toBeNull();
+      recovered.close();
+    });
+  }
+
   it("waits for an empty prompt after xhigh confirmation before sending the task", async () => {
     const db = unitDb();
     const pane = "w-mail-hardening:p1";
@@ -741,7 +790,35 @@ describe("fleet dispatch reservations", () => {
     stored.close();
   });
 
-  it("refreshes the current attempt send time when Enter fails but the pane starts", async () => {
+  it("preserves sent_at after successful Enter and late Working observation", async () => {
+    const db = unitDb();
+    const key = "TASK-SUCCESSFUL-ENTER-LATE-WORKING";
+    const prompt = join(unitHome, `${key}.txt`);
+    writeFileSync(prompt, "synthetic late Working fixture\n");
+    db.query("INSERT INTO cats(id,name,pane) VALUES('late-working-cat','Late Working','late-working:p1')").run();
+    db.close();
+    let entered = false;
+    let polls = 0;
+    expect(await dispatch("late-working-cat", key, prompt, {
+      keepModel: true,
+      runCommand: async argv => {
+        if (argv[2] === "read") return { exitCode: 0, stdout: entered && ++polls === 3 ? "Working (1s)\n❯" : "Idle\n❯" };
+        if (argv[2] === "send-keys" && argv[4] === "Enter") entered = true;
+        return { exitCode: 0, stdout: "" };
+      },
+      sleep: async () => {},
+    })).toContain(`DISPATCH_OK late-working-cat ${key} started`);
+    const stored = unitDb();
+    const task = stored.query("SELECT sent_at,started_at,status,history FROM tasks WHERE key=?").get(key);
+    const send = JSON.parse(task.history).findLast(event => event.ev === "send-attempted");
+    expect(polls).toBe(3);
+    expect(task.status).toBe("working");
+    expect(task.sent_at).toBe(send.at);
+    expect(task.started_at).not.toBeNull();
+    stored.close();
+  });
+
+  it("preserves the current attempt send time when Enter fails but the pane starts", async () => {
     const db = unitDb();
     const prompt = join(unitHome, "started-after-enter-error-prompt.txt");
     const pane = "w-started-after-enter-error:p1";
@@ -1388,7 +1465,7 @@ describe("fleet dispatch reservations", () => {
     expect(dispatched).toContain("DISPATCH_OK closed-release-cat AFTER-CLOSED");
   });
 
-  for (const status of ["dispatching", "send-failed-unconfirmed"]) {
+  for (const status of ["dispatching", "sent-unconfirmed", "send-failed-unconfirmed"]) {
     it(`clears and verifies pane input before closing a ${status} task`, async () => {
       const db = unitDb();
       const pane = `w-close-${status}:p1`;
@@ -1419,6 +1496,67 @@ describe("fleet dispatch reservations", () => {
       stored.close();
     });
   }
+
+  for (const reserved of [false, true]) {
+    it(`holds dispatch after a configured pane move with ${reserved ? "an old reservation" : "unresolved work"}`, async () => {
+      const db = unitDb();
+      const previous = db.query("SELECT * FROM cats WHERE id='crm'").get();
+      const key = `STALE-PANE-${reserved}`;
+      const nextKey = `${key}-NEXT`;
+      const prompt = join(unitHome, `${key}.txt`);
+      writeFileSync(prompt, "synthetic stale pane fixture\n");
+      db.query(`INSERT INTO cats(id,name,pane,task) VALUES('crm','CRM','old-configured-pane',?)
+        ON CONFLICT(id) DO UPDATE SET pane=excluded.pane,task=excluded.task`).run(key);
+      db.query("INSERT INTO tasks(key,cat,status) VALUES(?,'crm',?)").run(key, reserved ? "send-failed-unconfirmed" : "working");
+      if (reserved) db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES('old-configured-pane',?,'stale-pane-attempt')").run(key);
+      const calls = [];
+      try {
+        const result = await dispatch("crm", nextKey, prompt, {
+          keepModel: true,
+          sleep: async () => {},
+          runCommand: async argv => {
+            calls.push(argv);
+            return { exitCode: 0, stdout: argv[2] === "read" ? "Idle\n❯" : "" };
+          },
+        });
+        expect(result).toBe(`DISPATCH_HOLD crm ${reserved ? "pane-reserved" : "prior-task-unresolved"}; not sent`);
+        expect(calls.every(argv => argv[2] === "read" && argv[3] !== "old-configured-pane")).toBe(true);
+        expect(db.query("SELECT key FROM tasks WHERE key=?").get(nextKey)).toBeNull();
+        expect(db.query("SELECT task FROM cats WHERE id='crm'").get().task).toBe(key);
+        if (reserved) expect(db.query("SELECT key FROM dispatch_reservations WHERE key=?").get(key)?.key).toBe(key);
+      } finally {
+        db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
+        db.query("DELETE FROM tasks WHERE key IN (?,?)").run(key, nextKey);
+        if (previous) db.query("UPDATE cats SET pane=?,task=? WHERE id='crm'").run(previous.pane, previous.task);
+        else db.query("DELETE FROM cats WHERE id='crm'").run();
+        db.close();
+      }
+    });
+  }
+
+  it("retains a sent-unconfirmed reservation when input cleanup fails", async () => {
+    const db = unitDb();
+    const key = "TASK-SENT-UNCONFIRMED-CLEANUP-FAILURE";
+    const pane = "uncertain-close:p1";
+    db.query("INSERT INTO cats(id,name,pane,task) VALUES(?,'Uncertain Close',?,?)").run(key, pane, key);
+    db.query("INSERT INTO tasks(key,cat,status) VALUES(?,?,'sent-unconfirmed')").run(key, key);
+    db.query("INSERT INTO dispatch_reservations(pane,key,attempt) VALUES(?,?,'uncertain-close-attempt')").run(pane, key);
+    db.close();
+    const calls = [];
+    expect(await markTaskClosed(key, "owner cancelled uncertain input", async argv => {
+      calls.push(argv);
+      if (argv[2] === "read") return { exitCode: 0, stdout: "Idle\n❯ stale instruction" };
+      return { exitCode: argv[4] === "ctrl+u" ? 1 : 0, stdout: "" };
+    })).toBe(`FLEET_TASK_CLOSE_ERROR ${key} input_cleanup_unverified`);
+    expect(calls.some(argv => argv[4] === "ctrl+u")).toBe(true);
+    const stored = unitDb();
+    expect(stored.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("sent-unconfirmed");
+    expect(stored.query("SELECT task FROM cats WHERE id=?").get(key).task).toBe(key);
+    expect(stored.query("SELECT key,attempt,recovery_token FROM dispatch_reservations WHERE key=?").get(key))
+      .toEqual({ key, attempt: "uncertain-close-attempt", recovery_token: null });
+    expect(JSON.parse(stored.query("SELECT history FROM tasks WHERE key=?").get(key).history).some(event => event.ev === "closed")).toBe(false);
+    stored.close();
+  });
 
   it("clears the reservation pane rather than the current configured pane on close", async () => {
     const db = unitDb();
@@ -1636,6 +1774,30 @@ describe("fleet completion classification", () => {
 });
 
 describe("fleet completion claim verification", () => {
+  for (const ok of [true, false]) {
+    it(`keeps owner closure terminal during an asynchronous ${ok ? "passing" : "failing"} verification`, async () => {
+      const db = unitDb();
+      const key = `VERIFY-CLOSED-DURING-CHECK-${ok}`;
+      db.query("INSERT INTO tasks(key,cat,done,status,completion_claimed) VALUES(?,'verify-race-cat','cmd:synthetic','done-claimed',1)").run(key);
+      db.close();
+      let started;
+      const checking = new Promise(resolve => { started = resolve; });
+      let finish;
+      const pending = new Promise(resolve => { finish = resolve; });
+      const verification = verify(key, async () => { started(); await pending; return { ok, detail: "synthetic check" }; });
+      await checking;
+      expect(await markTaskClosed(key, "owner closed during check")).toContain(`FLEET_TASK_CLOSED ${key}`);
+      finish();
+      expect(await verification).toBe(`VERIFY_CLOSED ${key}: task is terminal`);
+      const stored = unitDb();
+      const task = stored.query("SELECT status,result,evidence,history FROM tasks WHERE key=?").get(key);
+      expect(task.status).toBe("closed");
+      expect(task.result).toBe("owner closed during check");
+      expect(task.evidence).toBeNull();
+      expect(JSON.parse(task.history).some(event => ["verified", "not-done"].includes(event.ev))).toBe(false);
+      stored.close();
+    });
+  }
   it("re-verifies not-done tasks with prior completion claims during watch polling", async () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE tasks(key TEXT,done TEXT,status TEXT,completion_claimed INTEGER)");
@@ -2462,6 +2624,21 @@ describe("fleet dispatch CLI persistence", () => {
   });
 });
 describe("fleet watch sent-unconfirmed recheck", () => {
+  for (const completed of [false, true]) {
+    it(`observes a newly tracked task on an unchanged ${completed ? "completed" : "working"} screen`, async () => {
+      const key = `TASK-TRACK-UNCHANGED-${completed ? "COMPLETED" : "WORKING"}`;
+      const expected = completed ? `FLEET_TASK_DONE crm ${key}` : `FLEET_TASK_STARTED crm ${key}`;
+      const result = await runWatchCycle({
+        catTask: key,
+        trackAfterHeartbeat: true,
+        waitForOutput: expected,
+        command: ["watch", "0"],
+        paneScreen: completed ? `Working (1s)\n⏺ Completed response\n${key}_DONE finished\n\n❯` : "Working (1s)\n❯",
+      });
+      expect(result.output).toContain(expected);
+      expect(result.taskStatus).toBe(completed ? "done-claimed" : "working");
+    });
+  }
   it("marks a late Working pane as started without resending", async () => {
     const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unconfirmed-"));
     const state = join(home, ".local", "state", "omonyang");
@@ -2565,6 +2742,20 @@ describe("fleet usage and Bugbot alerts", () => {
     expect(result.taskStatus).toBe("done-claimed");
     expect(result.herdrWrites).toEqual([]);
     expect(result.reservationLeft).toBe(true);
+  });
+
+  it("accepts an attemptless DONE after startup migrates a legacy sent task", async () => {
+    const result = await runWatchCycle({
+      catTask: "TASK-LEGACY-DONE-AFTER-MIGRATION",
+      taskStatus: "working",
+      taskHistory: [{ ev: "send-attempted", attempt: "old-version-attempt", at: "2026-10-12T00:00:00.000Z" }],
+      taskSentAt: "2026-10-12T00:00:01.000Z",
+      paneScreen: "⏺ Legacy worker completed\nTASK-LEGACY-DONE-AFTER-MIGRATION_DONE finished\n\n❯",
+    });
+    expect(result.output).toContain("FLEET_TASK_DONE crm TASK-LEGACY-DONE-AFTER-MIGRATION finished");
+    expect(result.taskStatus).toBe("done-claimed");
+    expect(result.taskDispatchAttempt).toBeNull();
+    expect(result.taskSendAttempted).toBe(1);
   });
 
   it("recovers an idle reservation when the same-key DONE belongs to an older attempt", async () => {
@@ -2814,6 +3005,21 @@ describe("fleet question policy", () => {
     expect(questionPolicy("May I use the production auth account?")?.id).toBe("production-auth-prohibited");
     expect(questionPolicy("Should we use the production auth account for this one?")).toBeNull();
     expect(questionPolicy("May I use Jaemin's password or OTP now? before the release?")).toBeNull();
+  });
+
+  it("joins a wrapped pending question before applying an exact policy", async () => {
+    const question = "May I use Jaemin's password\nor OTP now?";
+    const screen = `Question pending\n${question}\n❯`;
+    const classified = classify(screen);
+    expect(classified.questionText).toBe("May I use Jaemin's password or OTP now?");
+    expect(questionPolicy(classified.questionText)?.id).toBe("personal-credentials-defer");
+
+    const result = await runWatchCycle({
+      catTask: "Q-WRAPPED-POLICY",
+      paneScreen: screen,
+    });
+    expect(result.output).toContain("FLEET_AUTO_ANSWER crm Q-WRAPPED-POLICY policy=personal-credentials-defer");
+    expect(result.herdrWrites).toHaveLength(2);
   });
 
   it("keeps unanswered words inside a near-miss question and does not auto-answer it", async () => {

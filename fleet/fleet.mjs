@@ -150,21 +150,27 @@ export function classify(screen) {
     const screenLines = screen.replace(/\r/g, "").split("\n");
     const marker = screenLines.findLastIndex(isQuestionStatusLine);
     const prompt = screenLines.findLastIndex((line) => /^\s*❯/.test(line));
-    if (marker >= 0) questionText = screenLines.slice(marker + 1, prompt >= marker ? prompt : undefined).join("\n").trim().slice(-800);
-    else questionText = output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3).join("\n").trim().slice(-800);
+    const questionLines = marker >= 0
+      ? screenLines.slice(marker + 1, prompt >= marker ? prompt : undefined)
+      : output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3);
+    questionText = questionLines.map((line) => line.trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(-800);
   }
   return { state, model, done: done ? { key: done[1], kind: done[2], attempt: completion?.[1].replace(/\s/g, "") ?? null, text: (completion?.[2] ?? done[3]).replace(/\s*\n\s*/g, " ").trim().slice(0, 200) } : null, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
 }
 
 export function completionBelongsToDispatchAttempt(task, marker) {
   if (!task || ["closed", "done-claimed", "verified-done"].includes(task.status) || task.completion_claimed) return false;
+  if (task.key && marker?.key !== task.key) return false;
   const history = JSON.parse(task.history || "[]");
   if (!task.dispatch_attempt) {
-    if (!["tracked-unconfirmed", "working"].includes(task.status) || task.send_attempted) return false;
+    const sentAt = Date.parse(task.sent_at ?? "");
+    if (!Number.isFinite(sentAt) || marker?.attempt) return false;
+    if (task.send_attempted)
+      return ["dispatching", "sent-unconfirmed", "send-failed-unconfirmed", "working"].includes(task.status);
+    if (!["tracked-unconfirmed", "working"].includes(task.status)) return false;
     const tracked = history.findLast((event) => event.ev === "tracked");
     const trackAt = Date.parse(tracked?.at ?? task.sent_at ?? "");
-    const sentAt = Date.parse(task.sent_at ?? "");
-    return Number.isFinite(trackAt) && Number.isFinite(sentAt) && sentAt >= trackAt;
+    return Number.isFinite(trackAt) && sentAt >= trackAt;
   }
   return marker?.attempt === task.dispatch_attempt && Boolean(task.send_attempted);
 }
@@ -292,7 +298,7 @@ export async function markTaskClosed(key, reason, runCommand = executeSignalComm
   const releaseCloseClaim = () => {
     if (closeReservation && closeToken) releaseReservationRecovery(db, closeReservation, closeToken);
   };
-  if (["dispatching", "send-failed-unconfirmed"].includes(current.status)) {
+  if (["dispatching", "sent-unconfirmed", "send-failed-unconfirmed"].includes(current.status)) {
     closeReservation = db.query("SELECT pane,key,attempt,reserved_at FROM dispatch_reservations WHERE key=?").get(key) ?? null;
     const pane = closeReservation?.pane ?? configuredCatPane(current.cat, current.pane);
     if (!pane || pane === "-") return `FLEET_TASK_CLOSE_ERROR ${key} pane_unavailable`;
@@ -356,8 +362,9 @@ export function recordDispatchSendAttempt(dbHandle, pane, key, attempt) {
     const reservation = dbHandle.query("SELECT key,attempt,recovery_token FROM dispatch_reservations WHERE pane=?").get(pane);
     const task = dbHandle.query("SELECT status FROM tasks WHERE key=?").get(key);
     if (reservation?.key !== key || reservation.attempt !== attempt || reservation.recovery_token || task?.status !== "dispatching") return false;
-    dbHandle.query("UPDATE tasks SET send_attempted=1 WHERE key=? AND status='dispatching'").run(key);
-    appendHistoryInTransaction(dbHandle, key, { ev: "send-attempted", attempt });
+    const sentAt = now();
+    dbHandle.query("UPDATE tasks SET send_attempted=1,sent_at=? WHERE key=? AND status='dispatching'").run(sentAt, key);
+    appendHistoryInTransaction(dbHandle, key, { ev: "send-attempted", attempt, at: sentAt });
     return true;
   }).immediate();
 }
@@ -1293,6 +1300,15 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     await recoverInterruptedDispatches(db, [{ id: catId, state: screen.exitCode === 0 ? classify(screen.stdout).state : "unknown" }]);
     existing = db.query("SELECT cat,status FROM tasks WHERE key=?").get(key);
   }
+  const retainedReservation = db.query("SELECT pane FROM dispatch_reservations WHERE key=?").get(key);
+  if (retainedReservation && existing?.cat === catId && existing.status === "waiting") {
+    const detail = "queued retry found a retained pane reservation";
+    db.query("UPDATE tasks SET status='dispatch-error',result=? WHERE key=? AND status='waiting'").run(detail, key);
+    log(key, { ev: "dispatch-error", detail });
+    existing.status = "dispatch-error";
+  }
+  if (retainedReservation && existing?.cat === catId && existing.status === "dispatch-error")
+    return `DISPATCH_HOLD ${catId} reservation-retained; not queued`;
   if (existing && (existing.cat !== catId || !["waiting", "dispatch-interrupted", "dispatch-error", "dispatch-held", "dispatch-failed-before-send"].includes(existing.status))) return `DISPATCH_HOLD ${catId} duplicate-key; not sent`;
   if (!(await Bun.file(prompt).exists())) throw new Error(`prompt file missing: ${prompt}`);
   if (after) {
@@ -1309,9 +1325,10 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
   const claim = db.transaction(() => {
     const existing = db.query("SELECT key,cat,status FROM tasks WHERE key=?").get(key);
     if (existing && (existing.cat !== catId || !["waiting", "dispatch-interrupted", "dispatch-error", "dispatch-held", "dispatch-failed-before-send"].includes(existing.status))) return { hold: "duplicate-key" };
-    if (db.query("SELECT key FROM dispatch_reservations WHERE pane=?").get(c.pane)) return { hold: "pane-reserved" };
+    if (db.query(`SELECT r.key FROM dispatch_reservations r JOIN tasks t ON t.key=r.key
+      WHERE r.pane=? OR t.cat=? LIMIT 1`).get(c.pane, catId)) return { hold: "pane-reserved" };
     const active = db.query(`SELECT t.key FROM tasks t JOIN cats c ON c.id=t.cat
-      WHERE c.pane=? AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','closed','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, key);
+      WHERE (c.pane=? OR t.cat=?) AND t.key!=? AND t.status NOT IN ('waiting','verified-done','blocked','closed','prompt-lost','send-failed-unconfirmed','dispatch-interrupted','dispatch-error','dispatch-held','dispatch-failed-before-send') LIMIT 1`).get(c.pane, catId, key);
     if (active) return { hold: "prior-task-unresolved" };
     const attempt = crypto.randomUUID();
     const model = want ? `${want.provider}/${want.model}:${want.thinking}` : "kept";
@@ -1376,15 +1393,15 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
     enterAttempted = true;
     const enter = await runCommand(["herdr", "pane", "send-keys", c.pane, "Enter"]);
     if (enter.exitCode !== 0) throw new Error("SEND_ENTER_FAILED");
-    db.query("UPDATE tasks SET status='sent-unconfirmed',sent_at=?,model=? WHERE key=?").run(now(), model, key);
+    db.query("UPDATE tasks SET status='sent-unconfirmed',model=? WHERE key=?").run(model, key);
     log(key, { ev: "sent-unconfirmed", attempt });
     for (let i = 0; i < 12; i++) {
       const screen = await paneRead();
       const state = screen.exitCode === 0 ? classify(screen.stdout).state : "unknown";
       if (state === "working") {
         const observedAt = now();
-        db.query("UPDATE tasks SET status='working',started_at=?,sent_at=? WHERE key=? AND dispatch_attempt=?")
-          .run(observedAt, observedAt, key, attempt);
+        db.query("UPDATE tasks SET status='working',started_at=? WHERE key=? AND dispatch_attempt=?")
+          .run(observedAt, key, attempt);
         log(key, { ev: "started", attempt });
         return `DISPATCH_OK ${catId} ${key} started (${modelNote})`;
       }
@@ -1405,8 +1422,8 @@ export async function dispatch(catId, key, prompt, { type = "impl", skill = "ulw
           const state = screen.exitCode === 0 && screen.stdout.trim() ? classify(screen.stdout).state : "unknown";
           if (state === "working") {
             const observedAt = now();
-            db.query("UPDATE tasks SET status='working',started_at=?,sent_at=? WHERE key=? AND dispatch_attempt=?")
-              .run(observedAt, observedAt, key, attempt);
+            db.query("UPDATE tasks SET status='working',started_at=? WHERE key=? AND dispatch_attempt=?")
+              .run(observedAt, key, attempt);
             log(key, { ev: "started-after-enter-error", attempt });
             return `DISPATCH_OK ${catId} ${key} started after Enter error`;
           }
@@ -1575,11 +1592,16 @@ export async function verify(key, check = checkSignal) {
     })),
     signals: res.map((result) => ({ signal: result.s, ok: result.ok, detail: result.detail, headRefOid: result.headRefOid, mergeCommit: result.mergeCommit, httpCode: result.httpCode })),
   });
-  db.transaction(() => {
+  const terminal = db.transaction(() => {
+    const current = db.query("SELECT status FROM tasks WHERE key=?").get(key);
+    if (["closed", "verified-done"].includes(current?.status)) return current.status;
     db.query("UPDATE tasks SET status=?, evidence=?, ended_at=? WHERE key=?").run(ok ? "verified-done" : "not-done", evidence, ok ? now() : null, key);
     if (ok) db.query("DELETE FROM dispatch_reservations WHERE key=?").run(key);
+    appendHistoryInTransaction(db, key, { ev: ok ? "verified" : "not-done", detail: evidence });
+    return null;
   }).immediate();
-  log(key, { ev: ok ? "verified" : "not-done", detail: evidence });
+  if (terminal === "closed") return `VERIFY_CLOSED ${key}: task is terminal`;
+  if (terminal === "verified-done") return `VERIFIED_DONE ${key}: already verified`;
   return `${ok ? "VERIFIED_DONE" : "NOT_DONE"} ${key}: ${evidence}`;
 }
 
@@ -1811,7 +1833,7 @@ function markTaskObservedWorking(dbHandle, key) {
   const observedAt = now();
   dbHandle.query(`UPDATE tasks SET status='working',started_at=COALESCE(started_at,?),
     sent_at=CASE WHEN ? THEN ? ELSE sent_at END WHERE key=?`)
-    .run(observedAt, refreshSentAt ? 1 : 0, observedAt, key);
+    .run(observedAt, refreshSentAt ? 1 : 0, sent?.at ?? observedAt, key);
   return newlyWorking;
 }
 
@@ -1828,28 +1850,31 @@ async function watch(intervalSec = 30) {
       for (const event of await recoverInterruptedDispatches(db, rows)) console.log(event);
       for (const r of rows) {
         try {
-        const sig = JSON.stringify({ state: r.state, doneKey: r.done?.key ?? "", doneKind: r.done?.kind ?? "", doneAttempt: r.done?.attempt ?? "", doneText: r.done?.text ?? "", readyLine: r.readyLine ?? "", readyHead: r.ready?.head ?? "", claimText: r.claimText ?? "", questionText: r.questionText ?? "" });
+        const sig = JSON.stringify({ task: r.task, state: r.state, doneKey: r.done?.key ?? "", doneKind: r.done?.kind ?? "", doneAttempt: r.done?.attempt ?? "", doneText: r.done?.text ?? "", readyLine: r.readyLine ?? "", readyHead: r.ready?.head ?? "", claimText: r.claimText ?? "", questionText: r.questionText ?? "" });
         const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
         if (!previous || last.get(r.id) !== sig) {
           if (previous && r.state !== previous.state && r.id !== "omonyang") console.log(`FLEET_STATE ${r.id} ${previous.state} -> ${r.state}`);
           if (r.task && r.state === "working" && markTaskObservedWorking(db, r.task)) console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
           const doneTask = r.done ? db.query("SELECT cat,status,sent_at,history,dispatch_attempt,send_attempted,completion_claimed FROM tasks WHERE key=?").get(r.done.key) : null;
           const doneChanged = r.id !== "omonyang" && r.done
-            && (!previous || r.done.key !== previous.doneKey || r.done.kind !== previous.doneKind || r.done.attempt !== previous.doneAttempt)
+            && (!previous || previous.task !== r.task || r.done.key !== previous.doneKey || r.done.kind !== previous.doneKind || r.done.attempt !== previous.doneAttempt)
             && doneTask?.cat === r.id && completionBelongsToDispatchAttempt(doneTask, r.done);
           const readyChanged = r.ready && (!previous || r.ready.head !== previous.readyHead);
           const readyLineChanged = r.readyLine && (!previous || r.readyLine !== previous.readyLine);
           const claimTextChanged = r.claimText && (!previous || r.claimText !== previous.claimText);
           if (doneChanged) {
-            console.log(`FLEET_TASK_${r.done.kind} ${r.id} ${r.done.key} ${r.done.text}`);
-            if (r.done.kind === "BLOCKED") markTaskBlocked(r.done.key, r.done.text);
-            else {
-              const currentTask = db.query("SELECT status FROM tasks WHERE key=?").get(r.done.key);
-              if (!["verified-done", "closed"].includes(currentTask?.status) && !currentTask?.completion_claimed) {
-                db.query("UPDATE tasks SET status='done-claimed', result=?, completion_claimed=1 WHERE key=?").run(r.done.text, r.done.key);
-                log(r.done.key, { ev: "done-claimed", text: r.done.text });
-              }
-            }
+            const recorded = r.done.kind === "BLOCKED"
+              ? markTaskBlocked(r.done.key, r.done.text) !== false
+              : db.transaction(() => {
+                const currentTask = db.query("SELECT status,completion_claimed FROM tasks WHERE key=?").get(r.done.key);
+                if (!currentTask || ["verified-done", "closed"].includes(currentTask.status) || currentTask.completion_claimed) return false;
+                const changed = db.query("UPDATE tasks SET status='done-claimed',result=?,completion_claimed=1 WHERE key=? AND status NOT IN ('verified-done','closed') AND completion_claimed=0")
+                  .run(r.done.text, r.done.key).changes;
+                if (!changed) return false;
+                appendHistoryInTransaction(db, r.done.key, { ev: "done-claimed", text: r.done.text });
+                return true;
+              }).immediate();
+            if (recorded) console.log(`FLEET_TASK_${r.done.kind} ${r.id} ${r.done.key} ${r.done.text}`);
           }
           if (doneChanged || readyChanged || readyLineChanged || claimTextChanged) {
             const taskKey = r.done?.key ?? r.task;
