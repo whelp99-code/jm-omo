@@ -1398,22 +1398,51 @@ async function defaultPrLoopReplies(channel, threadTs) {
   return messages;
 }
 
-export async function runDoriHeavyDeploy(repo, deploy, timeoutMs, runCommand = executeSignalCommand, doriPath = process.env.DORI_SCRIPT || join(process.env.HOME || "", ".bun", "bin", "dori")) {
+export async function runDoriHeavyDeploy(repo, deploy, expectedMergeSha, timeoutMs, runCommand = executeSignalCommand, doriPath = process.env.DORI_SCRIPT || join(process.env.HOME || "", ".bun", "bin", "dori")) {
+  if (!/^[a-f0-9]{40}$/i.test(expectedMergeSha ?? "")) throw new Error("invalid_expected_merge_sha");
   const timeoutSeconds = `${Math.max(1, Math.ceil(timeoutMs / 1000))}s`;
   return runCommand([
     "bun", doriPath, "heavy", `fleet-pr-loop-${repo.replace(/[^a-z0-9-]/gi, "-")}`,
-    "--", "timeout", "--signal=TERM", "--kill-after=5s", timeoutSeconds, ...deploy.argv,
+    "--", "timeout", "--signal=TERM", "--kill-after=5s", timeoutSeconds,
+    "env", `FLEET_EXPECTED_MERGE_SHA=${expectedMergeSha.toLowerCase()}`, ...deploy.argv,
   ], AbortSignal.timeout(timeoutMs + 15_000));
 }
 
-async function checkDeployHealth(url, timeoutMs) {
+async function defaultBranchSha(repo, runCommand) {
+  const repoResult = await runCommand(
+    ["gh", "repo", "view", repo, "--json", "defaultBranchRef"],
+    AbortSignal.timeout(10_000),
+  );
+  if (repoResult.exitCode !== 0) throw new Error("default_branch_lookup_failed");
+  const branch = JSON.parse(repoResult.stdout).defaultBranchRef?.name;
+  if (typeof branch !== "string" || !branch) throw new Error("default_branch_missing");
+  const branchResult = await runCommand(
+    ["gh", "api", `repos/${repo}/branches/${encodeURIComponent(branch)}`],
+    AbortSignal.timeout(10_000),
+  );
+  if (branchResult.exitCode !== 0) throw new Error("default_branch_lookup_failed");
+  const sha = JSON.parse(branchResult.stdout).commit?.sha?.toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(sha ?? "")) throw new Error("default_branch_sha_missing");
+  return sha;
+}
+
+export async function checkDeployHealth(url, timeoutMs, fetchImpl = fetch) {
   let parsed;
   try { parsed = new URL(url); } catch { throw new Error("invalid health URL"); }
   if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
     throw new Error("unsupported health URL");
   }
-  const response = await fetch(parsed, { method: "GET", redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
-  return response.status;
+  const response = await fetchImpl(parsed, { method: "GET", redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
+  const body = await response.text();
+  let reportedSha = body.trim();
+  try {
+    const data = JSON.parse(body);
+    reportedSha = data.merge_sha ?? data.mergeSha ?? data.sha ?? data.revision ?? data.version ?? data.commit?.sha ?? "";
+  } catch {}
+  reportedSha = typeof reportedSha === "string" && /^[a-f0-9]{40}$/i.test(reportedSha.trim())
+    ? reportedSha.trim().toLowerCase()
+    : null;
+  return { status: response.status, mergeSha: reportedSha };
 }
 
 async function ensurePrLoopReady(info, signal, runCommand) {
@@ -1550,7 +1579,21 @@ async function mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand) {
   }
 }
 
-async function deployMergedPrLoopRow(dbHandle, row, config, io, events) {
+const activePrLoopDeployments = new Set();
+const pendingPrLoopDeployEvents = [];
+const MAX_PR_LOOP_DEPLOYMENTS = 1;
+
+function reportPrLoopDeployCompletion(io, event) {
+  if (typeof io.onDeploySettled === "function") {
+    try { io.onDeploySettled(event); } catch (error) {
+      fleetError("PR_LOOP_DEPLOY_NOTIFY", "background", error);
+    }
+  } else {
+    pendingPrLoopDeployEvents.push(event);
+  }
+}
+
+function deployMergedPrLoopRow(dbHandle, row, config, io, events, runCommand) {
   if (row.state !== "merged") return;
   const deployment = config.deploy?.[row.repo];
   if (!deployment) {
@@ -1566,31 +1609,66 @@ async function deployMergedPrLoopRow(dbHandle, row, config, io, events) {
     events.push(`FLEET_DEPLOY_FAILED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=invalid_deploy_config`);
     return;
   }
+  if (activePrLoopDeployments.size >= MAX_PR_LOOP_DEPLOYMENTS) return;
   const claimed = dbHandle.transaction(() => dbHandle.query(`UPDATE fleet_pr_loop SET state='deploying',updated_at=?
     WHERE repo=? AND pr_number=? AND head=? AND state='merged'`)
     .run(now(), row.repo, row.pr_number, row.head).changes === 1).immediate();
   if (!claimed) return;
   const timeoutMs = Number(config.deployTimeoutMs) > 0 ? Number(config.deployTimeoutMs) : 300_000;
-  let failure = "";
-  try {
-    const result = await (io.runDeploy ?? runDoriHeavyDeploy)(row.repo, deployment, timeoutMs);
-    if (result.exitCode !== 0) failure = `deploy_exit_${result.exitCode}`;
-    else {
-      const status = await (io.checkHealth ?? checkDeployHealth)(deployment.healthUrl, timeoutMs);
-      if (status !== 200) failure = `health_http_${status}`;
+  const expectedMergeSha = row.merge_sha?.toLowerCase() ?? "";
+  const deploymentKey = `${row.repo}#${row.pr_number}@${row.head}`;
+  activePrLoopDeployments.add(deploymentKey);
+  events.push(`FLEET_DEPLOY_STARTED ${row.task_key} pr:${row.repo}#${row.pr_number} merge_sha=${expectedMergeSha}`);
+  const getMainSha = io.getMainSha ?? ((repo) => defaultBranchSha(repo, runCommand));
+  const runDeploy = io.runDeploy ?? ((repo, deploy, mergeSha, timeout) =>
+    runDoriHeavyDeploy(repo, deploy, mergeSha, timeout, runCommand));
+  const checkHealth = io.checkHealth ?? checkDeployHealth;
+  const job = (async () => {
+    let failure = "";
+    try {
+      if (!/^[a-f0-9]{40}$/.test(expectedMergeSha)) throw new Error("invalid_merge_sha");
+      const mainBefore = String(await getMainSha(row.repo) ?? "").toLowerCase();
+      if (mainBefore !== expectedMergeSha) throw new Error(`default_branch_sha_mismatch expected=${expectedMergeSha} actual=${mainBefore || "unavailable"}`);
+      const result = await runDeploy(row.repo, deployment, expectedMergeSha, timeoutMs);
+      if (result.exitCode !== 0) throw new Error(`deploy_exit_${result.exitCode}`);
+      const health = await checkHealth(deployment.healthUrl, timeoutMs, expectedMergeSha);
+      if (health?.status !== 200) throw new Error(`health_http_${health?.status ?? "unavailable"}`);
+      const reportedMergeSha = String(health.mergeSha ?? health.sha ?? health.revision ?? "").toLowerCase();
+      if (reportedMergeSha !== expectedMergeSha) throw new Error("health_merge_sha_mismatch");
+      const mainAfter = String(await getMainSha(row.repo) ?? "").toLowerCase();
+      if (mainAfter !== expectedMergeSha) throw new Error(`default_branch_sha_moved expected=${expectedMergeSha} actual=${mainAfter || "unavailable"}`);
+    } catch (error) {
+      failure = String(error?.message ?? error).replace(/\s+/g, " ").slice(0, 120);
     }
-  } catch (error) {
-    failure = String(error?.message ?? error).replace(/\s+/g, " ").slice(0, 120);
-  }
-  const state = failure ? "deploy-failed" : "deployed";
-  dbHandle.query("UPDATE fleet_pr_loop SET state=?,updated_at=? WHERE repo=? AND pr_number=? AND head=? AND state='deploying'")
-    .run(state, now(), row.repo, row.pr_number, row.head);
-  const event = failure
-    ? `FLEET_DEPLOY_FAILED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=${failure}`
-    : `FLEET_DEPLOYED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} merge_sha=${row.merge_sha} health=200`;
-  events.push(event);
-  appendTaskHistory(dbHandle, row.task_key, {
-    ev: state, signal: `pr:${row.repo}#${row.pr_number}`, head: row.head, merge_sha: row.merge_sha, detail: failure || "health_http_200",
+    const state = failure ? "deploy-failed" : "deployed";
+    const changed = dbHandle.query("UPDATE fleet_pr_loop SET state=?,updated_at=? WHERE repo=? AND pr_number=? AND head=? AND state='deploying'")
+      .run(state, now(), row.repo, row.pr_number, row.head).changes;
+    if (!changed) return null;
+    appendTaskHistory(dbHandle, row.task_key, {
+      ev: state, signal: `pr:${row.repo}#${row.pr_number}`, head: row.head, merge_sha: expectedMergeSha,
+      detail: failure || `health_http_200 merge_sha=${expectedMergeSha}`,
+    });
+    return failure
+      ? `FLEET_DEPLOY_FAILED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=${failure}`
+      : `FLEET_DEPLOYED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} merge_sha=${expectedMergeSha} health=200`;
+  })();
+  void job.then((event) => {
+    activePrLoopDeployments.delete(deploymentKey);
+    if (event) reportPrLoopDeployCompletion(io, event);
+  }, (error) => {
+    activePrLoopDeployments.delete(deploymentKey);
+    fleetError("PR_LOOP_DEPLOY", `pr:${row.repo}#${row.pr_number}`, error);
+    const event = `FLEET_DEPLOY_FAILED ${row.task_key} pr:${row.repo}#${row.pr_number} head=${row.head} reason=internal_error`;
+    try {
+      dbHandle.query("UPDATE fleet_pr_loop SET state='deploy-failed',updated_at=? WHERE repo=? AND pr_number=? AND head=? AND state='deploying'")
+        .run(now(), row.repo, row.pr_number, row.head);
+      appendTaskHistory(dbHandle, row.task_key, {
+        ev: "deploy-failed", signal: `pr:${row.repo}#${row.pr_number}`, head: row.head, merge_sha: expectedMergeSha, detail: "internal_error",
+      });
+    } catch (persistError) {
+      fleetError("PR_LOOP_DEPLOY_PERSIST", `pr:${row.repo}#${row.pr_number}`, persistError);
+    }
+    reportPrLoopDeployCompletion(io, event);
   });
 }
 
@@ -1599,7 +1677,7 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
   const runCommand = io.runCommand ?? executeSignalCommand;
   const postMessage = io.postMessage ?? defaultPrLoopPost;
   const fetchReplies = io.fetchReplies ?? defaultPrLoopReplies;
-  const events = [];
+  const events = pendingPrLoopDeployEvents.splice(0);
   const waiting = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE state='awaiting-review'").all();
   let replies = [];
   if (waiting.length) {
@@ -1675,7 +1753,8 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       if (!row) continue;
       if (row.state === "awaiting-review") {
         let info = await prLoopPullRequestInfo(signal, runCommand);
-        if (!info || info.state !== "OPEN" || info.headRefOid?.toLowerCase() !== row.head) {
+        if (!info) continue;
+        if (info.headRefOid?.toLowerCase() !== row.head) {
           dbHandle.query(`UPDATE fleet_pr_loop SET state='stale-head',updated_at=?
             WHERE repo=? AND pr_number=? AND head=? AND state='awaiting-review'`)
             .run(now(), row.repo, row.pr_number, row.head);
@@ -1683,8 +1762,18 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
             `expected=${row.head} actual=${info?.headRefOid ?? "unavailable"}`);
           continue;
         }
-        info = await ensurePrLoopReady(info, signal, runCommand);
-        if (!info) continue;
+        if (info.state === "CLOSED") {
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='closed',updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state='awaiting-review'`)
+            .run(now(), row.repo, row.pr_number, row.head);
+          events.push(`FLEET_PR_CLOSED ${row.task_key} ${signal} head=${row.head}`);
+          continue;
+        }
+        if (!["OPEN", "MERGED"].includes(info.state)) continue;
+        if (info.state === "OPEN") {
+          info = await ensurePrLoopReady(info, signal, runCommand);
+          if (!info) continue;
+        }
         const verdict = matchPrLoopVerdict(replies, {
           repo: row.repo,
           prNumber: row.pr_number,
@@ -1742,6 +1831,11 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
             WHERE repo=? AND pr_number=? AND head=? AND state='accepted'`)
             .run(mergeSha, now(), repo, prNumber, row.head);
           events.push(`FLEET_PR_MERGED ${row.task_key} ${signal} head=${row.head} merge_sha=${mergeSha}`);
+        } else if (info?.state === "CLOSED" && info.headRefOid?.toLowerCase() === row.head) {
+          dbHandle.query(`UPDATE fleet_pr_loop SET state='closed',updated_at=?
+            WHERE repo=? AND pr_number=? AND head=? AND state='accepted'`)
+            .run(now(), repo, prNumber, row.head);
+          events.push(`FLEET_PR_CLOSED ${row.task_key} ${signal} head=${row.head}`);
         } else if (config.autoMerge) {
           const merge = await mergeAcceptedPrLoopHead(dbHandle, row, config, runCommand);
           if (merge) events.push(merge);
@@ -1749,11 +1843,11 @@ export async function processPrLoopEvents(dbHandle = db, config = CONFIG.prLoop,
       }
       const finalRow = dbHandle.query("SELECT * FROM fleet_pr_loop WHERE repo=? AND pr_number=? AND head=?")
         .get(repo, prNumber, row.head);
-      if (finalRow?.state === "merged") await deployMergedPrLoopRow(dbHandle, finalRow, config, io, events);
+      if (finalRow?.state === "merged") deployMergedPrLoopRow(dbHandle, finalRow, config, io, events, runCommand);
     }
   }
   for (const row of dbHandle.query("SELECT * FROM fleet_pr_loop WHERE state='merged'").all()) {
-    await deployMergedPrLoopRow(dbHandle, row, config, io, events);
+    deployMergedPrLoopRow(dbHandle, row, config, io, events, runCommand);
   }
   return events;
 }
