@@ -137,7 +137,9 @@ export function classify(screen) {
   const output = responseBlock(screen);
   const done = [...output.matchAll(/^\s*(?:[•●⏺✻]\s*)?(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b([^\n]*)$/gm)]
     .filter((m) => !/[<]|또는|<숫자/.test(m[0])).at(-1);
-  const completion = done?.[3].match(/^\s*attempt=([a-f0-9-]{36})\s*(.*)$/i);
+  const completionTail = done ? `${done[3]}${output.slice(done.index + done[0].length)}`
+    .split(/\n(?:[ \t]*\n|[ \t]*(?:[•●⏺✻]|TASK-[A-Z0-9-]+_(?:DONE|BLOCKED)\b|Working \())/, 1)[0] : "";
+  const completion = completionTail.match(/^\s*attempt=\s*((?:[a-f0-9-]\s*){35}[a-f0-9-])(?:\s+|$)([\s\S]*)$/i);
   const ready = [...output.matchAll(/\b([A-Za-z0-9_.-]+) PR READY head=([0-9a-f]{7,40})\b/gi)].at(-1);
   // Result lines wrap in narrow panes: also look at the latest output block.
   const joined = output.split("\n").slice(-40).map((l) => l.trim()).join(" ");
@@ -151,7 +153,7 @@ export function classify(screen) {
     if (marker >= 0) questionText = screenLines.slice(marker + 1, prompt >= marker ? prompt : undefined).join("\n").trim().slice(-800);
     else questionText = output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3).join("\n").trim().slice(-800);
   }
-  return { state, model, done: done ? { key: done[1], kind: done[2], attempt: completion?.[1] ?? null, text: (completion?.[2] ?? done[3]).trim().slice(0, 200) } : null, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
+  return { state, model, done: done ? { key: done[1], kind: done[2], attempt: completion?.[1].replace(/\s/g, "") ?? null, text: (completion?.[2] ?? done[3]).replace(/\s*\n\s*/g, " ").trim().slice(0, 200) } : null, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
 }
 
 export function completionBelongsToDispatchAttempt(task, marker) {

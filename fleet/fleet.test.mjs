@@ -1561,6 +1561,23 @@ describe("fleet completion classification", () => {
     expect(classify(screen).done).toBeNull();
   });
 
+  for (const kind of ["DONE", "BLOCKED"]) {
+    for (const suffix of [
+      "\nattempt=12345678-1234-4234-8234-123456789abc finished",
+      " attempt=\n12345678-1234-4234-8234-123456789abc finished",
+      " attempt=12345678-1234-4234-\n8234-123456789abc finished",
+    ]) {
+      it(`recognizes a wrapped ${kind} attempt ID (${JSON.stringify(suffix)})`, () => {
+        const done = classify(`⏺ Completed response\nTASK-WRAPPED_${kind}${suffix}\n\n❯`).done;
+        expect(done).toEqual({ key: "TASK-WRAPPED", kind, attempt: "12345678-1234-4234-8234-123456789abc", text: "finished" });
+        expect(completionBelongsToDispatchAttempt({ status: "working", dispatch_attempt: done.attempt, send_attempted: 1, history: "[]" }, done)).toBe(true);
+      });
+    }
+  }
+  it("does not borrow an attempt ID from a separate response after a completion marker", () => {
+    expect(classify("⏺ Completed response\nTASK-WRAPPED_DONE\n⏺ Different response\nattempt=12345678-1234-4234-8234-123456789abc unrelated\n\n❯").done?.attempt).toBeNull();
+  });
+
   it("recognizes a final completion line above the input prompt", () => {
     const screen = [
       "❯ Complete the task and return a final result",
