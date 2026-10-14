@@ -28,7 +28,8 @@ function prLoopDb(task = null) {
   const db = new Database(":memory:");
   db.exec(`CREATE TABLE tasks(
     key TEXT PRIMARY KEY, cat TEXT, done TEXT, status TEXT, completion_claimed INTEGER DEFAULT 0,
-    claim_evidence TEXT DEFAULT '{}', history TEXT DEFAULT '[]', sent_at TEXT, result TEXT
+    claim_evidence TEXT DEFAULT '{}', history TEXT DEFAULT '[]', sent_at TEXT, result TEXT,
+    started_at TEXT, ended_at TEXT, dispatch_attempt TEXT, send_attempted INTEGER DEFAULT 0
   );
   CREATE TABLE cats(id TEXT PRIMARY KEY,pane TEXT);
   CREATE TABLE fleet_pr_loop(
@@ -206,7 +207,7 @@ async function runRawUtf8Dispatch() {
   }
 }
 
-async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskStatus = "working", taskHistory = [], dispatchAttempt = "", taskSentAt = "", reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", fleetEnv = {}, waitForOutput = "", trackAfterHeartbeat = false, failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
+async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], paneScreen = "Idle\n❯", catTask = "", taskCat = "crm", taskStatus = "working", taskHistory = [], dispatchAttempt = "", taskSendAttempted = true, taskSentAt = "", reservation = false, reservationAgeMs = 0, paneReadFailure = false, catState = "working", fleetEnv = {}, waitForOutput = "", trackAfterHeartbeat = false, failFirstQuestionAnswer = false, command = ["watch", "1"] } = {}) {
   const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-alerts-"));
   const state = join(home, ".local", "state", "omonyang");
   const bin = join(home, "bin");
@@ -232,11 +233,11 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   CREATE TABLE beats(who TEXT PRIMARY KEY, at TEXT, detail TEXT);
   CREATE TABLE dispatch_reservations(pane TEXT PRIMARY KEY,key TEXT UNIQUE NOT NULL,attempt TEXT NOT NULL,reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
   const taskKey = catTask || (prDone ? "PR-TASK" : "");
-  if (taskKey && !trackAfterHeartbeat) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at,history) VALUES(?,'crm',?,?,?,?,?)")
-    .run(taskKey, taskKey, prDone, taskStatus, new Date().toISOString(), JSON.stringify(taskHistory));
+  if (taskKey && !trackAfterHeartbeat) db.query("INSERT INTO tasks(key,cat,title,done,status,sent_at,history) VALUES(?,?,?,?,?,?,?)")
+    .run(taskKey, taskCat, taskKey, prDone, taskStatus, new Date().toISOString(), JSON.stringify(taskHistory));
   if (taskKey && taskSentAt) db.query("UPDATE tasks SET sent_at=? WHERE key=?").run(taskSentAt, taskKey);
-  if (taskKey && dispatchAttempt) db.query("UPDATE tasks SET dispatch_attempt=?,send_attempted=1,sent_at=? WHERE key=?")
-    .run(dispatchAttempt, taskSentAt || new Date(Date.now() + 1000).toISOString(), taskKey);
+  if (taskKey && dispatchAttempt) db.query("UPDATE tasks SET dispatch_attempt=?,send_attempted=?,sent_at=? WHERE key=?")
+    .run(dispatchAttempt, taskSendAttempted ? 1 : 0, taskSentAt || new Date(Date.now() + 1000).toISOString(), taskKey);
   db.query("INSERT INTO cats(id,name,role,kind,pane,product,state,task) VALUES('crm','CRM','test','pane','w6:p1','fixture',?,?)").run(catState, trackAfterHeartbeat ? null : taskKey || null);
   if (reservation && taskKey) {
     db.query("INSERT INTO dispatch_reservations(pane,key,attempt,reserved_at) VALUES('w6:p1',?,?,?)")
@@ -757,6 +758,51 @@ describe("fleet PR automation", () => {
       .toBe("rejected");
     const history = JSON.parse(db.query("SELECT history FROM tasks WHERE key='PRLOOP-REJECT'").get().history);
     expect(history.filter((event) => event.ev === "cursor-reject-followup")).toHaveLength(1);
+    db.close();
+  });
+
+  it("rotates the worker attempt before forwarding a Cursor REJECT", async () => {
+    const key = "PRLOOP-REJECT-ROTATES-ATTEMPT";
+    const oldAttempt = "31000000-0000-4000-8000-000000000031";
+    const db = prLoopDb({ key, cat: "crm", done: signal, pane: "w5:p4", status: "done-claimed", completion_claimed: 1 });
+    db.query("UPDATE tasks SET dispatch_attempt=?,send_attempted=1,history=? WHERE key=?")
+      .run(oldAttempt, JSON.stringify([{ ev: "send-attempted", attempt: oldAttempt, at: "2026-10-14T10:00:00.000Z" }]), key);
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,updated_at)
+      VALUES('owner/repo','52',?,?,'awaiting-review','100','1')`).run(head, key);
+    let sentText = "";
+    let submittedMarker = "";
+    let submittedScreen = "";
+    const events = await processPrLoopEvents(db, prLoopConfig, {
+      fetchReplies: async () => [{
+        ts: "101", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW",
+        text: `REJECT owner/repo#52 head=${head} please address this`,
+      }],
+      readPane: async () => ({ exitCode: 0, stdout: submittedScreen }),
+      runCommand: async (argv) => {
+        if (argv[0] === "gh") return {
+          exitCode: 0,
+          stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head, url: "https://github.com/owner/repo/pull/52" }),
+        };
+        if (argv[2] === "send-text") {
+          sentText = argv[4];
+          const attempt = sentText.match(/attempt=([a-f0-9-]{36})/)?.[1];
+          const pendingTask = db.query("SELECT dispatch_attempt,send_attempted FROM tasks WHERE key=?").get(key);
+          expect(pendingTask).toEqual({ dispatch_attempt: attempt, send_attempted: 1 });
+          submittedMarker = sentText.match(/FLEET_REJECT_DELIVERY:[^\s]+/)?.[0] ?? "";
+        }
+        if (argv[2] === "send-keys" && argv[4] === "Enter") submittedScreen = `worker transcript\n${submittedMarker}\n❯`;
+        return { exitCode: 0, stdout: "" };
+      },
+    });
+    const task = db.query("SELECT status,dispatch_attempt,send_attempted,history FROM tasks WHERE key=?").get(key);
+    expect(events).toContain(`FLEET_PR_REJECT_FOLLOWUP ${key} ${signal} head=${head}`);
+    expect(task.status).toBe("working");
+    expect(task.dispatch_attempt).toBeString();
+    expect(task.dispatch_attempt).not.toBe(oldAttempt);
+    expect(task.send_attempted).toBe(1);
+    expect(sentText).toContain(`attempt=${task.dispatch_attempt}`);
+    expect(JSON.parse(task.history).findLast((event) => event.ev === "send-attempted").attempt)
+      .toBe(task.dispatch_attempt);
     db.close();
   });
 
@@ -4114,7 +4160,7 @@ describe("fleet dispatch reservations", () => {
       .toBe("TRACKED_UNCONFIRMED TASK-AFTER-CLOSED-TRACK on closed-track-cat");
     const tracked = db.query("SELECT * FROM tasks WHERE key='TASK-AFTER-CLOSED-TRACK'").get();
     expect(tracked.status).toBe("tracked-unconfirmed");
-    expect(completionBelongsToDispatchAttempt(tracked, classify("⏺ Tracked work complete\nTASK-AFTER-CLOSED-TRACK_DONE finished\n\n❯").done)).toBe(true);
+    expect(completionBelongsToDispatchAttempt(tracked, classify("⏺ Tracked work complete\nTASK-AFTER-CLOSED-TRACK_DONE finished\n\n❯").done)).toBe(false);
     expect(JSON.parse(tracked.history).some((event) => event.ev === "tracked")).toBe(true);
     db.close();
   });
@@ -4188,7 +4234,9 @@ describe("fleet completion classification", () => {
     }
   }
   it("does not borrow an attempt ID from a separate response after a completion marker", () => {
-    expect(classify("⏺ Completed response\nTASK-WRAPPED_DONE\n⏺ Different response\nattempt=12345678-1234-4234-8234-123456789abc unrelated\n\n❯").done?.attempt).toBeNull();
+    const result = classify("⏺ Completed response\nTASK-WRAPPED_DONE\n⏺ Different response\nattempt=12345678-1234-4234-8234-123456789abc unrelated\n\n❯");
+    expect(result.done).toBeNull();
+    expect(result.doneCandidates).toEqual([]);
   });
 
   it("recognizes a final completion line above the input prompt", () => {
@@ -4200,7 +4248,10 @@ describe("fleet completion classification", () => {
       "",
       "❯",
     ].join("\n");
-    expect(classify(screen).done).toEqual({ key: "TASK-X", kind: "DONE", attempt: null, text: "finished" });
+    expect(classify(screen).done).toBeNull();
+    expect(classify(screen).doneCandidates).toContainEqual({
+      key: "TASK-X", kind: "DONE", attempt: null, text: "finished", filtered: false,
+    });
   });
 
   it("finds a completion marker before Omo throughput and advances its task", async () => {
@@ -4228,6 +4279,76 @@ describe("fleet completion classification", () => {
     expect(result.taskStatus).toBe("done-claimed");
   });
 
+  it.each([
+    ["the exact TPS and Gateway warning screen", "\n\nTPS 30.2 tok/s. Cache hit 92.1%, 305.8s\n\nWarning: control endpoint drain failed: Gateway schema 7 is newer than this binary's supported version 6."],
+    ["a bullet list", "\n\n• Changed files\n• Tests passed"],
+    ["a turn-end footer", "\n\n✻ Worked for 12m"],
+    ["an unseen runtime warning", "\n\nWarning: a future runtime warning not known to the parser"],
+  ])("emits the attempt-bound DONE when %s follows it", async (_label, trailing) => {
+    const key = "TASK-COMPLETION-NOISE";
+    const attempt = "11000000-0000-4000-8000-000000000011";
+    const screen = `⏺ Completed response\n${key}_DONE attempt=${attempt} finished${trailing}\n\n❯`;
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "working",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-14T10:00:00.000Z" }],
+      taskSentAt: "2026-10-14T10:00:01.000Z",
+      paneScreen: screen,
+    });
+    expect(result.output).toContain(`FLEET_TASK_DONE crm ${key} finished`);
+    expect(result.taskStatus).toBe("done-claimed");
+  });
+
+  it.each([
+    ["Korean conjunction", "재시도 또는 timeout 수정"],
+    ["less-than measurement", "p95 < 200ms"],
+    ["generic type notation", "Result<T> parsed"],
+  ])("accepts completion summaries containing %s", (_label, summary) => {
+    const key = "TASK-SUMMARY-SYMBOLS";
+    const attempt = "12000000-0000-4000-8000-000000000012";
+    const done = classify(`⏺ Completed response\n${key}_DONE attempt=${attempt} ${summary}\n\n❯`).done;
+    expect(done).toEqual({ key, kind: "DONE", attempt, text: summary });
+  });
+
+  for (const kind of ["DONE", "BLOCKED"]) {
+    it.each([
+      ["bold", (line) => `**${line}**`],
+      ["inline-code", (line) => `\`${line}\``],
+    ])(`parses a %s-wrapped ${kind} completion line`, (_label, wrap) => {
+      const key = "TASK-MARKDOWN-DONE";
+      const attempt = "13000000-0000-4000-8000-000000000013";
+      const text = kind === "DONE" ? "finished" : "needs changes";
+      const done = classify(`⏺ Completed response\n${wrap(`${key}_${kind} attempt=${attempt} ${text}`)}\n\n❯`).done;
+      expect(done).toEqual({ key, kind, attempt, text });
+    });
+  }
+
+  it.each([
+    ["em-dash separator", `TASK-DASH-ATTEMPT_DONE — attempt=14000000-0000-4000-8000-000000000014 finished`, "TASK-DASH-ATTEMPT", "DONE"],
+    ["attempt colon separator", `TASK-COLON-ATTEMPT_BLOCKED attempt: 15000000-0000-4000-8000-000000000015 needs changes`, "TASK-COLON-ATTEMPT", "BLOCKED"],
+  ])("parses an %s in the completion marker", (_label, line, key, kind) => {
+    const done = classify(`⏺ Completed response\n${line}\n\n❯`).done;
+    expect(done).toMatchObject({
+      key,
+      kind,
+      attempt: kind === "DONE" ? "14000000-0000-4000-8000-000000000014" : "15000000-0000-4000-8000-000000000015",
+    });
+  });
+
+  it("filters only the exact generated completion prompt template", () => {
+    const key = "TASK-TEMPLATE-FILTER";
+    const attempt = "16000000-0000-4000-8000-000000000016";
+    const screen = `⏺ Instructions\n${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.\n\n❯`;
+    expect(classify(screen).done).toBeNull();
+    expect(classify(screen).doneCandidates).toContainEqual({
+      key, kind: "DONE", attempt, text: "<한 줄 요약> 또는 TASK-TEMPLATE-FILTER_BLOCKED attempt=16000000-0000-4000-8000-000000000016 reason=<한 줄>.",
+      filtered: true,
+    });
+    expect(classify(`⏺ Instructions\n${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.\n${key}_DONE attempt=${attempt} completed\n\n❯`).done)
+      .toEqual({ key, kind: "DONE", attempt, text: "completed" });
+  });
+
   it("keeps working-state classification and limits PR READY parsing to the latest response", () => {
     const screen = [
       "Earlier prompt: PR READY head=abcdef1234567",
@@ -4245,6 +4366,118 @@ describe("fleet completion classification", () => {
     const screen = ["Build complete", "jm-omo PR READY head=abcdef1234567", "", "❯"].join("\n");
     expect(classify(screen).ready).toEqual({ repo: "jm-omo", head: "abcdef1234567" });
     expect(classify(screen).claimText).toBe("jm-omo PR READY head=abcdef1234567");
+  });
+
+  it.each([
+    ["missing attempt", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE finished", "attempt-missing", true, "crm"],
+    ["mismatched attempt", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=21000000-0000-4000-8000-000000000021 stale", "attempt-mismatch", true, "crm"],
+    ["wrong task key on the same pane", "TASK-FOREIGN-PANE-DONE", "TASK-FOREIGN-PANE-DONE_DONE attempt=20000000-0000-4000-8000-000000000020 foreign", "attempt-mismatch", true, "crm"],
+    ["wrong task category", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=20000000-0000-4000-8000-000000000020 finished", "attempt-mismatch", true, "jarvis"],
+    ["matching attempt not sent", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=20000000-0000-4000-8000-000000000020 finished", "not-sent", false, "crm"],
+  ])("emits a completion hold for %s", async (_case, observedKey, line, reason, sendAttempted, taskCat) => {
+    const result = await runWatchCycle({
+      catTask: "TASK-COMPLETION-BOUND",
+      taskCat,
+      taskStatus: "working",
+      dispatchAttempt: "20000000-0000-4000-8000-000000000020",
+      taskSendAttempted: sendAttempted,
+      taskHistory: sendAttempted
+        ? [{ ev: "send-attempted", attempt: "20000000-0000-4000-8000-000000000020", at: "2026-10-14T10:00:00.000Z" }]
+        : [],
+      taskSentAt: "2026-10-14T10:00:01.000Z",
+      paneScreen: `⏺ Completion response\n${line}\n\n❯`,
+    });
+    expect(result.output).toContain(`FLEET_COMPLETION_REJECTED crm ${observedKey} reason=${reason}`);
+    expect(result.output).not.toContain("FLEET_TASK_DONE crm");
+    expect(result.taskStatus).toBe("working");
+  });
+
+  it("reports an exact prompt template as filtered rather than completed", async () => {
+    const key = "TASK-COMPLETION-TEMPLATE";
+    const attempt = "22000000-0000-4000-8000-000000000022";
+    const screen = [
+      "⏺ Instructions",
+      `${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.`,
+      "",
+      "❯",
+    ].join("\n");
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "working",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-14T10:00:00.000Z" }],
+      taskSentAt: "2026-10-14T10:00:01.000Z",
+      paneScreen: screen,
+    });
+    expect(result.output).toContain(`FLEET_COMPLETION_REJECTED crm ${key} reason=filtered`);
+    expect(result.output).not.toContain(`FLEET_TASK_DONE crm ${key}`);
+  });
+
+  it("deduplicates held completion events by dispatch attempt", async () => {
+    const key = "TASK-COMPLETION-DEDUP";
+    const attempt = "23000000-0000-4000-8000-000000000023";
+    const wrongAttempt = "24000000-0000-4000-8000-000000000024";
+    const line = `${key}_DONE attempt=${wrongAttempt} stale`;
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "working",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-14T10:00:00.000Z" }],
+      taskSentAt: "2026-10-14T10:00:01.000Z",
+      paneScreen: `⏺ Old output\n${line}\n${line}\n\n❯`,
+    });
+    expect(result.output.match(new RegExp(`FLEET_COMPLETION_REJECTED crm ${key} reason=attempt-mismatch`, "g"))).toHaveLength(1);
+  });
+
+  it("emits a matching DONE for a late unconfirmed dispatch", async () => {
+    const key = "TASK-SENT-UNCONFIRMED-DONE";
+    const attempt = "25000000-0000-4000-8000-000000000025";
+    const screen = `⏺ Final response\n${key}_DONE attempt=${attempt} completed\n\nTPS 26.3 tok/s. Cache hit 90.0%, 120s\n\nWarning: post-turn diagnostic`;
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "send-failed-unconfirmed",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-14T10:00:00.000Z" }],
+      taskSentAt: "2026-10-14T10:00:01.000Z",
+      reservation: true,
+      reservationAgeMs: 10 * 60_000,
+      paneScreen: screen,
+    });
+    expect(result.output).toContain(`FLEET_TASK_DONE crm ${key} completed`);
+    expect(result.taskStatus).toBe("done-claimed");
+  });
+
+  it("accepts a matching DONE after an unconfirmed dispatch remains visible", async () => {
+    const key = "TASK-SENT-UNCONFIRMED-DONE";
+    const attempt = "32000000-0000-4000-8000-000000000032";
+    const screen = `⏺ Final response\n${key}_DONE attempt=${attempt} completed\n\nTPS 26.3 tok/s\n\nWarning: updated runtime diagnostic\n\n❯`;
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "sent-unconfirmed",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-14T10:00:00.000Z" }],
+      taskSentAt: "2026-10-14T10:00:01.000Z",
+      paneScreen: screen,
+    });
+    expect(result.output).toContain(`FLEET_TASK_DONE crm ${key} completed`);
+    expect(result.taskStatus).toBe("done-claimed");
+  });
+
+  it("records a matching BLOCKED marker against the current dispatch attempt", async () => {
+    const key = "TASK-BLOCKED-CURRENT-ATTEMPT";
+    const attempt = "35000000-0000-4000-8000-000000000035";
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "working",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-14T10:00:00.000Z" }],
+      taskSentAt: "2026-10-14T10:00:01.000Z",
+      paneScreen: `⏺ Blocked response\n${key}_BLOCKED attempt=${attempt} upstream is unavailable\n\n❯`,
+    });
+    expect(result.output).toContain(`FLEET_TASK_BLOCKED crm ${key} upstream is unavailable`);
+    expect(result.taskStatus).toBe("blocked");
+    expect(result.taskHistory.findLast((event) => event.ev === "blocked"))
+      .toMatchObject({ attempt, text: "upstream is unavailable" });
   });
 });
 
@@ -5099,10 +5332,30 @@ describe("fleet dispatch CLI persistence", () => {
   });
 });
 describe("fleet watch sent-unconfirmed recheck", () => {
+  it("records the matching attempt when late Working evidence appears", async () => {
+    const key = "TASK-UNCONFIRMED-LATE-WORKING";
+    const attempt = "34000000-0000-4000-8000-000000000034";
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "sent-unconfirmed",
+      dispatchAttempt: attempt,
+      taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-14T10:00:00.000Z" }],
+      taskSentAt: "2026-10-14T10:00:01.000Z",
+      paneScreen: "Working (3s)\n❯",
+    });
+    expect(result.output).toContain(`FLEET_TASK_STARTED crm ${key}`);
+    expect(result.taskStatus).toBe("working");
+    expect(result.taskSendAttempted).toBe(1);
+    expect(result.taskHistory.findLast((event) => event.ev === "started"))
+      .toMatchObject({ attempt, source: "watch-observed" });
+  });
+
   for (const completed of [false, true]) {
     it(`observes a newly tracked task on an unchanged ${completed ? "completed" : "working"} screen`, async () => {
       const key = `TASK-TRACK-UNCHANGED-${completed ? "COMPLETED" : "WORKING"}`;
-      const expected = completed ? `FLEET_TASK_DONE crm ${key}` : `FLEET_TASK_STARTED crm ${key}`;
+      const expected = completed
+        ? `FLEET_COMPLETION_REJECTED crm ${key} reason=attempt-missing`
+        : `FLEET_TASK_STARTED crm ${key}`;
       const result = await runWatchCycle({
         catTask: key,
         trackAfterHeartbeat: true,
@@ -5111,7 +5364,7 @@ describe("fleet watch sent-unconfirmed recheck", () => {
         paneScreen: completed ? `Working (1s)\n⏺ Completed response\n${key}_DONE finished\n\n❯` : "Working (1s)\n❯",
       });
       expect(result.output).toContain(expected);
-      expect(result.taskStatus).toBe(completed ? "done-claimed" : "working");
+      expect(result.taskStatus).toBe(completed ? "tracked-unconfirmed" : "working");
     });
   }
   it("marks a late Working pane as started without resending", async () => {
@@ -5219,7 +5472,7 @@ describe("fleet usage and Bugbot alerts", () => {
     expect(result.reservationLeft).toBe(true);
   });
 
-  it("accepts an attemptless DONE after startup migrates a legacy sent task", async () => {
+  it("holds an attemptless DONE after startup migrates a legacy sent task", async () => {
     const result = await runWatchCycle({
       catTask: "TASK-LEGACY-DONE-AFTER-MIGRATION",
       taskStatus: "working",
@@ -5227,8 +5480,9 @@ describe("fleet usage and Bugbot alerts", () => {
       taskSentAt: "2026-10-12T00:00:01.000Z",
       paneScreen: "⏺ Legacy worker completed\nTASK-LEGACY-DONE-AFTER-MIGRATION_DONE finished\n\n❯",
     });
-    expect(result.output).toContain("FLEET_TASK_DONE crm TASK-LEGACY-DONE-AFTER-MIGRATION finished");
-    expect(result.taskStatus).toBe("done-claimed");
+    expect(result.output).toContain("FLEET_COMPLETION_REJECTED crm TASK-LEGACY-DONE-AFTER-MIGRATION reason=attempt-missing");
+    expect(result.output).not.toContain("FLEET_TASK_DONE crm TASK-LEGACY-DONE-AFTER-MIGRATION");
+    expect(result.taskStatus).toBe("working");
     expect(result.taskDispatchAttempt).toBeNull();
     expect(result.taskSendAttempted).toBe(1);
   });
@@ -5281,7 +5535,7 @@ describe("fleet usage and Bugbot alerts", () => {
   });
 
   for (const kind of ["DONE", "BLOCKED"]) {
-    it(`accepts a ${kind} marker for a tracked task by key and track time`, async () => {
+    it(`holds an attemptless ${kind} marker for a tracked task`, async () => {
       const key = `TASK-TRACKED-${kind}`;
       const result = await runWatchCycle({
         catTask: key,
@@ -5290,8 +5544,9 @@ describe("fleet usage and Bugbot alerts", () => {
         taskSentAt: "2026-10-12T00:00:01.000Z",
         paneScreen: `Working (1s)\n⏺ Tracked response\n${key}_${kind} tracked result\n\n❯`,
       });
-      expect(result.output).toContain(`FLEET_TASK_${kind} crm ${key} tracked result`);
-      expect(result.taskStatus).toBe(kind === "DONE" ? "done-claimed" : "blocked");
+      expect(result.output).toContain(`FLEET_COMPLETION_REJECTED crm ${key} reason=attempt-missing`);
+      expect(result.output).not.toContain(`FLEET_TASK_${kind} crm ${key}`);
+      expect(result.taskStatus).toBe("working");
     });
   }
 

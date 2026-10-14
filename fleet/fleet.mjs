@@ -164,6 +164,66 @@ export function configuredCatPane(catId, fallback = null) {
   return CONFIGURED_CAT_PANES.get(catId) ?? fallback;
 }
 
+function completionPromptTemplate(line, key, kind, attempt, tail) {
+  const normalized = line.replace(/^\s*[`*_~]+/, "").replace(/[`*_~]+\s*$/, "").replace(/\s+/g, " ").trim();
+  if (attempt) {
+    const template = `${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.`;
+    const normalizedTail = tail.replace(/\s+/g, " ").trim();
+    if (normalized.includes(template)
+      && (kind === "DONE" && normalizedTail.startsWith("<한 줄 요약> 또는")
+        || kind === "BLOCKED" && normalizedTail === "reason=<한 줄>.")) return true;
+  }
+  const normalizedTail = tail.replace(/\s+/g, " ").trim();
+  const prefix = normalized.slice(0, normalized.indexOf(`${key}_${kind}`));
+  return (kind === "DONE" && normalizedTail === "<summary>" && /instructions|finish with/i.test(prefix))
+    || (kind === "BLOCKED" && normalizedTail === "reason=<one line>");
+}
+
+function parseCompletionCandidates(screen) {
+  const lines = String(screen ?? "").replace(/\r/g, "").split("\n");
+  const promptLines = lines.flatMap((line, index) => /^\s*❯/.test(line) ? [index] : []);
+  const inputLine = promptLines.at(-1);
+  const previousPrompt = inputLine === undefined ? undefined : promptLines.at(-2);
+  const visibleLines = lines.slice(previousPrompt === undefined ? 0 : previousPrompt + 1, inputLine);
+  const responseStart = previousPrompt === undefined
+    ? visibleLines.findLastIndex((line) => /^\s*(?:⏺|●|Assistant:)\s*/i.test(line))
+    : visibleLines.findIndex((line) => /^\s*(?:⏺|●|Assistant:)\s*/i.test(line));
+  if (responseStart < 0) return [];
+  const transcript = visibleLines.slice(responseStart);
+  const candidates = [];
+  for (let index = 0; index < transcript.length; index++) {
+    const line = transcript[index].replace(/^[ \t>*`~_]+|[>*`~_]+$/g, "");
+    for (const match of line.matchAll(/\b(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b/gi)) {
+      const key = match[1];
+      const kind = match[2].toUpperCase();
+      let tail = line.slice(match.index + match[0].length);
+      const trimmedTail = tail.trim();
+      const wrappedAttempt = /(?:^|[\s—–-]\s*)attempt\s*(?:=|:)\s*(?:[a-f0-9-]{0,35})\s*$/i.test(trimmedTail)
+        || !trimmedTail && /^\s*(?:[—–-]\s*)?attempt\s*(?:=|:)/i.test(transcript[index + 1] ?? "");
+      if (wrappedAttempt) {
+        for (let next = index + 1; next < Math.min(transcript.length, index + 3); next++) {
+          if (/\bTASK-[A-Z0-9-]+_(?:DONE|BLOCKED)\b/i.test(transcript[next])
+            || /^\s*(?:⏺|✻|Working \(|TPS )/.test(transcript[next])) break;
+          tail += ` ${transcript[next]}`;
+          if (/(?:^|[\s—–-]\s*)attempt\s*(?:=|:)\s*(?:[a-f0-9-]\s*){36}(?=\s|$)/i.test(tail)) break;
+        }
+      }
+      const attemptMatch = tail.match(/(?:^|[\s—–-]\s*)attempt\s*(?:=|:)\s*((?:[a-f0-9-]\s*){36})(?=\s|$)/i);
+      const attempt = attemptMatch?.[1].replace(/\s/g, "") ?? null;
+      let summary = attemptMatch
+        ? `${tail.slice(0, attemptMatch.index)} ${tail.slice(attemptMatch.index + attemptMatch[0].length)}`
+        : tail;
+      summary = summary.replace(/^[\s—–-]+|[`*_~]+$/g, "").replace(/\s*\n\s*/g, " ").trim();
+      const templateContext = transcript.slice(Math.max(0, index - 1), Math.min(transcript.length, index + 3)).join(" ");
+      candidates.push({
+        key, kind, attempt, text: summary,
+        filtered: completionPromptTemplate(templateContext, key, kind, attempt, summary),
+      });
+    }
+  }
+  return candidates;
+}
+
 export function classify(screen) {
   const L = screen.split("\n");
   const tail = L.slice(-14).join("\n");
@@ -177,11 +237,11 @@ export function classify(screen) {
   else if (/Codex error|rate limit|usage limit|429|quota|Unable to verify/i.test(tail)) state = "provider-error";
   else if (/→\s+\S+\s+\[[^\]]+\]/.test(tail)) state = "model-picker";
   const output = responseBlock(screen);
-  const done = [...output.matchAll(/^\s*(?:[•●⏺✻]\s*)?(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b([^\n]*)$/gm)]
-    .filter((m) => !/[<]|또는|<숫자/.test(m[0])).at(-1);
-  const completionTail = done ? `${done[3]}${output.slice(done.index + done[0].length)}`
-    .split(/\n(?:[ \t]*\n|[ \t]*(?:[•●⏺✻]|TASK-[A-Z0-9-]+_(?:DONE|BLOCKED)\b|Working \())/, 1)[0] : "";
-  const completion = completionTail.match(/^\s*attempt=\s*((?:[a-f0-9-]\s*){35}[a-f0-9-])(?:\s+|$)([\s\S]*)$/i);
+  const doneCandidates = parseCompletionCandidates(screen);
+  const parsedDone = doneCandidates.filter((candidate) => !candidate.filtered && candidate.attempt).at(-1);
+  const done = parsedDone
+    ? { key: parsedDone.key, kind: parsedDone.kind, attempt: parsedDone.attempt, text: parsedDone.text }
+    : null;
   const ready = [...output.matchAll(/\b([A-Za-z0-9_.-]+) PR READY head=([0-9a-f]{7,40})\b/gi)].at(-1);
   // Result lines wrap in narrow panes: also look at the latest output block.
   const joined = output.split("\n").slice(-40).map((l) => l.trim()).join(" ");
@@ -197,24 +257,26 @@ export function classify(screen) {
       : output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3);
     questionText = questionLines.map((line) => line.trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(-800);
   }
-  return { state, model, done: done ? { key: done[1], kind: done[2], attempt: completion?.[1].replace(/\s/g, "") ?? null, text: (completion?.[2] ?? done[3]).replace(/\s*\n\s*/g, " ").trim().slice(0, 200) } : null, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
+  return { state, model, done, doneCandidates, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
 }
 
 export function completionBelongsToDispatchAttempt(task, marker) {
   if (!task || ["closed", "done-claimed", "verified-done"].includes(task.status) || task.completion_claimed) return false;
   if (task.key && marker?.key !== task.key) return false;
-  const history = JSON.parse(task.history || "[]");
-  if (!task.dispatch_attempt) {
-    const sentAt = Date.parse(task.sent_at ?? "");
-    if (!Number.isFinite(sentAt) || marker?.attempt) return false;
-    if (task.send_attempted)
-      return ["dispatching", "sent-unconfirmed", "send-failed-unconfirmed", "working"].includes(task.status);
-    if (!["tracked-unconfirmed", "working"].includes(task.status)) return false;
-    const tracked = history.findLast((event) => event.ev === "tracked");
-    const trackAt = Date.parse(tracked?.at ?? task.sent_at ?? "");
-    return Number.isFinite(trackAt) && sentAt >= trackAt;
-  }
-  return marker?.attempt === task.dispatch_attempt && Boolean(task.send_attempted);
+  return Boolean(marker?.attempt && task.dispatch_attempt
+    && marker.attempt === task.dispatch_attempt && task.send_attempted);
+}
+
+function completionRejectionReason(cat, assignedTaskKey, marker, task) {
+  if (marker.filtered) return "filtered";
+  if (!marker.attempt) return "attempt-missing";
+  if (marker.key !== assignedTaskKey || !task || task.key !== marker.key || task.cat !== cat)
+    return "attempt-mismatch";
+  if (!task.dispatch_attempt || marker.attempt !== task.dispatch_attempt)
+    return "attempt-mismatch";
+  if (!task.send_attempted) return "not-sent";
+  if (["closed", "done-claimed", "verified-done"].includes(task.status) || task.completion_claimed) return "already-claimed";
+  return completionBelongsToDispatchAttempt(task, marker) ? null : "attempt-mismatch";
 }
 
 function responseBlock(screen) {
@@ -1706,6 +1768,24 @@ async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, 
   if (!delivery) throw new Error("REJECT_LEASE_LOST");
   const deliveryAttempt = delivery.reject_delivery_attempt ?? row.reject_delivery_attempt;
   if (!deliveryAttempt) throw new Error("REJECT_DELIVERY_ATTEMPT_REQUIRED");
+  const recordSendAttempt = () => dbHandle.transaction(() => {
+    let current = dbHandle.query("SELECT dispatch_attempt,send_attempted FROM tasks WHERE key=?").get(row.task_key);
+    if (!current) throw new Error("REJECT_TASK_MISSING");
+    if (current.dispatch_attempt !== deliveryAttempt) {
+      dbHandle.query(`UPDATE tasks SET status='dispatching',sent_at=?,started_at=NULL,ended_at=NULL,
+        result=NULL,completion_claimed=0,send_attempted=0,dispatch_attempt=? WHERE key=?`)
+        .run(now(), deliveryAttempt, row.task_key);
+      current = { dispatch_attempt: deliveryAttempt, send_attempted: 0 };
+    }
+    if (current.send_attempted) return;
+    const sentAt = now();
+    dbHandle.query(`UPDATE tasks SET status='dispatching',completion_claimed=0,result=NULL,
+      send_attempted=1,sent_at=? WHERE key=? AND dispatch_attempt=?`)
+      .run(sentAt, row.task_key, deliveryAttempt);
+    appendHistoryInTransaction(dbHandle, row.task_key, {
+      ev: "send-attempted", attempt: deliveryAttempt, source: "cursor-reject-followup", at: sentAt,
+    });
+  }).immediate();
   const marker = prLoopRejectDeliveryMarker(row, deliveryAttempt);
   const complete = () => {
     const sentAt = now();
@@ -1729,22 +1809,26 @@ async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, 
     return transcript;
   };
   if (delivery.reject_submit_confirmed_at) {
+    recordSendAttempt();
     complete();
     return;
   }
   const transcript = await readScrollback();
   const markerLocation = prLoopRejectMarkerLocation(transcript.stdout, marker);
   if (markerLocation === "submitted") {
+    recordSendAttempt();
     complete();
     return;
   }
   if (markerLocation === "input") {
+    recordSendAttempt();
     const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
     if (enter.exitCode !== 0) throw new Error(`pane Enter exited ${enter.exitCode}`);
   } else {
     if (!prLoopRejectScrollbackComplete(transcript))
       throw rejectDeliveryAttentionError("REJECT_SCROLLBACK_INCOMPLETE", "pane scrollback cannot prove the rejection marker is absent");
-    const text = `Cursor REJECT for ${row.repo}#${row.pr_number} head=${row.head}:\n${verdict.text}\n${marker}`;
+    recordSendAttempt();
+    const text = `Cursor REJECT for ${row.repo}#${row.pr_number} head=${row.head} attempt=${deliveryAttempt}:\n${verdict.text}\nUse attempt=${deliveryAttempt} in the final ${row.task_key}_DONE or ${row.task_key}_BLOCKED marker.\n${marker}`;
     if (sendFollowup) {
       if (!await sendFollowup(pane, text, row)) throw new Error("pane follow-up send failed");
     } else {
@@ -3035,15 +3119,20 @@ function markTaskObservedWorking(dbHandle, key) {
   const newlyWorking = task.status !== "working" || !task.started_at;
   if (!newlyWorking && !refreshSentAt) return false;
   const observedAt = now();
-  dbHandle.query(`UPDATE tasks SET status='working',started_at=COALESCE(started_at,?),
-    sent_at=CASE WHEN ? THEN ? ELSE sent_at END WHERE key=?`)
-    .run(observedAt, refreshSentAt ? 1 : 0, sent?.at ?? observedAt, key);
+  dbHandle.transaction(() => {
+    dbHandle.query(`UPDATE tasks SET status='working',started_at=COALESCE(started_at,?),
+      sent_at=CASE WHEN ? THEN ? ELSE sent_at END WHERE key=?`)
+      .run(observedAt, refreshSentAt ? 1 : 0, sent?.at ?? observedAt, key);
+    if (newlyWorking && task.dispatch_attempt && task.send_attempted)
+      appendHistoryInTransaction(dbHandle, key, { ev: "started", attempt: task.dispatch_attempt, source: "watch-observed", at: observedAt });
+  }).immediate();
   return newlyWorking;
 }
 
 // Watch: emits only transitions. Gajae: surface recovery_hold / speech suppressed with reason.
 async function watch(intervalSec = 30) {
   const last = new Map();
+  const completionRejectionsReported = new Set();
   const usageAlerted = new Map();
   const bugbotAlerted = new Map();
   // journalctl --since takes local time; keep the cursor in epoch seconds to avoid TZ drift.
@@ -3054,34 +3143,73 @@ async function watch(intervalSec = 30) {
       for (const event of await recoverInterruptedDispatches(db, rows)) console.log(event);
       for (const r of rows) {
         try {
-        const sig = JSON.stringify({ task: r.task, state: r.state, doneKey: r.done?.key ?? "", doneKind: r.done?.kind ?? "", doneAttempt: r.done?.attempt ?? "", doneText: r.done?.text ?? "", readyLine: r.readyLine ?? "", readyHead: r.ready?.head ?? "", claimText: r.claimText ?? "", questionText: r.questionText ?? "" });
+        const completionCandidates = r.doneCandidates ?? (r.done ? [r.done] : []);
+        const completionChecks = completionCandidates.map((marker) => {
+          const task = db.query(`SELECT key,cat,status,sent_at,history,dispatch_attempt,send_attempted,completion_claimed
+            FROM tasks WHERE key=?`).get(marker.key);
+          return { marker, task, reason: completionRejectionReason(r.id, r.task, marker, task) };
+        });
+        if (r.id !== "omonyang") {
+          for (const { marker, reason } of completionChecks) {
+            if (!reason || reason === "already-claimed") continue;
+            const identity = `${r.id}:${marker.attempt ?? `missing:${marker.key}:${marker.kind}`}`;
+            if (completionRejectionsReported.has(identity)) continue;
+            completionRejectionsReported.add(identity);
+            console.log(`FLEET_COMPLETION_REJECTED ${r.id} ${marker.key} reason=${reason}`);
+          }
+        }
+        const currentCompletion = completionChecks.findLast(({ marker, reason }) => !reason && marker.key === r.task);
+        const doneMarker = currentCompletion?.marker ?? null;
+        const doneTask = currentCompletion?.task ?? null;
+        const sig = JSON.stringify({
+          task: r.task,
+          state: r.state,
+          doneKey: doneMarker?.key ?? "",
+          doneKind: doneMarker?.kind ?? "",
+          doneAttempt: doneMarker?.attempt ?? "",
+          doneText: doneMarker?.text ?? "",
+          completionCandidates: completionCandidates.map(({ key, kind, attempt, text, filtered }) => ({ key, kind, attempt, text, filtered })),
+          readyLine: r.readyLine ?? "",
+          readyHead: r.ready?.head ?? "",
+          claimText: r.claimText ?? "",
+          questionText: r.questionText ?? "",
+        });
         const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
         if (!previous || last.get(r.id) !== sig) {
           if (previous && r.state !== previous.state && r.id !== "omonyang") console.log(`FLEET_STATE ${r.id} ${previous.state} -> ${r.state}`);
           if (r.task && r.state === "working" && markTaskObservedWorking(db, r.task)) console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
-          const doneTask = r.done ? db.query("SELECT cat,status,sent_at,history,dispatch_attempt,send_attempted,completion_claimed FROM tasks WHERE key=?").get(r.done.key) : null;
-          const doneChanged = r.id !== "omonyang" && r.done
-            && (!previous || previous.task !== r.task || r.done.key !== previous.doneKey || r.done.kind !== previous.doneKind || r.done.attempt !== previous.doneAttempt)
-            && doneTask?.cat === r.id && completionBelongsToDispatchAttempt(doneTask, r.done);
+          const doneChanged = r.id !== "omonyang" && doneMarker
+            && (!previous || previous.task !== r.task || doneMarker.key !== previous.doneKey || doneMarker.kind !== previous.doneKind || doneMarker.attempt !== previous.doneAttempt)
+            && doneTask?.cat === r.id;
           const readyChanged = r.ready && (!previous || r.ready.head !== previous.readyHead);
           const readyLineChanged = r.readyLine && (!previous || r.readyLine !== previous.readyLine);
           const claimTextChanged = r.claimText && (!previous || r.claimText !== previous.claimText);
           if (doneChanged) {
-            const recorded = r.done.kind === "BLOCKED"
-              ? markTaskBlocked(r.done.key, r.done.text) !== false
-              : db.transaction(() => {
-                const currentTask = db.query("SELECT status,completion_claimed FROM tasks WHERE key=?").get(r.done.key);
-                if (!currentTask || ["verified-done", "closed"].includes(currentTask.status) || currentTask.completion_claimed) return false;
-                const changed = db.query("UPDATE tasks SET status='done-claimed',result=?,completion_claimed=1 WHERE key=? AND status NOT IN ('verified-done','closed') AND completion_claimed=0")
-                  .run(r.done.text, r.done.key).changes;
+            const recorded = db.transaction(() => {
+              const currentTask = db.query("SELECT cat,status,completion_claimed,dispatch_attempt,send_attempted FROM tasks WHERE key=?").get(doneMarker.key);
+              if (!currentTask || currentTask.cat !== r.id || currentTask.dispatch_attempt !== doneMarker.attempt
+                || !currentTask.send_attempted || ["verified-done", "closed", "done-claimed"].includes(currentTask.status)
+                || currentTask.completion_claimed) return false;
+              if (doneMarker.kind === "BLOCKED") {
+                const changed = db.query(`UPDATE tasks SET status='blocked',result=? WHERE key=? AND cat=?
+                  AND dispatch_attempt=? AND send_attempted=1 AND completion_claimed=0 AND status NOT IN ('verified-done','closed')`)
+                  .run(doneMarker.text, doneMarker.key, r.id, doneMarker.attempt).changes;
                 if (!changed) return false;
-                appendHistoryInTransaction(db, r.done.key, { ev: "done-claimed", text: r.done.text });
+                db.query("DELETE FROM dispatch_reservations WHERE key=?").run(doneMarker.key);
+                appendHistoryInTransaction(db, doneMarker.key, { ev: "blocked", attempt: doneMarker.attempt, text: doneMarker.text });
                 return true;
-              }).immediate();
-            if (recorded) console.log(`FLEET_TASK_${r.done.kind} ${r.id} ${r.done.key} ${r.done.text}`);
+              }
+              const changed = db.query(`UPDATE tasks SET status='done-claimed',result=?,completion_claimed=1 WHERE key=? AND cat=?
+                AND dispatch_attempt=? AND send_attempted=1 AND status NOT IN ('verified-done','closed','done-claimed') AND completion_claimed=0`)
+                .run(doneMarker.text, doneMarker.key, r.id, doneMarker.attempt).changes;
+              if (!changed) return false;
+              appendHistoryInTransaction(db, doneMarker.key, { ev: "done-claimed", attempt: doneMarker.attempt, text: doneMarker.text });
+              return true;
+            }).immediate();
+            if (recorded) console.log(`FLEET_TASK_${doneMarker.kind} ${r.id} ${doneMarker.key} ${doneMarker.text}`);
           }
           if (doneChanged || readyChanged || readyLineChanged || claimTextChanged) {
-            const taskKey = r.done?.key ?? r.task;
+            const taskKey = doneMarker?.key ?? r.task;
             const task = taskKey ? db.query("SELECT * FROM tasks WHERE key=?").get(taskKey) : null;
             const claims = await verifyClaims(r.claimText ?? "", task);
             for (const claim of claims) {
