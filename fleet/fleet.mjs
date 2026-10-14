@@ -1889,12 +1889,12 @@ function recordPrLoopRejectFailure(dbHandle, row, rejectLeaseToken, error, event
     if (error?.code === "REJECT_ENTER_RETRYABLE" && task?.dispatch_attempt === deliveryAttempt
       && task.send_attempted && task.status === "dispatching" && !task.completion_claimed) {
       const detail = String(error?.message ?? error).slice(0, 240);
-      const taskChanged = dbHandle.query(`UPDATE tasks SET status='send-failed-unconfirmed',result=?
+      const taskChanged = dbHandle.query(`UPDATE tasks SET status='sent-unconfirmed',result=?
         WHERE key=? AND status='dispatching' AND dispatch_attempt=? AND send_attempted=1 AND completion_claimed=0`)
         .run(`Cursor REJECT Enter remains unconfirmed: ${detail}`, row.task_key, deliveryAttempt).changes;
       if (taskChanged) {
         appendHistoryInTransaction(dbHandle, row.task_key, {
-          ev: "send-failed-unconfirmed", attempt: deliveryAttempt, source: "cursor-reject-followup", detail,
+          ev: "sent-unconfirmed", attempt: deliveryAttempt, source: "cursor-reject-followup", detail,
         });
         retryableEnterFailure = true;
       }
@@ -1902,12 +1902,21 @@ function recordPrLoopRejectFailure(dbHandle, row, rejectLeaseToken, error, event
     if (!retryableEnterFailure && task?.dispatch_attempt === deliveryAttempt && task.send_attempted
       && task.status === "dispatching" && !task.completion_claimed) {
       const detail = String(error?.message ?? error).slice(0, 240);
-      const taskChanged = dbHandle.query(`UPDATE tasks SET status='blocked',result=?,ended_at=?,completion_claimed=0
-        WHERE key=? AND status='dispatching' AND dispatch_attempt=? AND send_attempted=1 AND completion_claimed=0`)
-        .run(`Cursor REJECT follow-up needs attention: ${detail}`, now(), row.task_key, deliveryAttempt).changes;
+      const definitelyNotDelivered = error?.code === "REJECT_SEND_FAILED";
+      const taskChanged = definitelyNotDelivered
+        ? dbHandle.query(`UPDATE tasks SET status='blocked',result=?,ended_at=?,completion_claimed=0
+          WHERE key=? AND status='dispatching' AND dispatch_attempt=? AND send_attempted=1 AND completion_claimed=0`)
+          .run(`Cursor REJECT follow-up needs attention: ${detail}`, now(), row.task_key, deliveryAttempt).changes
+        : dbHandle.query(`UPDATE tasks SET status='sent-unconfirmed',result=?,completion_claimed=0
+          WHERE key=? AND status='dispatching' AND dispatch_attempt=? AND send_attempted=1 AND completion_claimed=0`)
+          .run(`Cursor REJECT follow-up delivery is unconfirmed: ${detail}`, row.task_key, deliveryAttempt).changes;
       if (taskChanged) {
         appendHistoryInTransaction(dbHandle, row.task_key, {
-          ev: "cursor-reject-followup-failed", attempt: deliveryAttempt, reason: "send_failed", text: detail,
+          ev: definitelyNotDelivered ? "cursor-reject-followup-failed" : "sent-unconfirmed",
+          attempt: deliveryAttempt,
+          source: "cursor-reject-followup",
+          reason: definitelyNotDelivered ? "send_failed" : "delivery_unconfirmed",
+          text: detail,
         });
         taskNeedsAttention = true;
       }
@@ -1916,7 +1925,8 @@ function recordPrLoopRejectFailure(dbHandle, row, rejectLeaseToken, error, event
       : error?.code === "REJECT_SUBMIT_UNCONFIRMED" ? "submit_unconfirmed"
         : error?.code === "REJECT_TASK_STATE_CHANGED" ? "task_state_changed"
           : error?.code === "REJECT_ENTER_RETRYABLE" && retryableEnterFailure ? null
-          : error?.code === "REJECT_SEND_FAILED" || taskNeedsAttention ? "send_failed"
+          : error?.code === "REJECT_SEND_FAILED" ? "send_failed"
+            : taskNeedsAttention ? "delivery_unconfirmed"
             : null;
     const state = reason ? "reject-needs-attention" : "reject-failed";
     const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state=?,reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?

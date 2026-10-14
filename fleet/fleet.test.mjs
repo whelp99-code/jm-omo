@@ -884,6 +884,82 @@ describe("fleet PR automation", () => {
     db.close();
   });
 
+  it("keeps a delivered REJECT pane occupied when confirmation read fails", async () => {
+    const key = "PRLOOP-REJECT-UNCONFIRMED";
+    const pane = "w-pr-loop-unconfirmed:p1";
+    const db = prLoopDb({ key, cat: "crm", done: signal, pane, status: "done-claimed", completion_claimed: 1 });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,updated_at)
+      VALUES('owner/repo','52',?,?,'awaiting-review','100','1')`).run(head, key);
+    const commands = [];
+    let paneReads = 0;
+    const events = await processPrLoopEvents(db, prLoopConfig, {
+      fetchReplies: async () => [{
+        ts: "101", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW",
+        text: `REJECT owner/repo#52 head=${head} please keep this pane occupied`,
+      }],
+      runCommand: async (argv) => {
+        commands.push(argv);
+        if (argv[0] === "gh") return {
+          exitCode: 0,
+          stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head, url: "https://github.com/owner/repo/pull/52" }),
+        };
+        return { exitCode: 0, stdout: "" };
+      },
+      readPane: async () => ++paneReads === 1
+        ? { exitCode: 0, stdout: "" }
+        : { exitCode: 1, stdout: "" },
+    });
+    const task = db.query("SELECT status,dispatch_attempt,send_attempted,completion_claimed FROM tasks WHERE key=?").get(key);
+    expect(commands.map((argv) => argv[2])).toEqual(["send-text", "send-keys"]);
+    expect(task.status).toBe("sent-unconfirmed");
+    expect(task.dispatch_attempt).toBeString();
+    expect(task.send_attempted).toBe(1);
+    expect(task.completion_claimed).toBe(0);
+    expect(events).toContain(`FLEET_PR_REJECT_NEEDS_ATTENTION ${key} ${signal} head=${head} reason=scrollback_incomplete`);
+
+    const dispatchDb = unitDb();
+    const prompt = join(unitHome, `${key}-next.txt`);
+    writeFileSync(prompt, "must wait for the unconfirmed REJECT task\n");
+    dispatchDb.query("INSERT INTO cats(id,name,pane) VALUES('pr-loop-unconfirmed-cat','Unconfirmed REJECT',?)").run(pane);
+    dispatchDb.query("INSERT INTO tasks(key,cat,title,done,status,sent_at) VALUES(?,?,?,?,?,?)")
+      .run(key, "pr-loop-unconfirmed-cat", key, signal, task.status, new Date().toISOString());
+    dispatchDb.close();
+    const next = await dispatch("pr-loop-unconfirmed-cat", `${key}-NEXT`, prompt, {
+      keepModel: true,
+      sleep: async () => {},
+      runCommand: async () => ({ exitCode: 0, stdout: "Idle\n❯" }),
+    });
+    expect(next).toBe("DISPATCH_HOLD pr-loop-unconfirmed-cat prior-task-unresolved; not sent");
+    db.close();
+  });
+
+  it("does not press Enter after a definite REJECT send-text failure", async () => {
+    const key = "PRLOOP-REJECT-SEND-TEXT-FAILURE";
+    const db = prLoopDb({ key, cat: "crm", done: signal, pane: "w5:p4", status: "done-claimed", completion_claimed: 1 });
+    db.query(`INSERT INTO fleet_pr_loop(repo,pr_number,head,task_key,state,request_ts,updated_at)
+      VALUES('owner/repo','52',?,?,'awaiting-review','100','1')`).run(head, key);
+    const commands = [];
+    const events = await processPrLoopEvents(db, prLoopConfig, {
+      fetchReplies: async () => [{
+        ts: "101", thread_ts: threadTs, user: "U0B81F5GR6V", app_id: "A08SKDT6QUW",
+        text: `REJECT owner/repo#52 head=${head} retry after a definite send failure`,
+      }],
+      runCommand: async (argv) => {
+        commands.push(argv);
+        if (argv[0] === "gh") return {
+          exitCode: 0,
+          stdout: JSON.stringify({ state: "OPEN", isDraft: false, headRefOid: head, url: "https://github.com/owner/repo/pull/52" }),
+        };
+        return { exitCode: argv[2] === "send-text" ? 1 : 0, stdout: "" };
+      },
+      readPane: async () => ({ exitCode: 0, stdout: "" }),
+    });
+    expect(commands.map((argv) => argv[2])).toEqual(["send-text"]);
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("blocked");
+    expect(events).toContain(`FLEET_PR_REJECT_NEEDS_ATTENTION ${key} ${signal} head=${head} reason=send_failed`);
+    db.close();
+  });
+
   it("runs configured deploys through Dori heavy and records health outcomes", async () => {
     const head = "0123456789abcdef0123456789abcdef01234567";
     const mergeSha = "abcdef0123456789abcdef0123456789abcdef01";
@@ -1616,6 +1692,7 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
     expect(first).toEqual([]);
     expect(db.query("SELECT state,reject_sent_at FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?").get(head))
       .toEqual({ state: "reject-failed", reject_sent_at: null });
+    expect(db.query("SELECT status FROM tasks WHERE key=?").get(key).status).toBe("sent-unconfirmed");
     expect(db.query("SELECT reject_submit_confirmed_at FROM fleet_pr_loop WHERE repo='owner/repo' AND pr_number='52' AND head=?")
       .get(head).reject_submit_confirmed_at).toBeNull();
 
