@@ -4220,6 +4220,12 @@ describe("fleet completion classification", () => {
       summary: "대표 필요 2단계, 계 획·격리 검증 완료",
     },
   ];
+  const dispatchPromptText = (key, attempt, request) => `${key} [attempt=${attempt} skill:ulw]: 지시문 파일 ${request} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 ${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.`;
+  const wrapTextAtWidth = (text, width) => {
+    const lines = [];
+    for (let offset = 0; offset < text.length; offset += width) lines.push(text.slice(offset, offset + width));
+    return lines;
+  };
 
   for (const fixture of realCompletionScreens) {
     it(`replays the markerless real screen for ${fixture.key}`, () => {
@@ -4251,6 +4257,63 @@ describe("fleet completion classification", () => {
     expect(result.doneCandidates).toContainEqual({
       key, kind: "BLOCKED", attempt, text: "reason=<한 줄>. 안내 예시", filtered: true,
     });
+  });
+
+  it("filters width-73 DONE and wrapped BLOCKED placeholders in unruled scrollback", () => {
+    const key = "TASK-INPUT-BOX-PROMPT";
+    const attempt = "3a000000-0000-4000-8000-00000000003a";
+    const request = "/tmp/fleet-input-box-request.md";
+    const message = dispatchPromptText(key, attempt, request);
+    const wrapped = wrapTextAtWidth(message, 73);
+    const markerLine = wrapped.findIndex((line) => line.startsWith(`${key}_DONE attempt=${attempt}`));
+    expect(markerLine).toBeGreaterThanOrEqual(0);
+    expect(wrapped[markerLine]).toEndWith("<");
+    expect(wrapped[markerLine + 1].startsWith("한 줄 요약>")).toBe(true);
+    const result = classify(wrapped.join("\n") + "\n\n❯");
+    expect(result.done).toBeNull();
+    expect(result.doneCandidates.some((candidate) => candidate.key === key && candidate.kind === "DONE" && candidate.filtered))
+      .toBe(true);
+
+    const blockedKey = "TASK-BLOCKED-PLACEHOLDER-WRAP";
+    const blocked = classify(`${blockedKey}_BLOCKED attempt=${attempt} reason=<한\n줄>. 안내 예시\n\n❯`);
+    expect(blocked.done).toBeNull();
+    expect(blocked.doneCandidates).toContainEqual({
+      key: blockedKey, kind: "BLOCKED", attempt, text: "reason=<한 줄>. 안내 예시", filtered: true,
+    });
+  });
+
+  it("sweeps 4,420 unruled dispatch echoes without current-attempt completions", () => {
+    const keys = [
+      "TASK-A",
+      "TASK-INPUT-BOX-PROMPT",
+      "TASK-JARVIS-82-FIX7-20261015",
+      "TASK-CRM-DEPLOY-VERIFY-GAPS-20261014",
+      "TASK-COMPANY-HANDOFF-ACTIVATE-PLAN-20261014",
+    ];
+    const pathLengths = [20, 31, 80, 160];
+    const attempt = "3a000000-0000-4000-8000-00000000003a";
+    let cases = 0;
+    const falseCompletions = [];
+    for (const key of keys) {
+      for (let pathIndex = 0; pathIndex < pathLengths.length; pathIndex++) {
+        const pathLength = pathLengths[pathIndex];
+        const pathPrefix = `/tmp/p${pathIndex}-`;
+        const pathSuffix = ".md";
+        const request = `${pathPrefix}${"x".repeat(pathLength - pathPrefix.length - pathSuffix.length)}${pathSuffix}`;
+        expect(request.length).toBe(pathLength);
+        const message = dispatchPromptText(key, attempt, request);
+        for (let width = 20; width <= 240; width++) {
+          const screen = `Older scrollback\n${wrapTextAtWidth(message, width).join("\n")}\n\n❯`;
+          const result = classify(screen);
+          if (result.done?.key === key && result.done.attempt === attempt
+            || result.doneCandidates.some((candidate) => candidate.key === key && candidate.attempt === attempt && !candidate.filtered))
+            falseCompletions.push({ key, pathLength, width, done: result.done });
+          cases++;
+        }
+      }
+    }
+    expect(cases).toBe(4420);
+    expect(falseCompletions).toEqual([]);
   });
 
   for (const width of [60, 116, 180]) {
@@ -5507,6 +5570,21 @@ describe("fleet watch sent-unconfirmed recheck", () => {
       .toMatchObject({ attempt, source: "watch-observed" });
   });
 
+  it("keeps a tracked task unstarted when Working accompanies an attemptless DONE", async () => {
+    const key = "TASK-TRACKED-WORKING-ATTEMPTLESS-DONE";
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "tracked-unconfirmed",
+      taskHistory: [],
+      taskSentAt: "2026-10-15T01:00:00.000Z",
+      paneScreen: `Working (1s)\n⏺ Completed response\n${key}_DONE prior work is complete\n\n❯`,
+    });
+    expect(result.output).toContain(`FLEET_COMPLETION_REJECTED crm ${key} reason=attempt-missing`);
+    expect(result.output).not.toContain(`FLEET_TASK_STARTED crm ${key}`);
+    expect(result.taskStatus).toBe("tracked-unconfirmed");
+    expect(result.taskHistory.some((event) => event.ev === "started")).toBe(false);
+  });
+
   for (const completed of [false, true]) {
     it(`observes a newly tracked task on an unchanged ${completed ? "completed" : "working"} screen`, async () => {
       const key = `TASK-TRACK-UNCHANGED-${completed ? "COMPLETED" : "WORKING"}`;
@@ -5521,9 +5599,26 @@ describe("fleet watch sent-unconfirmed recheck", () => {
         paneScreen: completed ? `Working (1s)\n⏺ Completed response\n${key}_DONE finished\n\n❯` : "Working (1s)\n❯",
       });
       expect(result.output).toContain(expected);
+      if (completed) expect(result.output).not.toContain(`FLEET_TASK_STARTED crm ${key}`);
       expect(result.taskStatus).toBe(completed ? "tracked-unconfirmed" : "working");
     });
   }
+
+  it("keeps a newly tracked task unstarted when Working accompanies an attemptless DONE", async () => {
+    const key = "TASK-TRACKED-WORKING-ATTEMPTLESS-DONE";
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "tracked-unconfirmed",
+      taskHistory: [],
+      taskSentAt: "2026-10-15T01:00:00.000Z",
+      paneScreen: `Working (1s)\n⏺ Completed response\n${key}_DONE prior work is complete\n\n❯`,
+    });
+    expect(result.output).toContain(`FLEET_COMPLETION_REJECTED crm ${key} reason=attempt-missing`);
+    expect(result.output).not.toContain(`FLEET_TASK_STARTED crm ${key}`);
+    expect(result.taskStatus).toBe("tracked-unconfirmed");
+    expect(result.taskHistory.some((event) => event.ev === "started")).toBe(false);
+  });
+
   it("marks a late Working pane as started without resending", async () => {
     const home = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unconfirmed-"));
     const state = join(home, ".local", "state", "omonyang");
@@ -5702,8 +5797,10 @@ describe("fleet usage and Bugbot alerts", () => {
         paneScreen: `Working (1s)\n⏺ Tracked response\n${key}_${kind} tracked result\n\n❯`,
       });
       expect(result.output).toContain(`FLEET_COMPLETION_REJECTED crm ${key} reason=attempt-missing`);
+      expect(result.output).not.toContain(`FLEET_TASK_STARTED crm ${key}`);
       expect(result.output).not.toContain(`FLEET_TASK_${kind} crm ${key}`);
-      expect(result.taskStatus).toBe("working");
+      expect(result.taskStatus).toBe("tracked-unconfirmed");
+      expect(result.taskHistory.some((event) => event.ev === "started")).toBe(false);
     });
   }
 

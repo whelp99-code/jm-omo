@@ -167,8 +167,10 @@ export function configuredCatPane(catId, fallback = null) {
 function completionPromptTemplate(line, key, kind, tail) {
   const normalized = line.replace(/^\s*[`*_~]+/, "").replace(/[`*_~]+\s*$/, "").replace(/\s+/g, " ").trim();
   const normalizedTail = tail.replace(/\s+/g, " ").trim();
-  if (kind === "DONE" && (normalized.includes("<한 줄 요약>") || normalizedTail.includes("<한 줄 요약>"))) return true;
-  if (kind === "BLOCKED" && (/reason=<한 줄>/.test(normalized) || /^reason=<한 줄>/.test(normalizedTail))) return true;
+  const compact = normalized.replace(/\s+/g, "");
+  const compactTail = normalizedTail.replace(/\s+/g, "");
+  if (kind === "DONE" && (compact.includes("<한줄요약>") || compactTail.includes("<한줄요약>"))) return true;
+  if (kind === "BLOCKED" && (compact.includes("reason=<한줄>") || compactTail.startsWith("reason=<한줄>"))) return true;
   const prefix = normalized.slice(0, normalized.indexOf(`${key}_${kind}`));
   return (kind === "DONE" && normalizedTail === "<summary>" && /instructions|finish with/i.test(prefix))
     || (kind === "BLOCKED" && normalizedTail === "reason=<one line>");
@@ -3159,14 +3161,18 @@ async function watch(intervalSec = 30) {
         const currentChecks = completionChecks.filter(({ marker, reason }) => marker.key === r.task
           && !["filtered", "stale-attempt", "other-task", "already-claimed"].includes(reason));
         const latestCurrentCheck = currentChecks.at(-1);
+        let rejectionIdentity = null;
+        let rejectionEvent = null;
         if (r.id !== "omonyang" && ["attempt-missing", "attempt-mismatch", "not-sent"].includes(latestCurrentCheck?.reason)) {
           const { marker, reason } = latestCurrentCheck;
-          const identity = `${r.id}:${marker.attempt ?? `missing:${marker.key}:${marker.kind}`}`;
-          if (!completionRejectionsReported.has(identity)) {
-            completionRejectionsReported.add(identity);
-            console.log(`FLEET_COMPLETION_REJECTED ${r.id} ${marker.key} reason=${reason}`);
+          rejectionIdentity = `${r.id}:${marker.attempt ?? `missing:${marker.key}:${marker.kind}`}`;
+          if (!completionRejectionsReported.has(rejectionIdentity)) {
+            rejectionEvent = `FLEET_COMPLETION_REJECTED ${r.id} ${marker.key} reason=${reason}`;
           }
         }
+        const holdUntrackedTask = ["attempt-missing", "attempt-mismatch"].includes(latestCurrentCheck?.reason)
+          && latestCurrentCheck.task?.status === "tracked-unconfirmed"
+          && !latestCurrentCheck.task.dispatch_attempt && !latestCurrentCheck.task.send_attempted;
         const currentCompletion = latestCurrentCheck?.reason === null ? latestCurrentCheck : null;
         const doneMarker = currentCompletion?.marker ?? null;
         const doneTask = currentCompletion?.task ?? null;
@@ -3186,7 +3192,7 @@ async function watch(intervalSec = 30) {
         const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
         if (!previous || last.get(r.id) !== sig) {
           if (previous && r.state !== previous.state && r.id !== "omonyang") console.log(`FLEET_STATE ${r.id} ${previous.state} -> ${r.state}`);
-          if (r.task && r.state === "working" && markTaskObservedWorking(db, r.task)) console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
+          if (r.task && r.state === "working" && !holdUntrackedTask && markTaskObservedWorking(db, r.task)) console.log(`FLEET_TASK_STARTED ${r.id} ${r.task}`);
           const doneChanged = r.id !== "omonyang" && doneMarker
             && (!previous || previous.task !== r.task || doneMarker.key !== previous.doneKey || doneMarker.kind !== previous.doneKind || doneMarker.attempt !== previous.doneAttempt)
             && doneTask?.cat === r.id;
@@ -3259,6 +3265,10 @@ async function watch(intervalSec = 30) {
           }
         }
         if (!retryQuestion) last.set(r.id, sig);
+        if (rejectionEvent) {
+          completionRejectionsReported.add(rejectionIdentity);
+          console.log(rejectionEvent);
+        }
         if (r.task) {
           const t = db.query("SELECT status,sent_at FROM tasks WHERE key=?").get(r.task);
           if (["sent", "sent-unconfirmed", "send-failed-unconfirmed", "working"].includes(t?.status)) {
