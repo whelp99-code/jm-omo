@@ -4194,6 +4194,66 @@ describe("fleet dispatch reservations", () => {
 });
 
 describe("fleet completion classification", () => {
+  const realCompletionScreens = [
+    {
+      file: "TASK-JARVIS-82-FIX6-20261014.txt",
+      key: "TASK-JARVIS-82-FIX6-20261014",
+      attempt: "5b681d72-81a9-4ad5-b541-4478d467ebb7",
+    },
+    {
+      file: "TASK-JARVIS-RELEASE-E780-PREP-20261014.txt",
+      key: "TASK-JARVIS-RELEASE-E780-PREP-20261014",
+      attempt: "38c212aa-d59a-41f5-9f6e-1d2ead2074d5",
+    },
+    {
+      file: "TASK-CRM-DEPLOY-VERIFY-GAPS-20261014.txt",
+      key: "TASK-CRM-DEPLOY-VERIFY-GAPS-20261014",
+      attempt: "a6a6d496-1eb5-4350-9886-95680f75f422",
+    },
+    {
+      file: "TASK-COMPANY-HANDOFF-ACTIVATE-PLAN-20261014.txt",
+      key: "TASK-COMPANY-HANDOFF-ACTIVATE-PLAN-20261014",
+      attempt: "6b515135-890c-4355-89c8-45fe7a342f4e",
+    },
+  ];
+
+  for (const fixture of realCompletionScreens) {
+    it(`replays the markerless real screen for ${fixture.key}`, () => {
+      const screen = readFileSync(new URL(`./fixtures/completion/${fixture.file}`, import.meta.url), "utf8");
+      expect(screen).not.toMatch(/^\s*(?:⏺|●|Assistant:)\s*/m);
+      expect(classify(screen).done).toMatchObject({
+        key: fixture.key,
+        kind: "DONE",
+        attempt: fixture.attempt,
+      });
+    });
+  }
+
+  it("filters the visible dispatch template but accepts its markerless current DONE", () => {
+    const key = "TASK-MARKERLESS-PROMPT";
+    const attempt = "36000000-0000-4000-8000-000000000036";
+    const template = `${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.`;
+    const screen = `❯ Finish with this exact final line: ${template}\n\n${key}_DONE attempt=${attempt} completed without an assistant marker\n\n❯`;
+    const result = classify(screen);
+    expect(result.done).toEqual({ key, kind: "DONE", attempt, text: "completed without an assistant marker" });
+    expect(result.doneCandidates.filter((candidate) => candidate.filtered).map(({ kind }) => kind))
+      .toEqual(["DONE", "BLOCKED"]);
+  });
+
+  it("finds a DONE before a trailing circle list", () => {
+    const key = "TASK-CIRCLE-LIST-AFTER-DONE";
+    const attempt = "37000000-0000-4000-8000-000000000037";
+    const screen = `⏺ Completed response\n${key}_DONE attempt=${attempt} passed\n\n● Files changed\n● Tests passed\n\n❯`;
+    expect(classify(screen).done).toEqual({ key, kind: "DONE", attempt, text: "passed" });
+  });
+
+  it("finds a scrolled-prompt DONE before a later tool-call paragraph", () => {
+    const key = "TASK-SCROLLED-PROMPT-DONE";
+    const attempt = "38000000-0000-4000-8000-000000000038";
+    const screen = `Older pane history\n\n⏺ ${key}_DONE attempt=${attempt} completed\n\n⏺ Bash(git status)\n  ⎿ working tree clean\n\n❯`;
+    expect(classify(screen).done).toEqual({ key, kind: "DONE", attempt, text: "completed" });
+  });
+
   it("ignores prompt instructions and placeholders outside the latest response block", () => {
     const screen = [
       "Earlier instructions: finish with TASK-X_DONE <summary>",
@@ -4236,7 +4296,9 @@ describe("fleet completion classification", () => {
   it("does not borrow an attempt ID from a separate response after a completion marker", () => {
     const result = classify("⏺ Completed response\nTASK-WRAPPED_DONE\n⏺ Different response\nattempt=12345678-1234-4234-8234-123456789abc unrelated\n\n❯");
     expect(result.done).toBeNull();
-    expect(result.doneCandidates).toEqual([]);
+    expect(result.doneCandidates).toContainEqual({
+      key: "TASK-WRAPPED", kind: "DONE", attempt: null, text: "", filtered: false,
+    });
   });
 
   it("recognizes a final completion line above the input prompt", () => {
@@ -4304,6 +4366,7 @@ describe("fleet completion classification", () => {
     ["Korean conjunction", "재시도 또는 timeout 수정"],
     ["less-than measurement", "p95 < 200ms"],
     ["generic type notation", "Result<T> parsed"],
+    ["terminal greater-than notation", "Result<T>"],
   ])("accepts completion summaries containing %s", (_label, summary) => {
     const key = "TASK-SUMMARY-SYMBOLS";
     const attempt = "12000000-0000-4000-8000-000000000012";
@@ -4370,24 +4433,27 @@ describe("fleet completion classification", () => {
 
   it.each([
     ["missing attempt", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE finished", "attempt-missing", true, "crm"],
-    ["mismatched attempt", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=21000000-0000-4000-8000-000000000021 stale", "attempt-mismatch", true, "crm"],
-    ["wrong task key on the same pane", "TASK-FOREIGN-PANE-DONE", "TASK-FOREIGN-PANE-DONE_DONE attempt=20000000-0000-4000-8000-000000000020 foreign", "attempt-mismatch", true, "crm"],
-    ["wrong task category", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=20000000-0000-4000-8000-000000000020 finished", "attempt-mismatch", true, "jarvis"],
-    ["matching attempt not sent", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=20000000-0000-4000-8000-000000000020 finished", "not-sent", false, "crm"],
-  ])("emits a completion hold for %s", async (_case, observedKey, line, reason, sendAttempted, taskCat) => {
+    ["mismatched current attempt", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=21000000-0000-4000-8000-000000000021 stale", "attempt-mismatch", true, "crm"],
+    ["a stale attempt from history", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=19000000-0000-4000-8000-000000000019 stale", "", true, "crm", ["19000000-0000-4000-8000-000000000019"]],
+    ["another task", "TASK-FOREIGN-PANE-DONE", "TASK-FOREIGN-PANE-DONE_DONE attempt=20000000-0000-4000-8000-000000000020 foreign", "", true, "crm"],
+    ["a task assigned to another category", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=20000000-0000-4000-8000-000000000020 finished", "", true, "jarvis"],
+    ["a matching attempt that was not sent", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=20000000-0000-4000-8000-000000000020 finished", "", false, "crm"],
+  ])("handles %s without stale-task alerts", async (_case, observedKey, line, reason, sendAttempted, taskCat, staleAttempts = []) => {
     const result = await runWatchCycle({
       catTask: "TASK-COMPLETION-BOUND",
       taskCat,
       taskStatus: "working",
       dispatchAttempt: "20000000-0000-4000-8000-000000000020",
       taskSendAttempted: sendAttempted,
-      taskHistory: sendAttempted
-        ? [{ ev: "send-attempted", attempt: "20000000-0000-4000-8000-000000000020", at: "2026-10-14T10:00:00.000Z" }]
-        : [],
+      taskHistory: [
+        ...staleAttempts.map((attempt) => ({ ev: "send-attempted", attempt, at: "2026-10-13T10:00:00.000Z" })),
+        ...(sendAttempted ? [{ ev: "send-attempted", attempt: "20000000-0000-4000-8000-000000000020", at: "2026-10-14T10:00:00.000Z" }] : []),
+      ],
       taskSentAt: "2026-10-14T10:00:01.000Z",
-      paneScreen: `⏺ Completion response\n${line}\n\n❯`,
+      paneScreen: `${line}\n\n❯`,
     });
-    expect(result.output).toContain(`FLEET_COMPLETION_REJECTED crm ${observedKey} reason=${reason}`);
+    if (reason) expect(result.output).toContain(`FLEET_COMPLETION_REJECTED crm ${observedKey} reason=${reason}`);
+    else expect(result.output).not.toContain("FLEET_COMPLETION_REJECTED");
     expect(result.output).not.toContain("FLEET_TASK_DONE crm");
     expect(result.taskStatus).toBe("working");
   });
@@ -4409,8 +4475,30 @@ describe("fleet completion classification", () => {
       taskSentAt: "2026-10-14T10:00:01.000Z",
       paneScreen: screen,
     });
-    expect(result.output).toContain(`FLEET_COMPLETION_REJECTED crm ${key} reason=filtered`);
+    expect(result.output).not.toContain("FLEET_COMPLETION_REJECTED");
     expect(result.output).not.toContain(`FLEET_TASK_DONE crm ${key}`);
+  });
+
+  it("accepts the current task and ignores older markerless tasks and attempts", async () => {
+    const key = "TASK-CURRENT-MARKERLESS";
+    const attempt = "39000000-0000-4000-8000-000000000039";
+    const oldAttempt = "38000000-0000-4000-8000-000000000038";
+    const otherKey = "TASK-OLDER-OTHER";
+    const screen = `${otherKey}_DONE attempt=37000000-0000-4000-8000-000000000037 stale task\n${key}_DONE attempt=${oldAttempt} stale attempt\n${key}_DONE attempt=${attempt} current result\n\n❯`;
+    const result = await runWatchCycle({
+      catTask: key,
+      taskStatus: "working",
+      dispatchAttempt: attempt,
+      taskHistory: [
+        { ev: "send-attempted", attempt: oldAttempt, at: "2026-10-13T10:00:00.000Z" },
+        { ev: "send-attempted", attempt, at: "2026-10-14T10:00:00.000Z" },
+      ],
+      taskSentAt: "2026-10-14T10:00:01.000Z",
+      paneScreen: screen,
+    });
+    expect(result.output).toContain(`FLEET_TASK_DONE crm ${key} current result`);
+    expect(result.output).not.toContain("FLEET_COMPLETION_REJECTED");
+    expect(result.taskStatus).toBe("done-claimed");
   });
 
   it("deduplicates held completion events by dispatch attempt", async () => {

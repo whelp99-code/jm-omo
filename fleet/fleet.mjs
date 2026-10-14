@@ -171,7 +171,7 @@ function completionPromptTemplate(line, key, kind, attempt, tail) {
     const normalizedTail = tail.replace(/\s+/g, " ").trim();
     if (normalized.includes(template)
       && (kind === "DONE" && normalizedTail.startsWith("<한 줄 요약> 또는")
-        || kind === "BLOCKED" && normalizedTail === "reason=<한 줄>.")) return true;
+        || kind === "BLOCKED" && normalizedTail.startsWith("reason=<한 줄>."))) return true;
   }
   const normalizedTail = tail.replace(/\s+/g, " ").trim();
   const prefix = normalized.slice(0, normalized.indexOf(`${key}_${kind}`));
@@ -180,19 +180,10 @@ function completionPromptTemplate(line, key, kind, attempt, tail) {
 }
 
 function parseCompletionCandidates(screen) {
-  const lines = String(screen ?? "").replace(/\r/g, "").split("\n");
-  const promptLines = lines.flatMap((line, index) => /^\s*❯/.test(line) ? [index] : []);
-  const inputLine = promptLines.at(-1);
-  const previousPrompt = inputLine === undefined ? undefined : promptLines.at(-2);
-  const visibleLines = lines.slice(previousPrompt === undefined ? 0 : previousPrompt + 1, inputLine);
-  const responseStart = previousPrompt === undefined
-    ? visibleLines.findLastIndex((line) => /^\s*(?:⏺|●|Assistant:)\s*/i.test(line))
-    : visibleLines.findIndex((line) => /^\s*(?:⏺|●|Assistant:)\s*/i.test(line));
-  if (responseStart < 0) return [];
-  const transcript = visibleLines.slice(responseStart);
+  const transcript = String(screen ?? "").replace(/\r/g, "").split("\n");
   const candidates = [];
   for (let index = 0; index < transcript.length; index++) {
-    const line = transcript[index].replace(/^[ \t>*`~_]+|[>*`~_]+$/g, "");
+    const line = transcript[index].replace(/^[ \t>*`~_]+|[*`~_]+$/g, "");
     for (const match of line.matchAll(/\b(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b/gi)) {
       const key = match[1];
       const kind = match[2].toUpperCase();
@@ -269,14 +260,18 @@ export function completionBelongsToDispatchAttempt(task, marker) {
 
 function completionRejectionReason(cat, assignedTaskKey, marker, task) {
   if (marker.filtered) return "filtered";
-  if (!marker.attempt) return "attempt-missing";
   if (marker.key !== assignedTaskKey || !task || task.key !== marker.key || task.cat !== cat)
-    return "attempt-mismatch";
-  if (!task.dispatch_attempt || marker.attempt !== task.dispatch_attempt)
-    return "attempt-mismatch";
-  if (!task.send_attempted) return "not-sent";
+    return "other-task";
   if (["closed", "done-claimed", "verified-done"].includes(task.status) || task.completion_claimed) return "already-claimed";
-  return completionBelongsToDispatchAttempt(task, marker) ? null : "attempt-mismatch";
+  if (!marker.attempt) return "attempt-missing";
+  if (!task.dispatch_attempt || marker.attempt !== task.dispatch_attempt) {
+    const history = JSON.parse(task.history || "[]");
+    if (history.some((event) => event.ev === "send-attempted" && event.attempt === marker.attempt))
+      return "stale-attempt";
+    return "attempt-mismatch";
+  }
+  if (!task.send_attempted) return "not-sent";
+  return completionBelongsToDispatchAttempt(task, marker) ? null : "already-claimed";
 }
 
 function responseBlock(screen) {
@@ -3149,16 +3144,18 @@ async function watch(intervalSec = 30) {
             FROM tasks WHERE key=?`).get(marker.key);
           return { marker, task, reason: completionRejectionReason(r.id, r.task, marker, task) };
         });
-        if (r.id !== "omonyang") {
-          for (const { marker, reason } of completionChecks) {
-            if (!reason || reason === "already-claimed") continue;
-            const identity = `${r.id}:${marker.attempt ?? `missing:${marker.key}:${marker.kind}`}`;
-            if (completionRejectionsReported.has(identity)) continue;
+        const currentChecks = completionChecks.filter(({ marker, reason }) => marker.key === r.task
+          && !["filtered", "stale-attempt", "other-task", "not-sent", "already-claimed"].includes(reason));
+        const latestCurrentCheck = currentChecks.at(-1);
+        if (r.id !== "omonyang" && ["attempt-missing", "attempt-mismatch"].includes(latestCurrentCheck?.reason)) {
+          const { marker, reason } = latestCurrentCheck;
+          const identity = `${r.id}:${marker.attempt ?? `missing:${marker.key}:${marker.kind}`}`;
+          if (!completionRejectionsReported.has(identity)) {
             completionRejectionsReported.add(identity);
             console.log(`FLEET_COMPLETION_REJECTED ${r.id} ${marker.key} reason=${reason}`);
           }
         }
-        const currentCompletion = completionChecks.findLast(({ marker, reason }) => !reason && marker.key === r.task);
+        const currentCompletion = latestCurrentCheck?.reason === null ? latestCurrentCheck : null;
         const doneMarker = currentCompletion?.marker ?? null;
         const doneTask = currentCompletion?.task ?? null;
         const sig = JSON.stringify({

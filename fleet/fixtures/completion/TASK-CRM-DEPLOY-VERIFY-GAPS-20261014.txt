@@ -1,0 +1,38 @@
+ III. 검증 — 2/2 done
+ IV. 전달
+   [✓] Create verified commit and new pull request from master
+   [✓] Publish before after evidence and final ready marker
+
+
+
+ update_goal → complete
+ ✓ complete • 526.7K tokens • 17m
+   TASK-CRM-DEPLOY-VERIFY-GAPS-20261014 attempt=a6a6d496-1eb5-4350-9886-95680f75f422. Create new branch
+ fix/crm-deploy-ver…
+
+
+ 두 스크립트의 TLS identity 확인과 DB·workspace·role 대조를 수정해 draft PR #66
+ (https://github.com/whelp99-code/ai-crm-project-manager/pull/66)에 push했습니다. 10/10 완료: 수정 전 TLS 16건·DB 26건
+ 실패 재현, 수정 후 전체 시험 200/200·독립 CLI 40/40 통과. 전후 로그
+ (https://github.com/whelp99-code/ai-crm-project-manager/pull/66#issuecomment-6160682472) 게시, QA 정리 완료. 운영 실행
+ 은 하지 않았으며 원격 CI·Cursor 판정은 미확인입니다. Issue62
+ (https://github.com/whelp99-code/ai-crm-project-manager/issues/62)·Issue64
+ (https://github.com/whelp99-code/ai-crm-project-manager/issues/64)는 Verify입니다.
+
+ 커밋: 5404dcb fix(deploy): verify identity TLS and API database bindings
+ 기록: /tmp/ulw-20261014-verify-gaps.R1OdaS.md
+ 현재·다음: 남은 작업 없음. 소요 17분 31초, 526,747 tokens.
+
+ PR #66 READY head=5404dcb10115e84d81ae45f6b06d1dd2f378ca84
+ TASK-CRM-DEPLOY-VERIFY-GAPS-20261014_DONE attempt=a6a6d496-1eb5-4350-9886-95680f75f422 두 배포기의 TLS·DB identity 검
+ 증 보강 및 새 PR·전후 로그 게시 완료
+
+ TPS 36.7 tok/s. Cache hit 88.8%, 211.9s
+
+ Warning: control endpoint drain failed: Gateway schema 7 is newer than this binary's supported version 6.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/orca/lanes/crm2 • fix/crm-deploy-verify-gaps-20261014 • crm2-lane • … • 232K/400K (58.0%) (auto)   ⚡ gpt-6.1-sol:high
+(😺 OmO Native by Q Kim) 🤖 1 TASK-CRM-DEPLOY-VERIFY-GAPS-202… · Goal achieved (17m) mem:crm2-c01fdfa4 3m ago (+82) !...
