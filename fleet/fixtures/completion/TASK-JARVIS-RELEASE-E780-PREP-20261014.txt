@@ -1,0 +1,39 @@
+ ├────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Prep evidence  │ jarvis-deploy-e780.prep.{json,log} — DEPLOY_E780_PREP_OK, status=prepared                         │
+ ├────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Operator       │ ~/.local/state/omonyang/jarvis-release-e780-prep.md                                               │
+ │ report         │                                                                                                   │
+ └────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ ### Prep run (stage=OK)
+
+ - Source: /var/tmp/jarvis-e780-build/source @ e780d5ea (npm ci + build)
+ - Seal: payload_digest b321f46c…, manifest_sha256 2378d954…, migrations 117 (+104_company_candidate_handoff.sql vs
+   7740)
+ - 운영 전환·재시작·current 변경 없음
+
+ ### Ops notes (in prep md)
+
+ - #87 messenger: exporter( inbox DB, representative UID, snapshot path/perm, ~30s timer ), JARVIS는
+   JARVIS_MESSENGER_SNAPSHOT_FILE + JARVIS_MESSENGER_PRODUCER_UID 없으면 configured: false
+ - #83 handoff: opt-in; broker/client/키 없으면 import·timer 없음, 스키마만 추가
+
+ Caveat: CONFIRM 게이트를 seal 앞에 두었던 첫 시도로 한 번 운영 online backup이 생성됨(jarvis-20261014T041116304Z-…) —
+ prep md에 기록.
+
+ Cutover (operator): CONFIRM=1 JARVIS_DEPLOY_SOURCE=/var/tmp/jarvis-e780-build/source
+ ~/.local/state/omonyang/jarvis-deploy-e780.sh
+
+ TASK-JARVIS-RELEASE-E780-PREP-20261014_DONE attempt=38c212aa-d59a-41f5-9f6e-1d2ead2074d5 stage=OK e780 배포 스크립트·
+ dry-run seal·운영 체크리스트 작성 완료
+ Extension "<boundary>" error: turn_end could not resolve the persisted assistant entry ID
+
+ TPS 82.9 tok/s. Cache hit 0.0%, 191.9s
+
+ Warning: control endpoint drain failed: Gateway schema 7 is newer than this binary's supported version 6.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/orca/lanes/jarvis3 • feat/messenger-summary-20261013 • … • 123K/200K (61.4%) (auto)              (cursor) composer-2.5
+(😺 OmO Native by Q Kim) Pursuing goal (12h 15m) mem:jarvis3-99c0cc4a 10m ago (+22) !5 paused
