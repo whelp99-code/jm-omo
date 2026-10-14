@@ -4199,21 +4199,25 @@ describe("fleet completion classification", () => {
       file: "TASK-JARVIS-82-FIX6-20261014.txt",
       key: "TASK-JARVIS-82-FIX6-20261014",
       attempt: "5b681d72-81a9-4ad5-b541-4478d467ebb7",
+      summary: "기존 재시도 identity 수정 확인 및 전후 로그 게시·재조회 완료",
     },
     {
       file: "TASK-JARVIS-RELEASE-E780-PREP-20261014.txt",
       key: "TASK-JARVIS-RELEASE-E780-PREP-20261014",
       attempt: "38c212aa-d59a-41f5-9f6e-1d2ead2074d5",
+      summary: "stage=OK e780 배포 스크립트· dry-run seal·운영 체크리스트 작성 완료",
     },
     {
       file: "TASK-CRM-DEPLOY-VERIFY-GAPS-20261014.txt",
       key: "TASK-CRM-DEPLOY-VERIFY-GAPS-20261014",
       attempt: "a6a6d496-1eb5-4350-9886-95680f75f422",
+      summary: "두 배포기의 TLS·DB identity 검 증 보강 및 새 PR·전후 로그 게시 완료",
     },
     {
       file: "TASK-COMPANY-HANDOFF-ACTIVATE-PLAN-20261014.txt",
       key: "TASK-COMPANY-HANDOFF-ACTIVATE-PLAN-20261014",
       attempt: "6b515135-890c-4355-89c8-45fe7a342f4e",
+      summary: "대표 필요 2단계, 계 획·격리 검증 완료",
     },
   ];
 
@@ -4221,10 +4225,8 @@ describe("fleet completion classification", () => {
     it(`replays the markerless real screen for ${fixture.key}`, () => {
       const screen = readFileSync(new URL(`./fixtures/completion/${fixture.file}`, import.meta.url), "utf8");
       expect(screen).not.toMatch(/^\s*(?:⏺|●|Assistant:)\s*/m);
-      expect(classify(screen).done).toMatchObject({
-        key: fixture.key,
-        kind: "DONE",
-        attempt: fixture.attempt,
+      expect(classify(screen).done).toEqual({
+        key: fixture.key, kind: "DONE", attempt: fixture.attempt, text: fixture.summary,
       });
     });
   }
@@ -4233,12 +4235,61 @@ describe("fleet completion classification", () => {
     const key = "TASK-MARKERLESS-PROMPT";
     const attempt = "36000000-0000-4000-8000-000000000036";
     const template = `${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.`;
-    const screen = `❯ Finish with this exact final line: ${template}\n\n${key}_DONE attempt=${attempt} completed without an assistant marker\n\n❯`;
+    const screen = `❯ Finish with this exact final line:\n${template}\n\n${key}_DONE attempt=${attempt} completed without an assistant marker\n\n❯`;
     const result = classify(screen);
     expect(result.done).toEqual({ key, kind: "DONE", attempt, text: "completed without an assistant marker" });
     expect(result.doneCandidates.filter((candidate) => candidate.filtered).map(({ kind }) => kind))
-      .toEqual(["DONE", "BLOCKED"]);
+      .toEqual(["DONE"]);
   });
+
+  it("filters a wrapped BLOCKED reason placeholder", () => {
+    const key = "TASK-WRAPPED-BLOCKED-TEMPLATE";
+    const attempt = "3b000000-0000-4000-8000-00000000003b";
+    const screen = `⏺ Instructions\n${key}_BLOCKED attempt=${attempt} reason=<한\n  줄>. 안내 예시\n\n❯`;
+    const result = classify(screen);
+    expect(result.done).toBeNull();
+    expect(result.doneCandidates).toContainEqual({
+      key, kind: "BLOCKED", attempt, text: "reason=<한 줄>. 안내 예시", filtered: true,
+    });
+  });
+
+  for (const width of [60, 116, 180]) {
+    it(`ignores wrapped dispatch text in the input box at width ${width}`, async () => {
+      const key = "TASK-INPUT-BOX-PROMPT";
+      const attempt = "3a000000-0000-4000-8000-00000000003a";
+      const request = "/tmp/fleet-input-box-request.md";
+      const head = `${key} [attempt=${attempt} skill:ulw]`;
+      const message = `${head}: 지시문 파일 ${request} 전체를 읽고 그대로 수행해. 끝나면 마지막 줄에 ${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.`;
+      const wrapped = [];
+      for (let offset = 0; offset < message.length; offset += width) wrapped.push(message.slice(offset, offset + width));
+      const rule = "─".repeat(118);
+      const screen = [
+        "Older pane output",
+        "",
+        "TPS 30.2 tok/s",
+        "",
+        rule,
+        `❯ ${wrapped[0]}`,
+        ...wrapped.slice(1).map((line) => `  ${line}`),
+        rule,
+        "w6:p1 • worker",
+      ].join("\n");
+      const classified = classify(screen);
+      expect(classified.done).toBeNull();
+      expect(classified.doneCandidates).toEqual([]);
+      const result = await runWatchCycle({
+        catTask: key,
+        taskStatus: "working",
+        dispatchAttempt: attempt,
+        taskHistory: [{ ev: "send-attempted", attempt, at: "2026-10-15T01:00:00.000Z" }],
+        taskSentAt: "2026-10-15T01:00:01.000Z",
+        paneScreen: screen,
+      });
+      expect(result.output).not.toContain(`FLEET_TASK_DONE crm ${key}`);
+      expect(result.output).not.toContain("FLEET_COMPLETION_REJECTED");
+      expect(result.taskStatus).toBe("working");
+    });
+  }
 
   it("finds a DONE before a trailing circle list", () => {
     const key = "TASK-CIRCLE-LIST-AFTER-DONE";
@@ -4252,6 +4303,24 @@ describe("fleet completion classification", () => {
     const attempt = "38000000-0000-4000-8000-000000000038";
     const screen = `Older pane history\n\n⏺ ${key}_DONE attempt=${attempt} completed\n\n⏺ Bash(git status)\n  ⎿ working tree clean\n\n❯`;
     expect(classify(screen).done).toEqual({ key, kind: "DONE", attempt, text: "completed" });
+  });
+
+  it("ignores a completion token embedded in prose", () => {
+    const key = "TASK-INLINE-PROSE";
+    const attempt = "3c000000-0000-4000-8000-00000000003c";
+    const screen = `I will not emit ${key}_DONE attempt=${attempt} until tests pass\n\n❯`;
+    expect(classify(screen).done).toBeNull();
+    expect(classify(screen).doneCandidates).toEqual([]);
+  });
+
+  it.each([
+    ["dash bullet", (line) => `- ${line}`],
+    ["Unicode bullet", (line) => `• ${line}`],
+  ])("accepts a line-start completion marker with a %s prefix", (_label, prefix) => {
+    const key = "TASK-MARKDOWN-PREFIX";
+    const attempt = "3d000000-0000-4000-8000-00000000003d";
+    const line = prefix(`${key}_DONE attempt=${attempt} passed`);
+    expect(classify(`⏺ Final\n${line}\n\n❯`).done).toEqual({ key, kind: "DONE", attempt, text: "passed" });
   });
 
   it("ignores prompt instructions and placeholders outside the latest response block", () => {
@@ -4437,7 +4506,7 @@ describe("fleet completion classification", () => {
     ["a stale attempt from history", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=19000000-0000-4000-8000-000000000019 stale", "", true, "crm", ["19000000-0000-4000-8000-000000000019"]],
     ["another task", "TASK-FOREIGN-PANE-DONE", "TASK-FOREIGN-PANE-DONE_DONE attempt=20000000-0000-4000-8000-000000000020 foreign", "", true, "crm"],
     ["a task assigned to another category", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=20000000-0000-4000-8000-000000000020 finished", "", true, "jarvis"],
-    ["a matching attempt that was not sent", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=20000000-0000-4000-8000-000000000020 finished", "", false, "crm"],
+    ["a matching attempt that was not sent", "TASK-COMPLETION-BOUND", "TASK-COMPLETION-BOUND_DONE attempt=20000000-0000-4000-8000-000000000020 finished", "not-sent", false, "crm"],
   ])("handles %s without stale-task alerts", async (_case, observedKey, line, reason, sendAttempted, taskCat, staleAttempts = []) => {
     const result = await runWatchCycle({
       catTask: "TASK-COMPLETION-BOUND",

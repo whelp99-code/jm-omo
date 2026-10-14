@@ -164,53 +164,65 @@ export function configuredCatPane(catId, fallback = null) {
   return CONFIGURED_CAT_PANES.get(catId) ?? fallback;
 }
 
-function completionPromptTemplate(line, key, kind, attempt, tail) {
+function completionPromptTemplate(line, key, kind, tail) {
   const normalized = line.replace(/^\s*[`*_~]+/, "").replace(/[`*_~]+\s*$/, "").replace(/\s+/g, " ").trim();
-  if (attempt) {
-    const template = `${key}_DONE attempt=${attempt} <한 줄 요약> 또는 ${key}_BLOCKED attempt=${attempt} reason=<한 줄>.`;
-    const normalizedTail = tail.replace(/\s+/g, " ").trim();
-    if (normalized.includes(template)
-      && (kind === "DONE" && normalizedTail.startsWith("<한 줄 요약> 또는")
-        || kind === "BLOCKED" && normalizedTail.startsWith("reason=<한 줄>."))) return true;
-  }
   const normalizedTail = tail.replace(/\s+/g, " ").trim();
+  if (kind === "DONE" && (normalized.includes("<한 줄 요약>") || normalizedTail.includes("<한 줄 요약>"))) return true;
+  if (kind === "BLOCKED" && (/reason=<한 줄>/.test(normalized) || /^reason=<한 줄>/.test(normalizedTail))) return true;
   const prefix = normalized.slice(0, normalized.indexOf(`${key}_${kind}`));
   return (kind === "DONE" && normalizedTail === "<summary>" && /instructions|finish with/i.test(prefix))
     || (kind === "BLOCKED" && normalizedTail === "reason=<one line>");
 }
 
+function completionMarkerOnLine(line) {
+  let text = String(line ?? "").trimStart();
+  text = text.replace(/^(?:(?:[-•●⏺✻>])\s*|[*_`~]+\s*)+/, "").replace(/[*_`~]+\s*$/, "").trimEnd();
+  const match = text.match(/^(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b(.*)$/i);
+  return match ? { key: match[1], kind: match[2].toUpperCase(), tail: match[3] } : null;
+}
+
+function completionContinuationBoundary(line) {
+  return /^\s*(?:❯|[•●]|[-*]\s|⏺|✻|TPS\b|Warning:|Error:|Extension\b|Bash\(|Tool call\b|[─━═-]{3,})/i.test(line);
+}
+
 function parseCompletionCandidates(screen) {
-  const transcript = String(screen ?? "").replace(/\r/g, "").split("\n");
+  const lines = String(screen ?? "").replace(/\r/g, "").split("\n");
+  const dividers = lines.flatMap((line, index) => /^\s*[─━═-]{3,}\s*$/.test(line) ? [index] : []);
+  const inputBoxLines = new Set();
+  for (const promptIndex of lines.flatMap((line, index) => /^\s*❯/.test(line) ? [index] : [])) {
+    const start = dividers.findLast((index) => index < promptIndex);
+    const end = dividers.find((index) => index > promptIndex);
+    if (start === undefined || end === undefined) continue;
+    for (let index = start; index <= end; index++) inputBoxLines.add(index);
+  }
+  const transcript = lines.map((line, index) => inputBoxLines.has(index) ? null : line);
   const candidates = [];
   for (let index = 0; index < transcript.length; index++) {
-    const line = transcript[index].replace(/^[ \t>*`~_]+|[*`~_]+$/g, "");
-    for (const match of line.matchAll(/\b(TASK-[A-Z0-9-]+)_(DONE|BLOCKED)\b/gi)) {
-      const key = match[1];
-      const kind = match[2].toUpperCase();
-      let tail = line.slice(match.index + match[0].length);
-      const trimmedTail = tail.trim();
-      const wrappedAttempt = /(?:^|[\s—–-]\s*)attempt\s*(?:=|:)\s*(?:[a-f0-9-]{0,35})\s*$/i.test(trimmedTail)
-        || !trimmedTail && /^\s*(?:[—–-]\s*)?attempt\s*(?:=|:)/i.test(transcript[index + 1] ?? "");
-      if (wrappedAttempt) {
-        for (let next = index + 1; next < Math.min(transcript.length, index + 3); next++) {
-          if (/\bTASK-[A-Z0-9-]+_(?:DONE|BLOCKED)\b/i.test(transcript[next])
-            || /^\s*(?:⏺|✻|Working \(|TPS )/.test(transcript[next])) break;
-          tail += ` ${transcript[next]}`;
-          if (/(?:^|[\s—–-]\s*)attempt\s*(?:=|:)\s*(?:[a-f0-9-]\s*){36}(?=\s|$)/i.test(tail)) break;
-        }
-      }
-      const attemptMatch = tail.match(/(?:^|[\s—–-]\s*)attempt\s*(?:=|:)\s*((?:[a-f0-9-]\s*){36})(?=\s|$)/i);
-      const attempt = attemptMatch?.[1].replace(/\s/g, "") ?? null;
-      let summary = attemptMatch
-        ? `${tail.slice(0, attemptMatch.index)} ${tail.slice(attemptMatch.index + attemptMatch[0].length)}`
-        : tail;
-      summary = summary.replace(/^[\s—–-]+|[`*_~]+$/g, "").replace(/\s*\n\s*/g, " ").trim();
-      const templateContext = transcript.slice(Math.max(0, index - 1), Math.min(transcript.length, index + 3)).join(" ");
-      candidates.push({
-        key, kind, attempt, text: summary,
-        filtered: completionPromptTemplate(templateContext, key, kind, attempt, summary),
-      });
+    const line = transcript[index];
+    if (line === null) continue;
+    const marker = completionMarkerOnLine(line);
+    if (!marker) continue;
+    const { key, kind } = marker;
+    let tail = marker.tail;
+    const continuationLines = [];
+    for (let next = index + 1; next < transcript.length; next++) {
+      const continuation = transcript[next];
+      if (continuation === null || !continuation.trim() || completionMarkerOnLine(continuation)
+        || completionContinuationBoundary(continuation)) break;
+      continuationLines.push(continuation.trim());
+      tail += ` ${continuation.trim()}`;
     }
+    const attemptMatch = tail.match(/(?:^|[\s—–-]\s*)attempt\s*(?:=|:)\s*((?:[a-f0-9-]\s*){36})(?=\s|$)/i);
+    const attempt = attemptMatch?.[1].replace(/\s/g, "") ?? null;
+    let summary = attemptMatch
+      ? `${tail.slice(0, attemptMatch.index)} ${tail.slice(attemptMatch.index + attemptMatch[0].length)}`
+      : tail;
+    summary = summary.replace(/^[\s—–-]+|[`*_~]+$/g, "").replace(/\s*\n\s*/g, " ").trim();
+    const templateContext = [line, ...continuationLines].join(" ");
+    candidates.push({
+      key, kind, attempt, text: summary,
+      filtered: completionPromptTemplate(templateContext, key, kind, summary),
+    });
   }
   return candidates;
 }
@@ -3145,9 +3157,9 @@ async function watch(intervalSec = 30) {
           return { marker, task, reason: completionRejectionReason(r.id, r.task, marker, task) };
         });
         const currentChecks = completionChecks.filter(({ marker, reason }) => marker.key === r.task
-          && !["filtered", "stale-attempt", "other-task", "not-sent", "already-claimed"].includes(reason));
+          && !["filtered", "stale-attempt", "other-task", "already-claimed"].includes(reason));
         const latestCurrentCheck = currentChecks.at(-1);
-        if (r.id !== "omonyang" && ["attempt-missing", "attempt-mismatch"].includes(latestCurrentCheck?.reason)) {
+        if (r.id !== "omonyang" && ["attempt-missing", "attempt-mismatch", "not-sent"].includes(latestCurrentCheck?.reason)) {
           const { marker, reason } = latestCurrentCheck;
           const identity = `${r.id}:${marker.attempt ?? `missing:${marker.key}:${marker.kind}`}`;
           if (!completionRejectionsReported.has(identity)) {
