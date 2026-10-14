@@ -1766,9 +1766,14 @@ function rejectDeliveryAttentionError(code, detail) {
   return error;
 }
 
+const PR_LOOP_REJECT_ALLOWED_TASK_STATES = [
+  "done-claimed", "blocked", "not-done", "working", "tracked-unconfirmed", "sent-unconfirmed", "send-failed-unconfirmed",
+];
+
 async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, sendFollowup, rejectLeaseToken) {
   if (!rejectLeaseToken) throw new Error("REJECT_LEASE_REQUIRED");
-  const task = dbHandle.query("SELECT t.cat,c.pane FROM tasks t LEFT JOIN cats c ON c.id=t.cat WHERE t.key=?").get(row.task_key);
+  const task = dbHandle.query(`SELECT t.cat,c.pane,t.status,t.dispatch_attempt,t.send_attempted,t.completion_claimed
+    FROM tasks t LEFT JOIN cats c ON c.id=t.cat WHERE t.key=?`).get(row.task_key);
   const pane = configuredCatPane(task?.cat, task?.pane);
   if (!pane || pane === "-") throw new Error("task pane unavailable");
   const delivery = dbHandle.query(`SELECT reject_delivery_attempt,reject_submit_confirmed_at FROM fleet_pr_loop
@@ -1778,19 +1783,24 @@ async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, 
   const deliveryAttempt = delivery.reject_delivery_attempt ?? row.reject_delivery_attempt;
   if (!deliveryAttempt) throw new Error("REJECT_DELIVERY_ATTEMPT_REQUIRED");
   const recordSendAttempt = () => dbHandle.transaction(() => {
-    let current = dbHandle.query("SELECT dispatch_attempt,send_attempted FROM tasks WHERE key=?").get(row.task_key);
+    const current = dbHandle.query("SELECT status,dispatch_attempt,send_attempted,completion_claimed FROM tasks WHERE key=?").get(row.task_key);
     if (!current) throw new Error("REJECT_TASK_MISSING");
-    if (current.dispatch_attempt !== deliveryAttempt) {
-      dbHandle.query(`UPDATE tasks SET status='dispatching',sent_at=?,started_at=NULL,ended_at=NULL,
-        result=NULL,completion_claimed=0,send_attempted=0,dispatch_attempt=? WHERE key=?`)
-        .run(now(), deliveryAttempt, row.task_key);
-      current = { dispatch_attempt: deliveryAttempt, send_attempted: 0 };
-    }
-    if (current.send_attempted) return;
+    if (["verified-done", "closed"].includes(current.status)
+      || current.status !== task.status || current.dispatch_attempt !== task.dispatch_attempt
+      || current.send_attempted !== task.send_attempted || current.completion_claimed !== task.completion_claimed)
+      throw rejectDeliveryAttentionError("REJECT_TASK_STATE_CHANGED", `task state changed before follow-up send: ${current.status}`);
+    if (current.dispatch_attempt === deliveryAttempt && current.send_attempted) return;
+    if (!PR_LOOP_REJECT_ALLOWED_TASK_STATES.includes(current.status)
+      && !(current.status === "dispatching" && current.dispatch_attempt === deliveryAttempt))
+      throw rejectDeliveryAttentionError("REJECT_TASK_STATE_CHANGED", `task state is not eligible for follow-up send: ${current.status}`);
     const sentAt = now();
-    dbHandle.query(`UPDATE tasks SET status='dispatching',completion_claimed=0,result=NULL,
-      send_attempted=1,sent_at=? WHERE key=? AND dispatch_attempt=?`)
-      .run(sentAt, row.task_key, deliveryAttempt);
+    const changed = dbHandle.query(`UPDATE tasks SET status='dispatching',sent_at=?,started_at=NULL,ended_at=NULL,
+      result=NULL,completion_claimed=0,send_attempted=1,dispatch_attempt=? WHERE key=? AND status=?
+      AND dispatch_attempt IS ? AND send_attempted=? AND completion_claimed=?
+      AND status IN (${[...PR_LOOP_REJECT_ALLOWED_TASK_STATES, "dispatching"].map(() => "?").join(",")})`)
+      .run(sentAt, deliveryAttempt, row.task_key, task.status, task.dispatch_attempt, task.send_attempted,
+        task.completion_claimed, ...PR_LOOP_REJECT_ALLOWED_TASK_STATES, "dispatching").changes;
+    if (!changed) throw rejectDeliveryAttentionError("REJECT_TASK_STATE_CHANGED", "task changed before follow-up send claim");
     appendHistoryInTransaction(dbHandle, row.task_key, {
       ev: "send-attempted", attempt: deliveryAttempt, source: "cursor-reject-followup", at: sentAt,
     });
@@ -1799,10 +1809,20 @@ async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, 
   const complete = () => {
     const sentAt = now();
     dbHandle.transaction(() => {
-      dbHandle.query("UPDATE tasks SET status='working',completion_claimed=0,result=NULL WHERE key=?").run(row.task_key);
-      appendHistoryInTransaction(dbHandle, row.task_key, {
-        ev: "cursor-reject-followup", signal: `pr:${row.repo}#${row.pr_number}`, head: row.head, text: verdict.text,
-      });
+      const currentTask = dbHandle.query("SELECT status,dispatch_attempt,send_attempted,completion_claimed FROM tasks WHERE key=?")
+        .get(row.task_key);
+      if (!currentTask) throw rejectDeliveryAttentionError("REJECT_TASK_STATE_CHANGED", "task disappeared after follow-up submission");
+      if (!["verified-done", "closed", "blocked", "done-claimed", "not-done"].includes(currentTask.status)
+        && !currentTask.completion_claimed && currentTask.dispatch_attempt === deliveryAttempt && currentTask.send_attempted) {
+        const taskChanged = dbHandle.query(`UPDATE tasks SET status='working',completion_claimed=0,result=NULL WHERE key=?
+          AND dispatch_attempt=? AND send_attempted=1 AND completion_claimed=0
+          AND status IN ('dispatching','sent-unconfirmed','send-failed-unconfirmed','working')`)
+          .run(row.task_key, deliveryAttempt).changes;
+        if (!taskChanged) throw rejectDeliveryAttentionError("REJECT_TASK_STATE_CHANGED", "task state changed after follow-up submission");
+        appendHistoryInTransaction(dbHandle, row.task_key, {
+          ev: "cursor-reject-followup", attempt: deliveryAttempt, signal: `pr:${row.repo}#${row.pr_number}`, head: row.head, text: verdict.text,
+        });
+      }
       const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state='rejected',verdict=?,verdict_ts=?,
         reject_sent_at=?,reject_submit_confirmed_at=COALESCE(reject_submit_confirmed_at,?),
         reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
@@ -1832,19 +1852,20 @@ async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, 
   if (markerLocation === "input") {
     recordSendAttempt();
     const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
-    if (enter.exitCode !== 0) throw new Error(`pane Enter exited ${enter.exitCode}`);
+    if (enter.exitCode !== 0) throw rejectDeliveryAttentionError("REJECT_ENTER_RETRYABLE", `pane Enter exited ${enter.exitCode}`);
   } else {
     if (!prLoopRejectScrollbackComplete(transcript))
       throw rejectDeliveryAttentionError("REJECT_SCROLLBACK_INCOMPLETE", "pane scrollback cannot prove the rejection marker is absent");
     recordSendAttempt();
     const text = `Cursor REJECT for ${row.repo}#${row.pr_number} head=${row.head} attempt=${deliveryAttempt}:\n${verdict.text}\nUse attempt=${deliveryAttempt} in the final ${row.task_key}_DONE or ${row.task_key}_BLOCKED marker.\n${marker}`;
     if (sendFollowup) {
-      if (!await sendFollowup(pane, text, row)) throw new Error("pane follow-up send failed");
+      if (!await sendFollowup(pane, text, row))
+        throw rejectDeliveryAttentionError("REJECT_SEND_FAILED", "pane follow-up send failed");
     } else {
       const sent = await runCommand(["herdr", "pane", "send-text", pane, text]);
-      if (sent.exitCode !== 0) throw new Error(`pane send-text exited ${sent.exitCode}`);
+      if (sent.exitCode !== 0) throw rejectDeliveryAttentionError("REJECT_SEND_FAILED", `pane send-text exited ${sent.exitCode}`);
       const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
-      if (enter.exitCode !== 0) throw new Error(`pane Enter exited ${enter.exitCode}`);
+      if (enter.exitCode !== 0) throw rejectDeliveryAttentionError("REJECT_ENTER_RETRYABLE", `pane Enter exited ${enter.exitCode}`);
     }
   }
   const confirmation = await readScrollback();
@@ -1854,15 +1875,57 @@ async function sendPrLoopFollowup(dbHandle, row, verdict, runCommand, readPane, 
 }
 
 function recordPrLoopRejectFailure(dbHandle, row, rejectLeaseToken, error, events, signal) {
-  const reason = error?.code === "REJECT_SCROLLBACK_INCOMPLETE" ? "scrollback_incomplete"
-    : error?.code === "REJECT_SUBMIT_UNCONFIRMED" ? "submit_unconfirmed"
+  const result = dbHandle.transaction(() => {
+    const owned = dbHandle.query(`SELECT reject_delivery_attempt FROM fleet_pr_loop
+      WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+      .get(row.repo, row.pr_number, row.head, rejectLeaseToken);
+    if (!owned) return { changed: false, reason: null };
+    const deliveryAttempt = owned.reject_delivery_attempt ?? row.reject_delivery_attempt;
+    let taskNeedsAttention = false;
+    const task = deliveryAttempt
+      ? dbHandle.query("SELECT status,dispatch_attempt,send_attempted,completion_claimed FROM tasks WHERE key=?").get(row.task_key)
       : null;
-  const state = reason ? "reject-needs-attention" : "reject-failed";
-  const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state=?,reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
-    WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
-    .run(state, now(), row.repo, row.pr_number, row.head, rejectLeaseToken).changes;
-  if (changed && reason)
-    events.push(`FLEET_PR_REJECT_NEEDS_ATTENTION ${row.task_key} ${signal} head=${row.head} reason=${reason}`);
+    let retryableEnterFailure = false;
+    if (error?.code === "REJECT_ENTER_RETRYABLE" && task?.dispatch_attempt === deliveryAttempt
+      && task.send_attempted && task.status === "dispatching" && !task.completion_claimed) {
+      const detail = String(error?.message ?? error).slice(0, 240);
+      const taskChanged = dbHandle.query(`UPDATE tasks SET status='send-failed-unconfirmed',result=?
+        WHERE key=? AND status='dispatching' AND dispatch_attempt=? AND send_attempted=1 AND completion_claimed=0`)
+        .run(`Cursor REJECT Enter remains unconfirmed: ${detail}`, row.task_key, deliveryAttempt).changes;
+      if (taskChanged) {
+        appendHistoryInTransaction(dbHandle, row.task_key, {
+          ev: "send-failed-unconfirmed", attempt: deliveryAttempt, source: "cursor-reject-followup", detail,
+        });
+        retryableEnterFailure = true;
+      }
+    }
+    if (!retryableEnterFailure && task?.dispatch_attempt === deliveryAttempt && task.send_attempted
+      && task.status === "dispatching" && !task.completion_claimed) {
+      const detail = String(error?.message ?? error).slice(0, 240);
+      const taskChanged = dbHandle.query(`UPDATE tasks SET status='blocked',result=?,ended_at=?,completion_claimed=0
+        WHERE key=? AND status='dispatching' AND dispatch_attempt=? AND send_attempted=1 AND completion_claimed=0`)
+        .run(`Cursor REJECT follow-up needs attention: ${detail}`, now(), row.task_key, deliveryAttempt).changes;
+      if (taskChanged) {
+        appendHistoryInTransaction(dbHandle, row.task_key, {
+          ev: "cursor-reject-followup-failed", attempt: deliveryAttempt, reason: "send_failed", text: detail,
+        });
+        taskNeedsAttention = true;
+      }
+    }
+    const reason = error?.code === "REJECT_SCROLLBACK_INCOMPLETE" ? "scrollback_incomplete"
+      : error?.code === "REJECT_SUBMIT_UNCONFIRMED" ? "submit_unconfirmed"
+        : error?.code === "REJECT_TASK_STATE_CHANGED" ? "task_state_changed"
+          : error?.code === "REJECT_ENTER_RETRYABLE" && retryableEnterFailure ? null
+          : error?.code === "REJECT_SEND_FAILED" || taskNeedsAttention ? "send_failed"
+            : null;
+    const state = reason ? "reject-needs-attention" : "reject-failed";
+    const changed = dbHandle.query(`UPDATE fleet_pr_loop SET state=?,reject_lease_token=NULL,reject_lease_until=NULL,updated_at=?
+      WHERE repo=? AND pr_number=? AND head=? AND state='rejecting' AND reject_lease_token=?`)
+      .run(state, now(), row.repo, row.pr_number, row.head, rejectLeaseToken).changes;
+    return { changed, reason };
+  }).immediate();
+  if (result.changed && result.reason)
+    events.push(`FLEET_PR_REJECT_NEEDS_ATTENTION ${row.task_key} ${signal} head=${row.head} reason=${result.reason}`);
   fleetError("PR_LOOP_REJECT", `task=${row.task_key} signal=${signal}`, error);
 }
 
