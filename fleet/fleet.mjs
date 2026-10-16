@@ -253,16 +253,22 @@ export function classify(screen) {
   const readyLine = [...joined.matchAll(/\b([A-Z]+_[A-Z_]*READY)\b([^❯─]{0,400})/g)].at(-1);
   const claimText = output.split("\n").filter((line) => /\bCursor\s+(?:ACCEPT|APPROVE)\b|\bPR READY\s+head=|\b(?:tests?\s+\d+\s+(?:passed|passing)|\d+\s+tests?\s+(?:passed|passing))\b|테스트\s*\d+\s*(?:개\s*)?통과/i.test(line)).join("\n");
   let questionText = "";
+  let questionActionable = false;
   if (state === "question") {
     const screenLines = screen.replace(/\r/g, "").split("\n");
     const marker = screenLines.findLastIndex(isQuestionStatusLine);
     const prompt = screenLines.findLastIndex((line) => /^\s*❯/.test(line));
+    const before = screenLines.slice(0, marker);
+    const boundary = before.findLastIndex((line) => /^\s*$|^\s*❯|^\s*[─━]{3,}\s*$/.test(line));
+    const quoted = before.filter((line) => /^\s*(?:```|~~~)/.test(line)).length % 2 !== 0
+      || before.slice(boundary + 1).some((line) => /^\s*(?:⏺|●|•|✻|Assistant:)\s*/i.test(line));
     const questionLines = marker >= 0
       ? screenLines.slice(marker + 1, prompt >= marker ? prompt : undefined)
       : output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3);
     questionText = questionLines.map((line) => line.trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(-800);
+    questionActionable = !quoted;
   }
-  return { state, model, done, doneCandidates, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
+  return { state, model, done, doneCandidates, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText, questionActionable };
 }
 
 export function completionBelongsToDispatchAttempt(task, marker) {
@@ -326,9 +332,15 @@ export async function answerPaneQuestion(pane, expectedQuestion, answer, runComm
   const current = await runCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
   if (current.exitCode !== 0) return false;
   const state = classify(current.stdout);
-  if (state.state !== "question" || state.questionText !== expectedQuestion) return false;
+  if (!state.questionActionable || state.questionText !== expectedQuestion || !promptLineIsEmpty(current.stdout)) return false;
   const send = await runCommand(["herdr", "pane", "send-text", pane, answer]);
   if (send.exitCode !== 0) return false;
+  const staged = await runCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
+  if (staged.exitCode !== 0) return false;
+  const stagedState = classify(staged.stdout);
+  const input = staged.stdout.replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
+  if (!stagedState.questionActionable || stagedState.questionText !== expectedQuestion
+    || input?.trim() !== `❯ ${answer}`) return false;
   const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
   return enter.exitCode === 0;
 }
@@ -3261,6 +3273,7 @@ async function watch(intervalSec = 30) {
           readyHead: r.ready?.head ?? "",
           claimText: r.claimText ?? "",
           questionText: r.questionText ?? "",
+          questionActionable: r.questionActionable ?? false,
         });
         const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
         if (!previous || last.get(r.id) !== sig) {
@@ -3312,10 +3325,11 @@ async function watch(intervalSec = 30) {
         }
         let retryQuestion = false;
         const questionChanged = r.id !== "omonyang" && r.state === "question"
-          && (!previous || previous.state !== "question" || r.questionText !== previous.questionText);
+          && (!previous || previous.state !== "question" || r.questionText !== previous.questionText
+            || r.questionActionable !== previous.questionActionable);
         if (questionChanged) {
           const taskKey = r.task || "-";
-          const policy = questionPolicy(r.questionText || "");
+          const policy = r.questionActionable ? questionPolicy(r.questionText || "") : null;
           if (policy) {
             let answered = false;
             try {

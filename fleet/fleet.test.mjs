@@ -250,7 +250,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const journalPath = join(bin, "journalctl");
   const ghPath = join(bin, "gh");
   const gitPath = join(bin, "git");
-  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1; printf '%s\\n' \"$PANE_SCREEN\"; elif [ \"$1\" = pane ] && [ \"$2\" = send-text ] && [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n");
+  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then\n  [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1\n  if [ -f \"$QUESTION_INPUT_PATH\" ]; then IFS= read -r input < \"$QUESTION_INPUT_PATH\" || true; printf '%s\\n' \"${PANE_SCREEN%❯*}❯ $input\"; else printf '%s\\n' \"$PANE_SCREEN\"; fi\nelif [ \"$1\" = pane ] && [ \"$2\" = send-text ]; then\n  if [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n  printf '%s\\n' \"$4\" > \"$QUESTION_INPUT_PATH\"\nfi\n");
   writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(gitPath, "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then printf 'https://github.com/whelp99-code/jm-omo.git\\n'; elif [ \"$1\" = branch ] && [ \"$2\" = --show-current ]; then printf 'fixture-branch\\n'; else exit 2; fi\n");
@@ -264,6 +264,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     HOME: home,
     PATH: `${bin}:${process.env.PATH}`,
     HERDR_LOG: herdrLog,
+    QUESTION_INPUT_PATH: join(home, "question-input"),
     GH_LOG: ghLog,
     PANE_SCREEN: paneScreen,
     PANE_READ_FAILURE: paneReadFailure ? "1" : "0",
@@ -6129,6 +6130,37 @@ describe("fleet question policy", () => {
     const state = classify(screen);
     expect(state.questionText).toBe("May I use the staging account password?");
     expect(questionPolicy(state.questionText)).toBeNull();
+  });
+
+  it.each([
+    "⏺ Example transcript:\nQuestion pending\nShould we use the production auth account?\n❯",
+    "```text\nQuestion pending\nShould we use the production auth account?\n❯\n```",
+  ])("does not auto-answer a quoted question UI frame: %s", async paneScreen => {
+    const result = await runWatchCycle({ catTask: "Q-QUOTED-FRAME", paneScreen });
+    expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
+    expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("does not append an answer to an occupied question input", async () => {
+    const question = "Should we use the production auth account?";
+    const calls = [];
+    expect(await answerPaneQuestion("w-question:p1", question, "Do not use it.", async argv => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: `Question pending\n${question}\n❯ owner draft` };
+    })).toBe(false);
+    expect(calls.every(argv => argv[2] === "read")).toBe(true);
+  });
+
+  it("does not submit an answer after the question disappears during staging", async () => {
+    const question = "Should we use the production auth account?";
+    const calls = [];
+    let staged = false;
+    expect(await answerPaneQuestion("w-question:p1", question, "Do not use it.", async argv => {
+      calls.push(argv);
+      if (argv[2] === "send-text") staged = true;
+      return { exitCode: 0, stdout: staged ? "Working (1s)\n❯ Do not use it." : `Question pending\n${question}\n❯` };
+    })).toBe(false);
+    expect(calls.some(argv => argv[2] === "send-keys")).toBe(false);
   });
 
   it("matches allowlisted policies only against the pending question", () => {
