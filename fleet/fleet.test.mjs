@@ -6555,6 +6555,14 @@ describe("fleet review-stall request correlation", () => {
     expect([...pairReviewReplies([request], [{ ...reply, text: "PR #999 TASK-UNRELATED" }])]).toEqual([]);
   });
 
+  it.each(["1600.000001", "1791757469.519659"])("keeps the exact microsecond review deadline for %s", ts => {
+    const [seconds, micros] = ts.split(".");
+    const deadline = BigInt(seconds) * 1_000_000n + BigInt(micros) + 45n * 60n * 1_000_000n;
+    const request = { ts, thread_ts: ts, user: "UOTHER", text: "Cursor 검수 요청 PR #42 TASK-EXACT-DEADLINE" };
+    expect(reviewStallDrafts([request], [], Number(deadline - 1n) / 1000)).toEqual([]);
+    expect(reviewStallDrafts([request], [], Number(deadline) / 1000)).toHaveLength(1);
+  });
+
   it("alerts each unanswered request at its own 45-minute deadline", () => {
     const requests = [
       { ts: "1000.000001", thread_ts: "1000.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 TASK-REQ-A" },
@@ -6566,7 +6574,7 @@ describe("fleet review-stall request correlation", () => {
     const alerted = new Set();
     const firstDeadline = reviewStallDrafts(requests, replies, 1000_000 + 45 * 60_000, alerted);
     expect(firstDeadline).toHaveLength(0);
-    const secondDeadline = reviewStallDrafts(requests, replies, 1600_000 + 45 * 60_000, alerted);
+    const secondDeadline = reviewStallDrafts(requests, replies, Number(requests[1].ts) * 1000 + 45 * 60_000, alerted);
     expect(secondDeadline).toHaveLength(1);
     expect(secondDeadline[0]).toContain("FLEET_REVIEW_STALL_DRAFT owner=omonyang");
     expect(secondDeadline[0]).toContain("TASK-REQ-B");

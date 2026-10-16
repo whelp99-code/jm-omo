@@ -1127,15 +1127,18 @@ export function pairReviewReplies(requests, replies) {
 export function reviewStallDrafts(requests, replies, nowMs, alerted = new Set()) {
   const paired = pairReviewReplies(requests, replies);
   const drafts = [];
+  const nowMicros = BigInt(Math.round(nowMs * 1000));
   for (const request of requests) {
     const requestTs = String(request.ts ?? "");
-    const requestedAt = Math.floor(Number(requestTs) * 1000);
-    if (!isReviewRequest(request) || paired.has(requestTs) || !Number.isFinite(requestedAt)
-      || nowMs - requestedAt < REVIEW_STALL_MS || alerted.has(requestTs)) continue;
+    const timestamp = /^(\d+)(?:\.(\d{1,6}))?$/.exec(requestTs);
+    if (!isReviewRequest(request) || paired.has(requestTs) || !timestamp || alerted.has(requestTs)) continue;
+    const requestedAt = BigInt(timestamp[1]) * 1_000_000n + BigInt((timestamp[2] ?? "").padEnd(6, "0"));
+    const age = nowMicros - requestedAt;
+    if (age < BigInt(REVIEW_STALL_MS) * 1000n) continue;
     const channel = request.channel || SLACK_REVIEW_CHANNEL;
     const permalink = `https://app.slack.com/archives/${channel}/p${requestTs.replace(".", "")}`;
     const keys = reviewRequestKeys(request.text);
-    drafts.push(`FLEET_REVIEW_STALL_DRAFT owner=omonyang request=${permalink} request_ts=${requestTs} age=${Math.floor((nowMs - requestedAt) / 60000)}m keys=${keys.join(",") || "none"}`);
+    drafts.push(`FLEET_REVIEW_STALL_DRAFT owner=omonyang request=${permalink} request_ts=${requestTs} age=${age / 60_000_000n}m keys=${keys.join(",") || "none"}`);
     alerted.add(requestTs);
   }
   return drafts;
