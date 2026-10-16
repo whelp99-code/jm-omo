@@ -1,6 +1,5 @@
 import { readFileSync, writeSync } from 'node:fs';
 import { Inbox, accept, processIdentity, guardParent } from './inbox.mjs';
-import { SlackBotClient, SlackBotCredentialManager, SlackBotListener } from '/home/jm/.nvm/versions/node/v24.19.0/lib/node_modules/agent-messenger/dist/src/platforms/slackbot/index.js';
 const inbox = new Inbox(`${process.env.HOME}/.omo/omonyang/durable/inbox.sqlite`);
 const identity=processIdentity(process.pid);
 const parent=processIdentity(process.ppid);
@@ -17,11 +16,17 @@ const emit=(row,replay)=>{
  const files=(e.files||[]).map(f=>f.name).join(',');
  writeSync(1,`SLACK_MESSAGE ${e.channel} ${e.ts} ${e.thread_ts||'-'} ${e.user||'?'} ${files?'[files:'+files+'] ':''}${text} [inbox=${row.id} state=${row.state} replay=${replay}]\n`);
 };
+let startupStage='module';
 try {
+ const { SlackBotClient, SlackBotCredentialManager, SlackBotListener }=await import('/home/jm/.nvm/versions/node/v24.19.0/lib/node_modules/agent-messenger/dist/src/platforms/slackbot/index.js');
+ startupStage='credentials';
  const creds=await new SlackBotCredentialManager().getCredentials();
+ startupStage='app-token';
  const appToken=readFileSync(`${process.env.HOME}/.config/omonyang/slack-app-token`,'utf8').trim();
  if(!creds?.token || !appToken)throw new Error('SLACK_NO_TOKEN');
+ startupStage='login';
  const client=await new SlackBotClient().login({token:creds.token});
+ startupStage='listener';
  listener=new SlackBotListener(client,{appToken});
  listener.on('connected',()=>console.log('SLACK_UP durable-inbox'));
  const receive=async(args)=>{
@@ -36,4 +41,9 @@ try {
  listener.on('error',()=>console.log('SLACK_ERROR transport_error'));
  for(const row of inbox.pending()){inbox.delivered(row.id);emit(row,true);}
  await listener.start();
-} catch { console.error('SLACK_START_FAILED'); stop(1); }
+} catch (error) {
+ const publicCode=/^(?:E[A-Z0-9_]{1,63}|SLACK_NO_TOKEN|invalid_auth|not_authed|account_inactive|token_revoked|missing_scope|invalid_app_token|not_allowed_token_type)$/;
+ const code=[error?.code,error?.data?.error,error?.cause?.code,error?.message]
+  .find(value=>typeof value==='string'&&publicCode.test(value))||'unknown_error';
+ console.error(`SLACK_START_FAILED stage=${startupStage} code=${code}`); stop(1);
+}
