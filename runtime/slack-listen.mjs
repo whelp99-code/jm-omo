@@ -1,5 +1,7 @@
 import { readFileSync, writeSync } from 'node:fs';
 import { Inbox, accept, processIdentity, guardParent } from './inbox.mjs';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { loadFleetConfig } from '../fleet/config.mjs';
 const inbox = new Inbox(`${process.env.HOME}/.omo/omonyang/durable/inbox.sqlite`);
 const identity=processIdentity(process.pid);
 const parent=processIdentity(process.ppid);
@@ -18,7 +20,8 @@ const emit=(row,replay)=>{
 };
 let startupStage='module';
 try {
- const { SlackBotClient, SlackBotCredentialManager, SlackBotListener }=await import('/home/jm/.nvm/versions/node/v24.19.0/lib/node_modules/agent-messenger/dist/src/platforms/slackbot/index.js');
+ const sdk=new URL('./index.js',pathToFileURL(loadFleetConfig().agentMessengerCredentialPath));
+ const { SlackBotClient, SlackBotCredentialManager, SlackBotListener }=await import(fileURLToPath(sdk));
  startupStage='credentials';
  const creds=await new SlackBotCredentialManager().getCredentials();
  startupStage='app-token';

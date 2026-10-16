@@ -1,4 +1,5 @@
 import {readFileSync} from 'node:fs';
+import {loadFleetConfig} from '../fleet/config.mjs';
 export function clean(value,max=220){
  const text=typeof value==='string'?value:Array.isArray(value)?value.map(v=>clean(v,100)).join('; '):value&&typeof value==='object'?Object.entries(value).filter(([k])=>!/token|secret|password|credential|authorization|api.?key/i.test(k)).map(([k,v])=>`${k}: ${clean(v,100)}`).join('; '):value==null?'미확인':String(value);
  const s=text.replace(/\s+/g,' ').trim();if(!s)return '미확인';if(/xox[baprs]-|sk-[A-Za-z0-9]{8,}|Bearer\s+[A-Za-z0-9._-]{8,}/.test(s))return '민감정보 패턴으로 본문 제외';return s.length>max?s.slice(0,max-1)+'…':s;
@@ -39,7 +40,7 @@ export function readDevelopmentStatus(home=process.env.HOME){
  try{return {data:JSON.parse(readFileSync(path,'utf8'))};}catch{return {error:'개발상황 자료 없음 — 지정된 producer JSON이 없거나 읽기/파싱 실패'};}
 }
 export function developmentText(home=process.env.HOME){const r=readDevelopmentStatus(home);return r.error??formatStatus(r.data);}
-export function serializeReport(text){return JSON.stringify({channel:'C0C6HJM0BV5',text});}
+export function serializeReport(text){return JSON.stringify({channel:loadFleetConfig().slack.reviewChannel,text});}
 export function buildHourlyText({now=Date.now(),bridge,states,data,error}){
  const hour=new Intl.DateTimeFormat('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit',hour12:false}).format(now);
  const prefix=`시간별 개발 진행상황 · ${hour} KST\n감시: ${brief(bridge,55)}\n\n`;

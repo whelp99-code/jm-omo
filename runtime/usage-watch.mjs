@@ -9,6 +9,7 @@
 //     merely because a usage read looks low.
 //  3) Auto-return to Opus only after a successful real Opus model call (not usage-header HTTP 200).
 import { SELF_POLICY_ENABLED } from "./usage-policy.mjs";
+import { loadFleetConfig } from "../fleet/config.mjs";
 
 const INTERVAL = 10 * 60 * 1000;
 const LIMIT = 0.95;
@@ -17,8 +18,9 @@ const FALLBACK = {
   "chatgpt-subscription": "xai/grok-4.7",
   "cursor-cli-oauth": "xai/grok-4.7",
 };
-const ORCA_TERMINALS = ["term_8eac441f-f846-4a47-b602-1148570eda89"]; // JARVIS OmO session, reopened after the 2026-09-29 12:49 reboot
-const HERDR_PANES = ["w1:p1", "w2:p1"];
+const CONFIG = loadFleetConfig();
+const ORCA_TERMINALS = CONFIG.usageWatch.orcaTerminals;
+const HERDR_PANES = CONFIG.usageWatch.herdrPanes;
 
 const sh = async (cmd) => (await Bun.$`bash -c ${cmd}`.nothrow().quiet()).stdout.toString();
 
@@ -73,8 +75,8 @@ const footerSel = (screen) => {
 
 // 오모냥: fixed to Opus 5.5 high by owner 2026-10-06 (no secondary switch). Historical: Opus 5.5 high primary; temporary Codex gpt-6.1-sol high while Claude is at limit
 // or until a real Opus call succeeds again (2026-10-05 Jae Min temporary Codex approval).
-// Herdr pane w5:p1.
-const SELF_PANE = "w5:p1";
+// The captain pane follows the same registry as fleet dispatch.
+const SELF_PANE = CONFIG.usageWatch.selfPane;
 const SELF_PRIMARY = { provider: "anthropic", model: "claude-opus-5-5", thinking: "high" };
 const SELF_SECONDARY = { provider: "chatgpt-subscription", model: "gpt-6.1-sol", thinking: "high" };
 
@@ -137,7 +139,7 @@ async function selfPolicy(usage) {
 }
 
 async function readOrca(h) {
-  const j = JSON.parse(await sh(`orca terminal read --terminal ${h} --screen --json`));
+  const j = JSON.parse((await Bun.$`orca terminal read --terminal ${h} --screen --json`.nothrow().quiet()).stdout.toString());
   const t = j.result.terminal.tail;
   return typeof t === "string" ? t : t.join("\n");
 }
@@ -171,7 +173,7 @@ async function tick() {
   }
   for (const p of HERDR_PANES) {
     try {
-      await switchIfNeeded(`herdr:${p}`, await sh(`herdr pane read ${p}`), async (text) => {
+      await switchIfNeeded(`herdr:${p}`, (await Bun.$`herdr pane read ${p}`.nothrow().quiet()).stdout.toString(), async (text) => {
         await Bun.$`herdr pane send-text ${p} ${text}`.nothrow().quiet();
         for (let i = 0; i < 2; i++) {
           await Bun.sleep(800);

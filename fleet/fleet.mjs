@@ -4,6 +4,8 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { loadFleetConfig } from "./config.mjs";
+export { resolveFleetConfig } from "./config.mjs";
 
 const STATE = `${process.env.HOME}/.local/state/omonyang`;
 mkdirSync(STATE, { recursive: true });
@@ -116,34 +118,8 @@ const sh = async (cmd) => (await Bun.$`bash -c ${cmd}`.nothrow().quiet()).stdout
 const read = (pane) => sh(`herdr pane read ${pane} --source visible --format text 2>/dev/null`);
 const readPaneResult = (pane) => executeSignalCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
 const ROUTES = JSON.parse(await Bun.file(new URL("./routes.json", import.meta.url)).text());
-export function resolveFleetConfig(config, env = process.env) {
-  const envBoolean = (value, fallback) => value === undefined ? Boolean(fallback) : value === "true";
-  return {
-    ...config,
-    cats: config.cats.map((cat) => {
-      const envKey = `FLEET_CAT_${cat.id.replace(/[^a-z0-9]/gi, "_").toUpperCase()}_PANE`;
-      return { ...cat, pane: env[envKey] || cat.pane };
-    }),
-    slack: {
-      ...config.slack,
-      reviewChannel: env.FLEET_SLACK_REVIEW_CHANNEL || config.slack.reviewChannel,
-      cursorUserId: env.FLEET_CURSOR_USER_ID || config.slack.cursorUserId,
-      reviewReplyAppId: env.FLEET_REVIEW_REPLY_APP_ID || config.slack.reviewReplyAppId,
-    },
-    prLoop: {
-      ...config.prLoop,
-      enabled: envBoolean(env.FLEET_PR_LOOP_ENABLED, config.prLoop?.enabled),
-      autoMerge: envBoolean(env.FLEET_PR_LOOP_AUTO_MERGE, config.prLoop?.autoMerge),
-      deploy: config.prLoop?.deploy ?? {},
-      mergeMethods: config.prLoop?.mergeMethods ?? {},
-    },
-    agentMessengerCredentialPath: env.FLEET_AGENT_MESSENGER_CREDENTIAL_PATH
-      || config.agentMessengerCredentialPath,
-  };
-}
-const CONFIG = resolveFleetConfig(JSON.parse(await Bun.file(new URL("./fleet.config.json", import.meta.url)).text()));
+const CONFIG = loadFleetConfig();
 const CURSOR_USER_ID = CONFIG.slack.cursorUserId;
-const REVIEW_RELAY_USER_ID = "U0B81F5GR6V";
 const SLACK_REVIEW_CHANNEL = CONFIG.slack.reviewChannel;
 const REVIEW_REPLY_APP_ID = CONFIG.slack.reviewReplyAppId;
 const REVIEW_STALL_MS = 45 * 60 * 1000;
@@ -1644,13 +1620,13 @@ function claimPrLoopReviewPost(dbHandle, row) {
   return claimed ? token : null;
 }
 
-function buildPrLoopReviewRequest(repo, prNumber, url, head) {
+export function buildPrLoopReviewRequest(repo, prNumber, url, head) {
   const header = `서윤아, Cursor 검수 요청 ${repo}#${prNumber}`;
   const headLine = `head=${head}`;
   return {
     header,
     headLine,
-    text: [header, url, headLine, `[<@${REVIEW_RELAY_USER_ID}> 서윤]`].join("\n"),
+    text: [header, url, headLine, `[<@${CURSOR_USER_ID}> 서윤]`].join("\n"),
   };
 }
 
