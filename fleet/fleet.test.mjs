@@ -2822,6 +2822,49 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
 });
 
 describe("fleet model-switch waits", () => {
+  it.each(["prefix-footer", "unselected-row", "quoted-catalog"])("rejects ambiguous model selection: %s", async scenario => {
+    const originalNow = Date.now;
+    let clock = 0, stage = "idle", selections = 0;
+    Date.now = () => clock;
+    try {
+      const runCommand = async argv => {
+        if (argv[2] === "read") {
+          if (stage === "catalog" && scenario === "quoted-catalog") {
+            clock = 1000;
+            return { exitCode: 0, stdout: "Example output\n→ claude-sonnet [anthropic]\n❯" };
+          }
+          if (stage === "filtered" && scenario === "unselected-row") {
+            clock = 1000;
+            return { exitCode: 0, stdout: "Select model\n→ claude-sonnet-5 [anthropic]\nnote claude-sonnet [anthropic]\n❯" };
+          }
+          const screens = {
+            idle: `Idle\n⚡ ${scenario === "prefix-footer" ? "claude-sonnet-5" : "claude-haiku"}:high\n❯`,
+            typed: "Idle\n⚡ claude-haiku:off\n❯ /model",
+            catalog: "Select model\n→ claude-sonnet [anthropic]\n❯",
+            filtered: "Select model\n→ claude-sonnet [anthropic]\n❯",
+            selected: `Idle\n⚡ ${scenario === "unselected-row" ? "claude-sonnet-5" : "claude-sonnet"}:high\n❯`,
+          };
+          return { exitCode: 0, stdout: screens[stage] };
+        }
+        if (argv[2] === "send-text") stage = argv[4] === "/model" ? "typed" : "filtered";
+        if (argv[2] === "send-keys") {
+          if (argv[4] === "Escape" || argv[4] === "ctrl+u") stage = "idle";
+          else if (stage === "typed") stage = "catalog";
+          else { selections++; stage = "selected"; }
+        }
+        return { exitCode: 0, stdout: "" };
+      };
+      const result = await switchModel("w-exact:p1", { provider: "anthropic", model: "claude-sonnet", thinking: "high" }, runCommand, 1000);
+      if (scenario === "prefix-footer") {
+        expect(result).toStartWith("MODEL_SWITCHED ");
+        expect(selections).toBe(1);
+      } else {
+        expect(result).toStartWith("MODEL_SWITCH_TIMEOUT ");
+        expect(selections).toBe(0);
+      }
+    } finally { Date.now = originalNow; }
+  });
+
   it("advances only after the picker, catalog, and selected model appear", async () => {
     let stage = 0;
     const calls = [];

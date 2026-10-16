@@ -862,7 +862,7 @@ export async function switchModel(pane, want, runCommand = executeSignalCommand,
     return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (pane read failed)`;
   }
   const before = classify(initial.stdout).model;
-  if (before.startsWith(want.model)) return `MODEL_OK ${want.model}`;
+  if (before.split(":")[0] === want.model && (!want.thinking || before === `${want.model}:${want.thinking}`)) return `MODEL_OK ${want.model}`;
   const send = async (step, argv) => {
     try {
       const result = await runCommand(argv, AbortSignal.timeout(Math.max(1, deadline - Date.now())));
@@ -895,21 +895,25 @@ export async function switchModel(pane, want, runCommand = executeSignalCommand,
   if (!await send("submit-picker-command", ["herdr", "pane", "send-keys", pane, "Enter"])) {
     return failCleanly(commandFailure("picker submit"));
   }
-  if (!await wait((screen) => classify(screen).state === "model-picker")) {
+  if (!await wait((screen) => classify(screen).state === "model-picker"
+    && /^\s*Select(?: a)? model\s*$/im.test(screen))) {
     return timeoutAndClean("catalog");
   }
   if (!await send("filter-model", ["herdr", "pane", "send-text", pane, want.model])) {
     return failCleanly(commandFailure("model filter"));
   }
-  const pick = await wait((screen) => screen.split(/\r?\n/).some((line) =>
-    line.includes(want.model) && line.includes(`[${want.provider}]`)));
+  const pick = await wait((screen) => {
+    const selected = screen.split(/\r?\n/).filter((line) => /^\s*→\s+/.test(line));
+    const row = selected.length === 1 ? /^\s*→\s+(\S+)\s+\[([^\]]+)\](?:\s|$)/.exec(selected[0]) : null;
+    return row?.[1] === want.model && row[2] === want.provider;
+  });
   if (!pick) {
     return timeoutAndClean("model-row");
   }
   if (!await send("select-model", ["herdr", "pane", "send-keys", pane, "Enter"])) {
     return failCleanly(commandFailure("model selection"));
   }
-  let after = await wait((screen) => classify(screen).model.startsWith(want.model));
+  let after = await wait((screen) => classify(screen).model.split(":")[0] === want.model);
   if (!after) return timeoutAndClean("model-change");
   if (want.thinking && !classify(after).model.endsWith(`:${want.thinking}`)) {
     if (!await send("set-thinking", ["herdr", "pane", "send-text", pane, `/thinking ${want.thinking}`])) {
