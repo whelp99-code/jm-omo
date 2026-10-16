@@ -1203,6 +1203,7 @@ export async function pollReviewStalls(dbHandle, nowMs = Date.now(), fetchMessag
 }
 
 function parsePullRequestSignal(signal) {
+  if (typeof signal !== "string" || !signal) return null;
   const match = signal.match(/^pr:([\w.-]+\/[\w.-]+)#(\d+)$/);
   return match ? { repo: match[1].toLowerCase(), prNumber: match[2] } : null;
 }
@@ -1424,7 +1425,7 @@ export function hasListedTests(body) {
   return false;
 }
 
-function taskPrSignals(task) {
+export function taskPrSignals(task) {
   const signals = new Set((task.done ?? "").split(";").map((part) => part.trim()).filter((part) => parsePullRequestSignal(part)));
   try {
     for (const signal of Object.keys(JSON.parse(task.claim_evidence || "{}"))) {
