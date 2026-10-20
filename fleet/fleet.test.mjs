@@ -8,7 +8,7 @@ import { SELF_POLICY_ENABLED } from "../runtime/usage-policy.mjs";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { activeModelPicker, answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkDeployHealth, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, hasListedTests, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, matchPrLoopVerdict, migrateFleetColumns, pairReviewReplies, pollReviewStalls, processPrLoopEvents, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, runDoriHeavyDeploy, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
+const { activeModelPicker, answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkDeployHealth, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, hasListedTests, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, matchPrLoopVerdict, migrateFleetColumns, pairReviewReplies, pollReviewStalls, processPrLoopEvents, questionPolicy, taskPrSignals, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, runDoriHeavyDeploy, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -450,6 +450,27 @@ describe("fleet PR automation", () => {
   const head = "0123456789abcdef0123456789abcdef01234567";
   const threadTs = "1791757469.519659";
   const prLoopConfig = { enabled: true, autoMerge: false, reviewChannel: "C0C5Z4SJ309", reviewThreadTs: threadTs, deploy: {} };
+
+
+  it("taskPrSignals tolerates null claim signals in history and claim_evidence keys", () => {
+    const signal = "pr:whelp99-code/second-brain-app#55";
+    expect(taskPrSignals({
+      key: "TASK-SB-55-BTRFS-20261016",
+      done: `cmd:test -s /home/jm/.local/state/omonyang/sb55.md`,
+      claim_evidence: JSON.stringify({ null: { "pr-ready": { ok: true } }, [signal]: { "pr-ready": { ok: true, head: "a".repeat(40) } } }),
+      history: JSON.stringify([
+        { ev: "claim-ok", claim: "pr-ready", signal: null },
+        { ev: "claim-ok", claim: "tests-count", signal: null },
+        { claim: "pr-ready", signal },
+      ]),
+    })).toEqual([signal]);
+    expect(taskPrSignals({
+      key: "TASK-SB-CHECKPOINT-PR-20261016",
+      done: null,
+      claim_evidence: "{}",
+      history: JSON.stringify([{ ev: "claim-ok", claim: "cursor-accept", signal: null }]),
+    })).toEqual([]);
+  });
 
   it("does no PR-loop I/O with the default-off switch", async () => {
     const db = prLoopDb({ key: "PRLOOP-DISABLED", done: signal });
