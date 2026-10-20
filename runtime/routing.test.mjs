@@ -44,6 +44,16 @@ describe("shared runtime routing configuration", () => {
     expect(result.calls).not.toContain("herdr pane read w2:p1");
   });
 
+  it("resolves the hourly credential manager beside the configured path", async () => {
+    const source = new URL("./hourly.mjs", import.meta.url).href;
+    const hourly = fileURLToPath(new URL("./hourly.mjs", import.meta.url));
+    const result = await runRouting(["--eval", `const {agentMessengerIndexPath}=await import(${JSON.stringify(source)}); console.log(agentMessengerIndexPath());`],
+      { FLEET_AGENT_MESSENGER_CREDENTIAL_PATH: "/task/owned/credential-manager.js" });
+    expect(result.stdout.trim()).toBe("/task/owned/index.js");
+    expect(readFileSync(hourly, "utf8")).not.toContain("/home/jm/.nvm/versions/node/v24.19.0/lib/node_modules/agent-messenger");
+    expect(readFileSync(hourly, "utf8")).toContain("import(agentMessengerIndexPath())");
+  });
+
   it("mentions the configured Cursor user in review requests", async () => {
     const source = new URL("../fleet/fleet.mjs", import.meta.url).href;
     const result = await runRouting(["--eval", `const {buildPrLoopReviewRequest}=await import(${JSON.stringify(source)}); console.log(JSON.stringify(buildPrLoopReviewRequest("owner/repo","1","https://example.invalid","a".repeat(40))));`],

@@ -12,6 +12,7 @@ const factory = source => () => {
   return {
     SlackBotCredentialManager: class {
       getCredentials() {
+        if (failure === "private-message") throw new Error("EPRIVATE_ACCOUNT_ID");
         if (failure === "credentials") throw rejected("EACCES");
         return { token: "xoxb-task-owned-fixture" };
       }

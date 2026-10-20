@@ -12,6 +12,7 @@ describe("Slack startup failure diagnostics", () => {
     ["app-token", "app-token", "ENOENT"],
     ["login", "login", "invalid_auth"],
     ["listener", "listener", "ECONNREFUSED"],
+    ["private-message", "credentials", "unknown_error"],
   ])("records the %s failure without private error text", async (failure, stage, code) => {
     const home = mkdtempSync(join(tmpdir(), "jmomo-slack-startup-"));
     let child;
@@ -35,6 +36,7 @@ describe("Slack startup failure diagnostics", () => {
       expect(stderr).toContain(`SLACK_START_FAILED stage=${stage} code=${code}`);
       expect(stdout + stderr).not.toContain("private fixture detail");
       expect(stdout + stderr).not.toContain("xoxb-do-not-log");
+      expect(stdout + stderr).not.toContain("EPRIVATE_ACCOUNT_ID");
       const inbox = new Database(join(home, ".omo/omonyang/durable/inbox.sqlite"));
       try { expect(inbox.query("SELECT COUNT(*) AS count FROM owner").get().count).toBe(0); }
       finally { inbox.close(); }

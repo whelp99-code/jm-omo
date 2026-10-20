@@ -234,15 +234,12 @@ export function classify(screen) {
     const screenLines = screen.replace(/\r/g, "").split("\n");
     const marker = screenLines.findLastIndex(isQuestionStatusLine);
     const prompt = screenLines.findLastIndex((line) => /^\s*❯/.test(line));
-    const before = screenLines.slice(0, marker);
-    const boundary = before.findLastIndex((line) => /^\s*$|^\s*❯|^\s*[─━]{3,}\s*$/.test(line));
-    const quoted = before.filter((line) => /^\s*(?:```|~~~)/.test(line)).length % 2 !== 0
-      || before.slice(boundary + 1).some((line) => /^\s*(?:⏺|●|•|✻|Assistant:)\s*/i.test(line));
     const questionLines = marker >= 0
       ? screenLines.slice(marker + 1, prompt >= marker ? prompt : undefined)
       : output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3);
     questionText = questionLines.map((line) => line.trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(-800);
-    questionActionable = !quoted;
+    const live = currentQuestionFrame(screenLines);
+    questionActionable = Boolean(questionText) && live?.questionText === questionText;
   }
   return { state, model, done, doneCandidates, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText, questionActionable };
 }
@@ -778,6 +775,45 @@ async function pickModel(type) {
   return { ...ROUTES.cursorFallback, usage: u };
 }
 
+function currentQuestionFrame(screenLines) {
+  const prompt = screenLines.findLastIndex((line) => /^\s*❯/.test(line));
+  if (prompt < 0) return null;
+  const frame = [];
+  for (let index = prompt - 1; index >= 0; index -= 1) {
+    const line = screenLines[index];
+    if (!line.trim() || /^\s*[─━]{3,}\s*$/.test(line) || /^\s*❯/.test(line)) break;
+    frame.unshift(line);
+  }
+  if (!isQuestionStatusLine(frame[0])) return null;
+  const body = frame.slice(1);
+  if (body.some((line) => /^\s*(?:```|~~~|⏺|●|•|✻|Assistant:)/i.test(line))) return null;
+  const before = screenLines.slice(0, prompt - frame.length);
+  if (before.filter((line) => /^\s*(?:```|~~~)/.test(line)).length % 2 !== 0) return null;
+  const questionText = body.map((line) => line.trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(-800);
+  return questionText ? { questionText } : null;
+}
+
+const PICKER_HEADER = /^\s*Select(?: a)? model\s*$/i;
+const PICKER_ROW = /^\s*(→)?\s*(\S+)\s+\[([^\]]+)\]\s*$/;
+
+export function activeModelPicker(screen) {
+  const lines = String(screen).replace(/\r/g, "").split("\n");
+  const prompt = lines.findLastIndex((line) => /^\s*❯/.test(line));
+  if (prompt < 0) return null;
+  const frame = [];
+  for (let index = prompt - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (!line.trim()) break;
+    frame.unshift(line);
+  }
+  if (!PICKER_HEADER.test(frame[0] ?? "")) return null;
+  const rows = frame.slice(1).map((line) => PICKER_ROW.exec(line));
+  if (!rows.length || rows.some((row) => !row)) return null;
+  const selected = rows.filter((row) => row[1]);
+  if (selected.length !== 1) return null;
+  return { model: selected[0][2], provider: selected[0][3] };
+}
+
 function promptLineContains(screen, text) {
   const input = String(screen).replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
   return Boolean(input?.includes(text));
@@ -871,17 +907,15 @@ export async function switchModel(pane, want, runCommand = executeSignalCommand,
   if (!await send("submit-picker-command", ["herdr", "pane", "send-keys", pane, "Enter"])) {
     return failCleanly(commandFailure("picker submit"));
   }
-  if (!await wait((screen) => classify(screen).state === "model-picker"
-    && /^\s*Select(?: a)? model\s*$/im.test(screen))) {
+  if (!await wait((screen) => activeModelPicker(screen) !== null)) {
     return timeoutAndClean("catalog");
   }
   if (!await send("filter-model", ["herdr", "pane", "send-text", pane, want.model])) {
     return failCleanly(commandFailure("model filter"));
   }
   const pick = await wait((screen) => {
-    const selected = screen.split(/\r?\n/).filter((line) => /^\s*→\s+/.test(line));
-    const row = selected.length === 1 ? /^\s*→\s+(\S+)\s+\[([^\]]+)\](?:\s|$)/.exec(selected[0]) : null;
-    return row?.[1] === want.model && row[2] === want.provider;
+    const picker = activeModelPicker(screen);
+    return picker?.model === want.model && picker.provider === want.provider;
   });
   if (!pick) {
     return timeoutAndClean("model-row");

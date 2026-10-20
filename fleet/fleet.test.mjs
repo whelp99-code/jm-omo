@@ -2865,6 +2865,31 @@ describe("fleet model-switch waits", () => {
     } finally { Date.now = originalNow; }
   });
 
+  it("does not treat a scrollback picker transcript as the open picker", async () => {
+    const originalNow = Date.now;
+    let clock = 0, stage = "idle", modelTypes = 0;
+    Date.now = () => clock;
+    try {
+      const result = await switchModel("w-stale:p1", { provider: "anthropic", model: "claude-sonnet", thinking: "high" }, async argv => {
+        if (argv[2] === "read") {
+          if (stage === "catalog") clock = 1000;
+          const screens = {
+            idle: "Idle\n⚡ claude-haiku:high\n❯",
+            typed: "Idle\n⚡ claude-haiku:off\n❯ /model",
+            catalog: "Select model\n→ claude-sonnet [anthropic]\nIdle\n⚡ claude-haiku:off\n❯",
+          };
+          return { exitCode: 0, stdout: screens[stage] };
+        }
+        if (argv[2] === "send-text" && argv[4] === "/model") stage = "typed";
+        else if (argv[2] === "send-text") modelTypes += 1;
+        if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === "typed") stage = "catalog";
+        return { exitCode: 0, stdout: "" };
+      }, 1000);
+      expect(result).toStartWith("MODEL_SWITCH_TIMEOUT ");
+      expect(modelTypes).toBe(0);
+    } finally { Date.now = originalNow; }
+  });
+
   it("advances only after the picker, catalog, and selected model appear", async () => {
     let stage = 0;
     const calls = [];
@@ -6180,6 +6205,14 @@ describe("fleet question policy", () => {
     "```text\nQuestion pending\nShould we use the production auth account?\n❯\n```",
   ])("does not auto-answer a quoted question UI frame: %s", async paneScreen => {
     const result = await runWatchCycle({ catTask: "Q-QUOTED-FRAME", paneScreen });
+    expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
+    expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("does not auto-answer a plain-text quoted question frame", async () => {
+    const paneScreen = "Example:\nQuestion pending\nShould we use the production auth account?\n❯";
+    expect(classify(paneScreen).questionActionable).toBe(false);
+    const result = await runWatchCycle({ catTask: "Q-PLAIN-QUOTE", paneScreen });
     expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
     expect(result.herdrWrites).toEqual([]);
   });

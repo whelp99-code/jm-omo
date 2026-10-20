@@ -45,8 +45,10 @@ try {
  for(const row of inbox.pending()){inbox.delivered(row.id);emit(row,true);}
  await listener.start();
 } catch (error) {
- const publicCode=/^(?:E[A-Z0-9_]{1,63}|SLACK_NO_TOKEN|invalid_auth|not_authed|account_inactive|token_revoked|missing_scope|invalid_app_token|not_allowed_token_type)$/;
- const code=[error?.code,error?.data?.error,error?.cause?.code,error?.message]
-  .find(value=>typeof value==='string'&&publicCode.test(value))||'unknown_error';
+ const safeMessage=/^(?:SLACK_NO_TOKEN|invalid_auth|not_authed|account_inactive|token_revoked|missing_scope|invalid_app_token|not_allowed_token_type)$/;
+ const publicCode=/^E[A-Z0-9_]{1,63}$/;
+ const structured=[error?.code,error?.data?.error,error?.cause?.code]
+  .find(value=>typeof value==='string'&&(publicCode.test(value)||safeMessage.test(value)));
+ const code=structured||(typeof error?.message==='string'&&safeMessage.test(error.message)?error.message:'unknown_error');
  console.error(`SLACK_START_FAILED stage=${startupStage} code=${code}`); stop(1);
 }
