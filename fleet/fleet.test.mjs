@@ -8,7 +8,7 @@ import { SELF_POLICY_ENABLED } from "../runtime/usage-policy.mjs";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { activeModelPicker, answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkDeployHealth, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, hasListedTests, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, matchPrLoopVerdict, migrateFleetColumns, pairReviewReplies, pollReviewStalls, processPrLoopEvents, questionPolicy, taskPrSignals, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, runDoriHeavyDeploy, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
+const { activeModelPicker, answerPaneQuestion, appendTaskHistory, parseHerdrAgentStatus, bugbotLimitEvents, checkDeployHealth, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, hasListedTests, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, matchPrLoopVerdict, migrateFleetColumns, pairReviewReplies, pollReviewStalls, processPrLoopEvents, questionPolicy, taskPrSignals, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, runDoriHeavyDeploy, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -250,7 +250,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const journalPath = join(bin, "journalctl");
   const ghPath = join(bin, "gh");
   const gitPath = join(bin, "git");
-  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then\n  [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1\n  if [ -f \"$QUESTION_INPUT_PATH\" ]; then IFS= read -r input < \"$QUESTION_INPUT_PATH\" || true; printf '%s\\n' \"${PANE_SCREEN%❯*}❯ $input\"; else printf '%s\\n' \"$PANE_SCREEN\"; fi\nelif [ \"$1\" = pane ] && [ \"$2\" = send-text ]; then\n  if [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n  printf '%s\\n' \"$4\" > \"$QUESTION_INPUT_PATH\"\nfi\n");
+  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = agent ] && [ \"$2\" = get ]; then\n  status=\"${HERDR_AGENT_STATUS:-blocked}\"\n  printf '%s\\n' '{\"result\":{\"pane_id\":\"'\"$3\"'\",\"agent_status\":\"'\"$status\"'\"}}'\nelif [ \"$1\" = pane ] && [ \"$2\" = read ]; then\n  [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1\n  if [ -f \"$QUESTION_INPUT_PATH\" ]; then IFS= read -r input < \"$QUESTION_INPUT_PATH\" || true; printf '%s\\n' \"${PANE_SCREEN%❯*}❯ $input\"; else printf '%s\\n' \"$PANE_SCREEN\"; fi\nelif [ \"$1\" = pane ] && [ \"$2\" = send-text ]; then\n  if [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n  printf '%s\\n' \"$4\" > \"$QUESTION_INPUT_PATH\"\nfi\n");
   writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(gitPath, "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then printf 'https://github.com/whelp99-code/jm-omo.git\\n'; elif [ \"$1\" = branch ] && [ \"$2\" = --show-current ]; then printf 'fixture-branch\\n'; else exit 2; fi\n");
@@ -362,6 +362,11 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
 
 async function runWatchCycle(options = {}) {
   return runFleetCommand({ ...options, command: ["watch", "1"] });
+}
+
+function agentGetResult(argv, status = "idle") {
+  if (argv[1] !== "agent" || argv[2] !== "get") return null;
+  return { exitCode: 0, stdout: JSON.stringify({ result: { pane_id: argv[3], agent_status: status } }) };
 }
 
 async function runFleetBoard(options = {}) {
@@ -2849,6 +2854,8 @@ describe("fleet model-switch waits", () => {
     Date.now = () => clock;
     try {
       const runCommand = async argv => {
+        const agent = agentGetResult(argv, "idle");
+        if (agent) return agent;
         if (argv[2] === "read") {
           if (stage === "catalog" && scenario === "quoted-catalog") {
             clock = 1000;
@@ -2928,6 +2935,45 @@ describe("fleet model-switch waits", () => {
     expect(pickerWrites.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(1);
   });
 
+  it("does not drive a full-width quoted picker transcript", async () => {
+    const quote = `Example:\n${"─".repeat(80)}\nSelect model\n→ claude-sonnet [anthropic]\n❯`;
+    expect(activeModelPicker(quote)).toEqual({ model: "claude-sonnet", provider: "anthropic" });
+    let phase = "idle";
+    const pickerWrites = [];
+    const pickerScreen = () => phase === "idle" ? "Idle\n⚡ claude-haiku:off\n❯"
+      : phase === "typed" ? "Idle\n⚡ claude-haiku:off\n❯ /model"
+      : phase === "done" ? "Idle\n⚡ claude-sonnet:high\n❯" : quote;
+    const switched = await switchModel("fake-only:fullwidth-picker", { model: "claude-sonnet", provider: "anthropic", thinking: "high" }, async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: pickerScreen() };
+      pickerWrites.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") phase = "typed";
+      else if (argv[2] === "send-keys" && argv[4] === "Enter") phase = phase === "typed" ? "quoted" : "done";
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(switched).toBe("MODEL_SWITCH_HELD fake-only:fullwidth-picker agent_status=unknown");
+    expect(pickerWrites.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model"]);
+    expect(pickerWrites.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(1);
+  });
+
+  it("ignores a picker frame that was already on screen before /model", async () => {
+    const quote = `Example:\n${"─".repeat(80)}\nSelect model\n→ claude-sonnet [anthropic]\n❯`;
+    let phase = "before";
+    const pickerWrites = [];
+    const pickerScreen = () => phase === "typed" ? quote.replace(/\n❯$/, "\n❯ /model") : quote;
+    const switched = await switchModel("fake-only:preexisting-picker", { model: "claude-sonnet", provider: "anthropic", thinking: "high" }, async argv => {
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
+      if (argv[2] === "read") return { exitCode: 0, stdout: pickerScreen() };
+      pickerWrites.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") phase = "typed";
+      else if (argv[2] === "send-keys" && argv[4] === "Enter") phase = "quoted";
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(switched).toStartWith("MODEL_SWITCH_TIMEOUT ");
+    expect(pickerWrites.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model"]);
+    expect(pickerWrites.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(1);
+  });
+
   it("does not treat a scrollback picker transcript as the open picker", async () => {
     const originalNow = Date.now;
     let clock = 0, stage = "idle", modelTypes = 0;
@@ -2965,6 +3011,8 @@ describe("fleet model-switch waits", () => {
     ][stage];
     const runCommand = async (argv) => {
       calls.push(argv);
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
       if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
       if (argv[2] === "send-text" && argv[4] === "/model") stage = 1;
       else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 1) stage = 2;
@@ -3012,6 +3060,8 @@ describe("fleet model-switch waits", () => {
     };
     const runCommand = async (argv) => {
       calls.push(argv);
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
       if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
       if (argv[2] === "send-text") {
         if (argv[4] === "/model") {
@@ -3157,6 +3207,8 @@ describe("fleet model-switch waits", () => {
     const timeline = [];
     const concatenatedInput = "/thinking xhighTASK-MAIL-JARVIS-READER-20261012 [attempt=fixture]:";
     const runCommand = async (argv) => {
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
       if (argv[2] === "read") {
         let stdout;
         if (phase === "initial") stdout = "Idle\n⚡ claude-haiku:off\n❯";
@@ -6304,6 +6356,34 @@ describe("fleet question policy", () => {
     expect(questionWrites).toEqual([]);
   });
 
+  it("does not answer a full-width quoted question frame", async () => {
+    const question = "Should we use the production auth account?";
+    const questionScreen = () => `Example:\n${"─".repeat(80)}\nQuestion pending\n${question}\n❯`;
+    const questionWrites = [];
+    const answered = await answerPaneQuestion("fake-only:fullwidth-question", question, "Do not use it.", async argv => {
+      if (argv[1] === "agent") return { exitCode: 0, stdout: "" };
+      if (argv[2] === "read") return { exitCode: 0, stdout: questionScreen() };
+      questionWrites.push(argv.slice(2));
+      return { exitCode: 0, stdout: "" };
+    });
+    expect(classify(questionScreen()).questionActionable).toBe(true);
+    expect(answered).toBe(false);
+    expect(questionWrites).toEqual([]);
+  });
+
+  it("does not answer a live question unless herdr reports blocked", async () => {
+    const question = "Should we use the production auth account?";
+    const questionWrites = [];
+    const answered = await answerPaneQuestion("w-question:p1", question, "Do not use it.", async argv => {
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
+      if (argv[2] !== "read") questionWrites.push(argv.slice(2));
+      return { exitCode: 0, stdout: `Question pending\n${question}\n❯` };
+    });
+    expect(answered).toBe(false);
+    expect(questionWrites).toEqual([]);
+  });
+
   it("does not auto-answer a plain-text quoted question frame", async () => {
     const paneScreen = "Example:\nQuestion pending\nShould we use the production auth account?\n❯";
     expect(classify(paneScreen).questionActionable).toBe(false);
@@ -6328,9 +6408,12 @@ describe("fleet question policy", () => {
     let staged = false;
     expect(await answerPaneQuestion("w-question:p1", question, "Do not use it.", async argv => {
       calls.push(argv);
+      const agent = agentGetResult(argv, "blocked");
+      if (agent) return agent;
       if (argv[2] === "send-text") staged = true;
       return { exitCode: 0, stdout: staged ? "Working (1s)\n❯ Do not use it." : `Question pending\n${question}\n❯` };
     })).toBe(false);
+    expect(calls.some(argv => argv[2] === "send-text")).toBe(true);
     expect(calls.some(argv => argv[2] === "send-keys")).toBe(false);
   });
 
@@ -6427,6 +6510,27 @@ describe("fleet question policy", () => {
     expect(result.output).toContain("FLEET_QUESTION_NOTIFY owner=omonyang crm Q-NEAR-MISS");
     expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
     expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("holds an allowlisted question unless herdr reports blocked", async () => {
+    const result = await runWatchCycle({
+      catTask: "Q-HELD",
+      paneScreen: "Question pending\nShould we use the production auth account?\n❯",
+      fleetEnv: { HERDR_AGENT_STATUS: "idle" },
+    });
+    expect(result.output).toContain("FLEET_QUESTION_HELD crm Q-HELD policy=production-auth-prohibited agent_status=idle");
+    expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
+    expect(result.output).not.toContain("FLEET_QUESTION_SEND_FAILED");
+    expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("reads herdr agent status from agent get and agent list", () => {
+    expect(parseHerdrAgentStatus(JSON.stringify({ result: { pane_id: "w6:p1", agent_status: "blocked" } }), "w6:p1")).toBe("blocked");
+    expect(parseHerdrAgentStatus(JSON.stringify({
+      result: { agents: [{ pane_id: "w1:p1", agent_status: "idle" }, { pane_id: "w6:p1", agent_status: "blocked" }] },
+    }), "w6:p1")).toBe("blocked");
+    expect(parseHerdrAgentStatus("not-json", "w6:p1")).toBeNull();
+    expect(parseHerdrAgentStatus(JSON.stringify({ result: { pane_id: "w1:p1", agent_status: "blocked" } }), "w6:p1")).toBeNull();
   });
 
   it("defers personal password or OTP use and answers through the fake pane", async () => {

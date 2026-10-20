@@ -301,11 +301,31 @@ export function questionPolicy(question) {
   return QUESTION_POLICIES.find((policy) => policy.matches.test(question)) ?? null;
 }
 
+export function parseHerdrAgentStatus(stdout, pane = "") {
+  let data;
+  try { data = JSON.parse(stdout); } catch { return null; }
+  const result = data?.result;
+  const agents = Array.isArray(result?.agents) ? result.agents : result ? [result] : [];
+  const agent = agents.find((item) => !pane || item?.pane_id === pane || item?.pane === pane) ?? null;
+  return typeof agent?.agent_status === "string" ? agent.agent_status : null;
+}
+
+export async function paneAgentStatus(pane, runCommand = executeSignalCommand, signal = AbortSignal.timeout(10_000)) {
+  let result;
+  try { result = await runCommand(["herdr", "agent", "get", pane], signal); } catch (error) {
+    fleetError("HERDR_AGENT_STATUS", `pane=${pane}`, error);
+    return null;
+  }
+  if (result?.exitCode !== 0) return null;
+  return parseHerdrAgentStatus(result.stdout, pane);
+}
+
 export async function answerPaneQuestion(pane, expectedQuestion, answer, runCommand = executeSignalCommand) {
   const current = await runCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
   if (current.exitCode !== 0) return false;
   const state = classify(current.stdout);
   if (!state.questionActionable || state.questionText !== expectedQuestion || !promptLineIsEmpty(current.stdout)) return false;
+  if (await paneAgentStatus(pane, runCommand) !== "blocked") return false;
   const send = await runCommand(["herdr", "pane", "send-text", pane, answer]);
   if (send.exitCode !== 0) return false;
   const staged = await runCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
@@ -313,7 +333,7 @@ export async function answerPaneQuestion(pane, expectedQuestion, answer, runComm
   const stagedState = classify(staged.stdout);
   const input = staged.stdout.replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
   if (!stagedState.questionActionable || stagedState.questionText !== expectedQuestion
-    || input?.trim() !== `❯ ${answer}`) return false;
+    || input?.trim() !== `❯ ${answer}` || await paneAgentStatus(pane, runCommand) !== "blocked") return false;
   const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
   return enter.exitCode === 0;
 }
@@ -830,6 +850,18 @@ export function activeModelPicker(screen) {
   return { model: selected[0][2], provider: selected[0][3] };
 }
 
+function pickerAlreadyOnScreen(before, picker) {
+  const previous = activeModelPicker(before);
+  if (previous?.model === picker.model && previous?.provider === picker.provider) return true;
+  const lines = String(before).replace(/\r/g, "").split("\n");
+  const hasHeader = lines.some((line) => PICKER_HEADER.test(line));
+  const hasRow = lines.some((line) => {
+    const row = PICKER_ROW.exec(line);
+    return row?.[2] === picker.model && row?.[3] === picker.provider;
+  });
+  return hasHeader && hasRow;
+}
+
 function promptLineContains(screen, text) {
   const input = String(screen).replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
   return Boolean(input?.includes(text));
@@ -889,7 +921,8 @@ export async function switchModel(pane, want, runCommand = executeSignalCommand,
     fleetError("MODEL_SWITCH_READ", `pane=${pane}`, `exit ${initial.exitCode}`);
     return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (pane read failed)`;
   }
-  const before = classify(initial.stdout).model;
+  const beforeScreen = initial.stdout;
+  const before = classify(beforeScreen).model;
   if (before.split(":")[0] === want.model && (!want.thinking || before === `${want.model}:${want.thinking}`)) return `MODEL_OK ${want.model}`;
   const send = async (step, argv) => {
     try {
@@ -923,19 +956,30 @@ export async function switchModel(pane, want, runCommand = executeSignalCommand,
   if (!await send("submit-picker-command", ["herdr", "pane", "send-keys", pane, "Enter"])) {
     return failCleanly(commandFailure("picker submit"));
   }
-  if (!await wait((screen) => activeModelPicker(screen) !== null)) {
+  const freshPicker = (screen) => {
+    const picker = activeModelPicker(screen);
+    if (!picker || pickerAlreadyOnScreen(beforeScreen, picker)) return null;
+    return picker;
+  };
+  if (!await wait((screen) => freshPicker(screen) !== null)) {
     return timeoutAndClean("catalog");
   }
+  const pickerStatus = async () => paneAgentStatus(pane, runCommand, AbortSignal.timeout(Math.max(1, deadline - Date.now())));
+  const holdForStatus = async (status) => failCleanly(`MODEL_SWITCH_HELD ${pane} agent_status=${status ?? "unknown"}`);
+  const openedStatus = await pickerStatus();
+  if (openedStatus !== "blocked" && openedStatus !== "idle") return holdForStatus(openedStatus);
   if (!await send("filter-model", ["herdr", "pane", "send-text", pane, want.model])) {
     return failCleanly(commandFailure("model filter"));
   }
   const pick = await wait((screen) => {
-    const picker = activeModelPicker(screen);
+    const picker = freshPicker(screen);
     return picker?.model === want.model && picker.provider === want.provider;
   });
   if (!pick) {
     return timeoutAndClean("model-row");
   }
+  const selectStatus = await pickerStatus();
+  if (selectStatus !== "blocked" && selectStatus !== "idle") return holdForStatus(selectStatus);
   if (!await send("select-model", ["herdr", "pane", "send-keys", pane, "Enter"])) {
     return failCleanly(commandFailure("model selection"));
   }
@@ -3365,19 +3409,24 @@ async function watch(intervalSec = 30) {
           const taskKey = r.task || "-";
           const policy = r.questionActionable ? questionPolicy(r.questionText || "") : null;
           if (policy) {
-            let answered = false;
-            try {
-              answered = await answerPaneQuestion(r.pane, r.questionText, policy.answer);
-            } catch (error) {
-              fleetError("AUTO_ANSWER", `cat=${r.id} task=${taskKey} policy=${policy.id}`, error);
-            }
-            if (answered) {
-              console.log(`FLEET_AUTO_ANSWER ${r.id} ${taskKey} policy=${policy.id}`);
-              console.log(`FLEET_QUESTION_ANSWERED ${r.id} ${taskKey} policy=${policy.id}`);
-              if (taskKey !== "-") log(taskKey, { ev: "question-auto-answer", policy: policy.id });
+            const agentStatus = await paneAgentStatus(r.pane);
+            if (agentStatus !== "blocked") {
+              console.log(`FLEET_QUESTION_HELD ${r.id} ${taskKey} policy=${policy.id} agent_status=${agentStatus ?? "unknown"}`);
             } else {
-              console.log(`FLEET_QUESTION_SEND_FAILED ${r.id} ${taskKey} policy=${policy.id}`);
-              retryQuestion = true;
+              let answered = false;
+              try {
+                answered = await answerPaneQuestion(r.pane, r.questionText, policy.answer);
+              } catch (error) {
+                fleetError("AUTO_ANSWER", `cat=${r.id} task=${taskKey} policy=${policy.id}`, error);
+              }
+              if (answered) {
+                console.log(`FLEET_AUTO_ANSWER ${r.id} ${taskKey} policy=${policy.id}`);
+                console.log(`FLEET_QUESTION_ANSWERED ${r.id} ${taskKey} policy=${policy.id}`);
+                if (taskKey !== "-") log(taskKey, { ev: "question-auto-answer", policy: policy.id });
+              } else {
+                console.log(`FLEET_QUESTION_SEND_FAILED ${r.id} ${taskKey} policy=${policy.id}`);
+                retryQuestion = true;
+              }
             }
           } else {
             const excerpt = (r.questionText || "unreadable").replace(/[\r\n\t]+/g, " ").replaceAll('"', "'").slice(0, 180);
