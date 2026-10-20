@@ -305,8 +305,10 @@ export function parseHerdrAgentStatus(stdout, pane = "") {
   let data;
   try { data = JSON.parse(stdout); } catch { return null; }
   const result = data?.result;
-  const agents = Array.isArray(result?.agents) ? result.agents : result ? [result] : [];
-  const agent = agents.find((item) => !pane || item?.pane_id === pane || item?.pane === pane) ?? null;
+  const listed = Array.isArray(result?.agents) ? result.agents : [];
+  const nested = result?.agent && typeof result.agent === "object" ? [result.agent] : [];
+  const flat = result && typeof result.agent_status === "string" ? [result] : [];
+  const agent = [...listed, ...nested, ...flat].find((item) => !pane || item?.pane_id === pane || item?.pane === pane) ?? null;
   return typeof agent?.agent_status === "string" ? agent.agent_status : null;
 }
 

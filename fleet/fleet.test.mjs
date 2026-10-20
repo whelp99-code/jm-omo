@@ -250,7 +250,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const journalPath = join(bin, "journalctl");
   const ghPath = join(bin, "gh");
   const gitPath = join(bin, "git");
-  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = agent ] && [ \"$2\" = get ]; then\n  status=\"${HERDR_AGENT_STATUS:-blocked}\"\n  printf '%s\\n' '{\"result\":{\"pane_id\":\"'\"$3\"'\",\"agent_status\":\"'\"$status\"'\"}}'\nelif [ \"$1\" = pane ] && [ \"$2\" = read ]; then\n  [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1\n  if [ -f \"$QUESTION_INPUT_PATH\" ]; then IFS= read -r input < \"$QUESTION_INPUT_PATH\" || true; printf '%s\\n' \"${PANE_SCREEN%❯*}❯ $input\"; else printf '%s\\n' \"$PANE_SCREEN\"; fi\nelif [ \"$1\" = pane ] && [ \"$2\" = send-text ]; then\n  if [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n  printf '%s\\n' \"$4\" > \"$QUESTION_INPUT_PATH\"\nfi\n");
+  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = agent ] && [ \"$2\" = get ]; then\n  status=\"${HERDR_AGENT_STATUS:-blocked}\"\n  printf '%s\\n' '{\"id\":\"cli:agent:get\",\"result\":{\"agent\":{\"agent\":\"gjc\",\"agent_status\":\"'\"$status\"'\",\"pane_id\":\"'\"$3\"'\"},\"type\":\"agent_info\"}}'\nelif [ \"$1\" = pane ] && [ \"$2\" = read ]; then\n  [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1\n  if [ -f \"$QUESTION_INPUT_PATH\" ]; then IFS= read -r input < \"$QUESTION_INPUT_PATH\" || true; printf '%s\\n' \"${PANE_SCREEN%❯*}❯ $input\"; else printf '%s\\n' \"$PANE_SCREEN\"; fi\nelif [ \"$1\" = pane ] && [ \"$2\" = send-text ]; then\n  if [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n  printf '%s\\n' \"$4\" > \"$QUESTION_INPUT_PATH\"\nfi\n");
   writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(gitPath, "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then printf 'https://github.com/whelp99-code/jm-omo.git\\n'; elif [ \"$1\" = branch ] && [ \"$2\" = --show-current ]; then printf 'fixture-branch\\n'; else exit 2; fi\n");
@@ -364,9 +364,16 @@ async function runWatchCycle(options = {}) {
   return runFleetCommand({ ...options, command: ["watch", "1"] });
 }
 
+function liveAgentEnvelope(status, pane = "w2:p1") {
+  return JSON.stringify({
+    id: "cli:agent:get",
+    result: { agent: { agent: "gjc", agent_status: status, pane_id: pane }, type: "agent_info" },
+  });
+}
+
 function agentGetResult(argv, status = "idle") {
   if (argv[1] !== "agent" || argv[2] !== "get") return null;
-  return { exitCode: 0, stdout: JSON.stringify({ result: { pane_id: argv[3], agent_status: status } }) };
+  return { exitCode: 0, stdout: liveAgentEnvelope(status, argv[3]) };
 }
 
 async function runFleetBoard(options = {}) {
@@ -3028,6 +3035,34 @@ describe("fleet model-switch waits", () => {
     expect(result).toBe("MODEL_SWITCHED claude-haiku:off -> anthropic/claude-sonnet");
     expect(calls.filter((argv) => argv[2] === "send-text").map((argv) => argv[4])).toEqual(["/model", "claude-sonnet"]);
     expect(calls.filter((argv) => argv[2] === "send-keys").map((argv) => argv[4])).toEqual(["Enter", "Enter"]);
+  });
+
+  it("switches a model when the live herdr envelope reports idle", async () => {
+    const pane = "w2:p1";
+    const envelope = '{"id":"cli:agent:get","result":{"agent":{"agent":"gjc","agent_status":"idle","pane_id":"w2:p1"},"type":"agent_info"}}';
+    let stage = 0;
+    const writes = [];
+    const screen = () => [
+      "Idle\n⚡ claude-haiku:off\n❯",
+      "Idle\n⚡ claude-haiku:off\n❯ /model",
+      "Select model\n→ claude-sonnet [anthropic]\n❯",
+      "Select model\n→ claude-sonnet [anthropic]\n❯",
+      "Idle\n⚡ claude-sonnet:high\n❯",
+    ][stage];
+    const result = await switchModel(pane, { provider: "anthropic", model: "claude-sonnet", thinking: "high" }, async argv => {
+      if (argv[1] === "agent" && argv[2] === "get") return { exitCode: 0, stdout: envelope };
+      if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
+      writes.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") stage = 1;
+      else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 1) stage = 2;
+      else if (argv[2] === "send-text" && argv[4] === "claude-sonnet") stage = 3;
+      else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 3) stage = 4;
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(parseHerdrAgentStatus(envelope, pane)).toBe("idle");
+    expect(result).toBe("MODEL_SWITCHED claude-haiku:off -> anthropic/claude-sonnet");
+    expect(writes.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model", "claude-sonnet"]);
+    expect(writes.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(2);
   });
 
   it("returns a distinct timeout when the picker screen never appears", async () => {
@@ -6525,12 +6560,39 @@ describe("fleet question policy", () => {
   });
 
   it("reads herdr agent status from agent get and agent list", () => {
+    const live = '{"id":"cli:agent:get","result":{"agent":{"agent":"gjc","agent_status":"idle","pane_id":"w2:p1"},"type":"agent_info"}}';
+    expect(parseHerdrAgentStatus(live, "w2:p1")).toBe("idle");
+    expect(parseHerdrAgentStatus(live.replace('"agent_status":"idle"', '"agent_status":"blocked"'), "w2:p1")).toBe("blocked");
+    expect(parseHerdrAgentStatus(live, "w6:p1")).toBeNull();
     expect(parseHerdrAgentStatus(JSON.stringify({ result: { pane_id: "w6:p1", agent_status: "blocked" } }), "w6:p1")).toBe("blocked");
     expect(parseHerdrAgentStatus(JSON.stringify({
       result: { agents: [{ pane_id: "w1:p1", agent_status: "idle" }, { pane_id: "w6:p1", agent_status: "blocked" }] },
     }), "w6:p1")).toBe("blocked");
     expect(parseHerdrAgentStatus("not-json", "w6:p1")).toBeNull();
     expect(parseHerdrAgentStatus(JSON.stringify({ result: { pane_id: "w1:p1", agent_status: "blocked" } }), "w6:p1")).toBeNull();
+    expect(parseHerdrAgentStatus('{"id":"cli:agent:get","result":{"agent":{"agent":"gjc","pane_id":"w2:p1"},"type":"agent_info"}}', "w2:p1")).toBeNull();
+  });
+
+  it("answers a blocked question reported in the live herdr agent envelope", async () => {
+    const pane = "w2:p1";
+    const question = "Should we use the production auth account?";
+    const answer = "Do not use it.";
+    const envelope = '{"id":"cli:agent:get","result":{"agent":{"agent":"gjc","agent_status":"blocked","pane_id":"w2:p1"},"type":"agent_info"}}';
+    let staged = "";
+    const writes = [];
+    const answered = await answerPaneQuestion(pane, question, answer, async argv => {
+      if (argv[1] === "agent" && argv[2] === "get") return { exitCode: 0, stdout: envelope };
+      if (argv[2] === "read") return { exitCode: 0, stdout: `Question pending\n${question}\n❯${staged ? ` ${staged}` : ""}` };
+      writes.push(argv.slice(2));
+      if (argv[2] === "send-text") staged = argv[4];
+      return { exitCode: 0, stdout: "" };
+    });
+    expect(parseHerdrAgentStatus(envelope, pane)).toBe("blocked");
+    expect(answered).toBe(true);
+    expect(writes).toEqual([
+      ["send-text", pane, answer],
+      ["send-keys", pane, "Enter"],
+    ]);
   });
 
   it("defers personal password or OTP use and answers through the fake pane", async () => {
