@@ -775,23 +775,36 @@ async function pickModel(type) {
   return { ...ROUTES.cursorFallback, usage: u };
 }
 
-function uiChrome(line) {
+function paneWidth(lines) {
+  return lines.reduce((width, line) => Math.max(width, line.trimEnd().length), 0);
+}
+
+function fullWidthRule(line, width) {
+  const text = line.trim();
+  return /^[─━]+$/.test(text) && text.length >= 8 && text.length >= width;
+}
+
+function uiChrome(line, width) {
   return /^\s*❯/.test(line)
-    || /^\s*[─━]{3,}\s*$/.test(line)
+    || fullWidthRule(line, width)
     || /(?:⚡|\([a-z-]+\)|\s)\s*[a-z][A-Za-z0-9._-]+:(?:low|medium|high|xhigh|minimal|off)\s*$/.test(line);
 }
 
 function contentAbovePrompt(lines) {
-  const prompt = lines.findLastIndex((line) => /^\s*❯/.test(line));
-  if (prompt < 0) return null;
+  let prompt = lines.length - 1;
+  while (prompt >= 0 && !lines[prompt].trim()) prompt -= 1;
+  if (prompt < 0 || !/^\s*❯/.test(lines[prompt])) return null;
+  const width = paneWidth(lines);
   let start = 0;
   for (let index = prompt - 1; index >= 0; index -= 1) {
-    if (uiChrome(lines[index])) {
+    if (uiChrome(lines[index], width)) {
       start = index + 1;
       break;
     }
   }
-  return { start, content: lines.slice(start, prompt).filter((line) => line.trim()) };
+  const content = lines.slice(start, prompt).filter((line) => line.trim());
+  if (content.some((line) => /^[─━]+$/.test(line.trim()) && !fullWidthRule(line, width))) return null;
+  return { start, content };
 }
 
 function currentQuestionFrame(screenLines) {

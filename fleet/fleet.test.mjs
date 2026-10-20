@@ -2865,6 +2865,26 @@ describe("fleet model-switch waits", () => {
     } finally { Date.now = originalNow; }
   });
 
+  it("does not drive a ruled quoted picker transcript", async () => {
+    const quote = "Example:\n───\nSelect model\n→ claude-sonnet [anthropic]\n❯";
+    expect(activeModelPicker(quote)).toBeNull();
+    let phase = "idle";
+    const pickerWrites = [];
+    const pickerScreen = () => phase === "idle" ? "Idle\n⚡ claude-haiku:off\n❯"
+      : phase === "typed" ? "Idle\n⚡ claude-haiku:off\n❯ /model"
+      : phase === "done" ? "Idle\n⚡ claude-sonnet:high\n❯" : quote;
+    const switched = await switchModel("fake-only:ruled-picker", { model: "claude-sonnet", provider: "anthropic", thinking: "high" }, async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: pickerScreen() };
+      pickerWrites.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") phase = "typed";
+      else if (argv[2] === "send-keys" && argv[4] === "Enter") phase = phase === "typed" ? "quoted" : "done";
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(switched).toStartWith("MODEL_SWITCH_TIMEOUT ");
+    expect(pickerWrites.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model"]);
+    expect(pickerWrites.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(1);
+  });
+
   it("does not drive a blank-line quoted picker transcript", async () => {
     expect(activeModelPicker("Example:\n\nSelect model\n→ claude-sonnet [anthropic]\n❯")).toBeNull();
     let phase = "idle";
@@ -6229,6 +6249,22 @@ describe("fleet question policy", () => {
     const result = await runWatchCycle({ catTask: "Q-QUOTED-FRAME", paneScreen });
     expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
     expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("does not answer a ruled quoted question frame", async () => {
+    const question = "Should we use the production auth account?";
+    let staged = "";
+    const screen = () => `Example:\n───\nQuestion pending\n${question}\n❯${staged ? ` ${staged}` : ""}`;
+    const writes = [];
+    const answered = await answerPaneQuestion("fake-only:ruled-question", question, "Do not use it.", async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
+      writes.push(argv.slice(2));
+      if (argv[2] === "send-text") staged = argv[4];
+      return { exitCode: 0, stdout: "" };
+    });
+    expect(classify(screen()).questionActionable).toBe(false);
+    expect(answered).toBe(false);
+    expect(writes).toEqual([]);
   });
 
   it("does not answer a blank-line quoted question frame", async () => {
