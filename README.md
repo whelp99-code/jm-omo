@@ -32,6 +32,10 @@ Draft PRs are automatically readied only when their Tests/Test Plan contains an 
 
 Environment overrides are `FLEET_CAT_<ID>_PANE` (for example, `FLEET_CAT_CRM_PANE`), `FLEET_SLACK_REVIEW_CHANNEL`, `FLEET_CURSOR_USER_ID`, `FLEET_REVIEW_REPLY_APP_ID`, `FLEET_AGENT_MESSENGER_CREDENTIAL_PATH`, `FLEET_PR_LOOP_ENABLED`, and `FLEET_PR_LOOP_AUTO_MERGE`.
 
+Runtime consumers share the side-effect-free loader in `fleet/config.mjs`: Slack startup and hourly reports resolve the SDK beside the configured credential manager, review requests mention the configured Cursor user, and development reports use the configured review channel. The versioned credential path in JSON is an installation default, not a source-code dependency; override it after moving the SDK.
+
+`usageWatch.catIds` selects registered cats to monitor (default: `gajae`); pane overrides apply there too. The obsolete unregistered `w1:p1` target is no longer monitored. The self-policy pane follows `omonyang`, and `SELF_POLICY_ENABLED` remains disabled. `usageWatch.orcaTerminals` holds installation-specific terminal IDs; override that list with a JSON string array in `FLEET_USAGE_ORCA_TERMINALS`.
+
 ```bash
 cd fleet
 bun fleet.mjs init

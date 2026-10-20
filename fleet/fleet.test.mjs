@@ -8,7 +8,7 @@ import { SELF_POLICY_ENABLED } from "../runtime/usage-policy.mjs";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkDeployHealth, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, hasListedTests, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, matchPrLoopVerdict, migrateFleetColumns, pairReviewReplies, pollReviewStalls, processPrLoopEvents, questionPolicy, taskPrSignals, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, runDoriHeavyDeploy, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
+const { activeModelPicker, answerPaneQuestion, appendTaskHistory, parseHerdrAgentStatus, bugbotLimitEvents, checkDeployHealth, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, hasListedTests, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, matchPrLoopVerdict, migrateFleetColumns, pairReviewReplies, pollReviewStalls, processPrLoopEvents, questionPolicy, taskPrSignals, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, runDoriHeavyDeploy, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -250,7 +250,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
   const journalPath = join(bin, "journalctl");
   const ghPath = join(bin, "gh");
   const gitPath = join(bin, "git");
-  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = pane ] && [ \"$2\" = read ]; then [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1; printf '%s\\n' \"$PANE_SCREEN\"; elif [ \"$1\" = pane ] && [ \"$2\" = send-text ] && [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n");
+  writeFileSync(herdrPath, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1\" = agent ] && [ \"$2\" = get ]; then\n  status=\"${HERDR_AGENT_STATUS:-blocked}\"\n  printf '%s\\n' '{\"id\":\"cli:agent:get\",\"result\":{\"agent\":{\"agent\":\"gjc\",\"agent_status\":\"'\"$status\"'\",\"pane_id\":\"'\"$3\"'\"},\"type\":\"agent_info\"}}'\nelif [ \"$1\" = pane ] && [ \"$2\" = read ]; then\n  [ \"$PANE_READ_FAILURE\" = 1 ] && exit 1\n  if [ -f \"$QUESTION_INPUT_PATH\" ]; then IFS= read -r input < \"$QUESTION_INPUT_PATH\" || true; printf '%s\\n' \"${PANE_SCREEN%❯*}❯ $input\"; else printf '%s\\n' \"$PANE_SCREEN\"; fi\nelif [ \"$1\" = pane ] && [ \"$2\" = send-text ]; then\n  if [ \"$FAIL_FIRST_ANSWER\" = 1 ] && [ ! -f \"$FIRST_ANSWER_FAILED\" ]; then : > \"$FIRST_ANSWER_FAILED\"; exit 1; fi\n  printf '%s\\n' \"$4\" > \"$QUESTION_INPUT_PATH\"\nfi\n");
   writeFileSync(pgrepPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(journalPath, "#!/bin/sh\nexit 0\n");
   writeFileSync(gitPath, "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$2\" = get-url ] && [ \"$3\" = origin ]; then printf 'https://github.com/whelp99-code/jm-omo.git\\n'; elif [ \"$1\" = branch ] && [ \"$2\" = --show-current ]; then printf 'fixture-branch\\n'; else exit 2; fi\n");
@@ -264,6 +264,7 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
     HOME: home,
     PATH: `${bin}:${process.env.PATH}`,
     HERDR_LOG: herdrLog,
+    QUESTION_INPUT_PATH: join(home, "question-input"),
     GH_LOG: ghLog,
     PANE_SCREEN: paneScreen,
     PANE_READ_FAILURE: paneReadFailure ? "1" : "0",
@@ -361,6 +362,18 @@ async function runFleetCommand({ usageTick = "", prDone = "", checkRuns = [], pa
 
 async function runWatchCycle(options = {}) {
   return runFleetCommand({ ...options, command: ["watch", "1"] });
+}
+
+function liveAgentEnvelope(status, pane = "w2:p1") {
+  return JSON.stringify({
+    id: "cli:agent:get",
+    result: { agent: { agent: "gjc", agent_status: status, pane_id: pane }, type: "agent_info" },
+  });
+}
+
+function agentGetResult(argv, status = "idle") {
+  if (argv[1] !== "agent" || argv[2] !== "get") return null;
+  return { exitCode: 0, stdout: liveAgentEnvelope(status, argv[3]) };
 }
 
 async function runFleetBoard(options = {}) {
@@ -2842,6 +2855,157 @@ describe("fleet PR-loop durable recovery and verdict safety", () => {
 });
 
 describe("fleet model-switch waits", () => {
+  it.each(["prefix-footer", "unselected-row", "quoted-catalog"])("rejects ambiguous model selection: %s", async scenario => {
+    const originalNow = Date.now;
+    let clock = 0, stage = "idle", selections = 0;
+    Date.now = () => clock;
+    try {
+      const runCommand = async argv => {
+        const agent = agentGetResult(argv, "idle");
+        if (agent) return agent;
+        if (argv[2] === "read") {
+          if (stage === "catalog" && scenario === "quoted-catalog") {
+            clock = 1000;
+            return { exitCode: 0, stdout: "Example output\n→ claude-sonnet [anthropic]\n❯" };
+          }
+          if (stage === "filtered" && scenario === "unselected-row") {
+            clock = 1000;
+            return { exitCode: 0, stdout: "Select model\n→ claude-sonnet-5 [anthropic]\nnote claude-sonnet [anthropic]\n❯" };
+          }
+          const screens = {
+            idle: `Idle\n⚡ ${scenario === "prefix-footer" ? "claude-sonnet-5" : "claude-haiku"}:high\n❯`,
+            typed: "Idle\n⚡ claude-haiku:off\n❯ /model",
+            catalog: "Select model\n→ claude-sonnet [anthropic]\n❯",
+            filtered: "Select model\n→ claude-sonnet [anthropic]\n❯",
+            selected: `Idle\n⚡ ${scenario === "unselected-row" ? "claude-sonnet-5" : "claude-sonnet"}:high\n❯`,
+          };
+          return { exitCode: 0, stdout: screens[stage] };
+        }
+        if (argv[2] === "send-text") stage = argv[4] === "/model" ? "typed" : "filtered";
+        if (argv[2] === "send-keys") {
+          if (argv[4] === "Escape" || argv[4] === "ctrl+u") stage = "idle";
+          else if (stage === "typed") stage = "catalog";
+          else { selections++; stage = "selected"; }
+        }
+        return { exitCode: 0, stdout: "" };
+      };
+      const result = await switchModel("w-exact:p1", { provider: "anthropic", model: "claude-sonnet", thinking: "high" }, runCommand, 1000);
+      if (scenario === "prefix-footer") {
+        expect(result).toStartWith("MODEL_SWITCHED ");
+        expect(selections).toBe(1);
+      } else {
+        expect(result).toStartWith("MODEL_SWITCH_TIMEOUT ");
+        expect(selections).toBe(0);
+      }
+    } finally { Date.now = originalNow; }
+  });
+
+  it("does not drive a ruled quoted picker transcript", async () => {
+    const quote = "Example:\n───\nSelect model\n→ claude-sonnet [anthropic]\n❯";
+    expect(activeModelPicker(quote)).toBeNull();
+    let phase = "idle";
+    const pickerWrites = [];
+    const pickerScreen = () => phase === "idle" ? "Idle\n⚡ claude-haiku:off\n❯"
+      : phase === "typed" ? "Idle\n⚡ claude-haiku:off\n❯ /model"
+      : phase === "done" ? "Idle\n⚡ claude-sonnet:high\n❯" : quote;
+    const switched = await switchModel("fake-only:ruled-picker", { model: "claude-sonnet", provider: "anthropic", thinking: "high" }, async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: pickerScreen() };
+      pickerWrites.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") phase = "typed";
+      else if (argv[2] === "send-keys" && argv[4] === "Enter") phase = phase === "typed" ? "quoted" : "done";
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(switched).toStartWith("MODEL_SWITCH_TIMEOUT ");
+    expect(pickerWrites.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model"]);
+    expect(pickerWrites.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(1);
+  });
+
+  it("does not drive a blank-line quoted picker transcript", async () => {
+    expect(activeModelPicker("Example:\n\nSelect model\n→ claude-sonnet [anthropic]\n❯")).toBeNull();
+    let phase = "idle";
+    const pickerWrites = [];
+    const pickerScreen = () => {
+      if (phase === "idle") return "Idle\n⚡ claude-haiku:off\n❯";
+      if (phase === "typed") return "Idle\n⚡ claude-haiku:off\n❯ /model";
+      if (phase === "done") return "Idle\n⚡ claude-sonnet:high\n❯";
+      return "Example:\n\nSelect model\n→ claude-sonnet [anthropic]\n❯";
+    };
+    const switched = await switchModel("fake-only:p2", { model: "claude-sonnet", provider: "anthropic", thinking: "high" }, async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: pickerScreen() };
+      pickerWrites.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") phase = "typed";
+      else if (argv[2] === "send-keys" && argv[4] === "Enter") phase = phase === "typed" ? "quoted" : "done";
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(switched).toStartWith("MODEL_SWITCH_TIMEOUT ");
+    expect(pickerWrites.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model"]);
+    expect(pickerWrites.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(1);
+  });
+
+  it("does not drive a full-width quoted picker transcript", async () => {
+    const quote = `Example:\n${"─".repeat(80)}\nSelect model\n→ claude-sonnet [anthropic]\n❯`;
+    expect(activeModelPicker(quote)).toEqual({ model: "claude-sonnet", provider: "anthropic" });
+    let phase = "idle";
+    const pickerWrites = [];
+    const pickerScreen = () => phase === "idle" ? "Idle\n⚡ claude-haiku:off\n❯"
+      : phase === "typed" ? "Idle\n⚡ claude-haiku:off\n❯ /model"
+      : phase === "done" ? "Idle\n⚡ claude-sonnet:high\n❯" : quote;
+    const switched = await switchModel("fake-only:fullwidth-picker", { model: "claude-sonnet", provider: "anthropic", thinking: "high" }, async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: pickerScreen() };
+      pickerWrites.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") phase = "typed";
+      else if (argv[2] === "send-keys" && argv[4] === "Enter") phase = phase === "typed" ? "quoted" : "done";
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(switched).toBe("MODEL_SWITCH_HELD fake-only:fullwidth-picker agent_status=unknown");
+    expect(pickerWrites.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model"]);
+    expect(pickerWrites.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(1);
+  });
+
+  it("ignores a picker frame that was already on screen before /model", async () => {
+    const quote = `Example:\n${"─".repeat(80)}\nSelect model\n→ claude-sonnet [anthropic]\n❯`;
+    let phase = "before";
+    const pickerWrites = [];
+    const pickerScreen = () => phase === "typed" ? quote.replace(/\n❯$/, "\n❯ /model") : quote;
+    const switched = await switchModel("fake-only:preexisting-picker", { model: "claude-sonnet", provider: "anthropic", thinking: "high" }, async argv => {
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
+      if (argv[2] === "read") return { exitCode: 0, stdout: pickerScreen() };
+      pickerWrites.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") phase = "typed";
+      else if (argv[2] === "send-keys" && argv[4] === "Enter") phase = "quoted";
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(switched).toStartWith("MODEL_SWITCH_TIMEOUT ");
+    expect(pickerWrites.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model"]);
+    expect(pickerWrites.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(1);
+  });
+
+  it("does not treat a scrollback picker transcript as the open picker", async () => {
+    const originalNow = Date.now;
+    let clock = 0, stage = "idle", modelTypes = 0;
+    Date.now = () => clock;
+    try {
+      const result = await switchModel("w-stale:p1", { provider: "anthropic", model: "claude-sonnet", thinking: "high" }, async argv => {
+        if (argv[2] === "read") {
+          if (stage === "catalog") clock = 1000;
+          const screens = {
+            idle: "Idle\n⚡ claude-haiku:high\n❯",
+            typed: "Idle\n⚡ claude-haiku:off\n❯ /model",
+            catalog: "Select model\n→ claude-sonnet [anthropic]\nIdle\n⚡ claude-haiku:off\n❯",
+          };
+          return { exitCode: 0, stdout: screens[stage] };
+        }
+        if (argv[2] === "send-text" && argv[4] === "/model") stage = "typed";
+        else if (argv[2] === "send-text") modelTypes += 1;
+        if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === "typed") stage = "catalog";
+        return { exitCode: 0, stdout: "" };
+      }, 1000);
+      expect(result).toStartWith("MODEL_SWITCH_TIMEOUT ");
+      expect(modelTypes).toBe(0);
+    } finally { Date.now = originalNow; }
+  });
+
   it("advances only after the picker, catalog, and selected model appear", async () => {
     let stage = 0;
     const calls = [];
@@ -2854,6 +3018,8 @@ describe("fleet model-switch waits", () => {
     ][stage];
     const runCommand = async (argv) => {
       calls.push(argv);
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
       if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
       if (argv[2] === "send-text" && argv[4] === "/model") stage = 1;
       else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 1) stage = 2;
@@ -2869,6 +3035,34 @@ describe("fleet model-switch waits", () => {
     expect(result).toBe("MODEL_SWITCHED claude-haiku:off -> anthropic/claude-sonnet");
     expect(calls.filter((argv) => argv[2] === "send-text").map((argv) => argv[4])).toEqual(["/model", "claude-sonnet"]);
     expect(calls.filter((argv) => argv[2] === "send-keys").map((argv) => argv[4])).toEqual(["Enter", "Enter"]);
+  });
+
+  it("switches a model when the live herdr envelope reports idle", async () => {
+    const pane = "w2:p1";
+    const envelope = '{"id":"cli:agent:get","result":{"agent":{"agent":"gjc","agent_status":"idle","pane_id":"w2:p1"},"type":"agent_info"}}';
+    let stage = 0;
+    const writes = [];
+    const screen = () => [
+      "Idle\n⚡ claude-haiku:off\n❯",
+      "Idle\n⚡ claude-haiku:off\n❯ /model",
+      "Select model\n→ claude-sonnet [anthropic]\n❯",
+      "Select model\n→ claude-sonnet [anthropic]\n❯",
+      "Idle\n⚡ claude-sonnet:high\n❯",
+    ][stage];
+    const result = await switchModel(pane, { provider: "anthropic", model: "claude-sonnet", thinking: "high" }, async argv => {
+      if (argv[1] === "agent" && argv[2] === "get") return { exitCode: 0, stdout: envelope };
+      if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
+      writes.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") stage = 1;
+      else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 1) stage = 2;
+      else if (argv[2] === "send-text" && argv[4] === "claude-sonnet") stage = 3;
+      else if (argv[2] === "send-keys" && argv[4] === "Enter" && stage === 3) stage = 4;
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(parseHerdrAgentStatus(envelope, pane)).toBe("idle");
+    expect(result).toBe("MODEL_SWITCHED claude-haiku:off -> anthropic/claude-sonnet");
+    expect(writes.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model", "claude-sonnet"]);
+    expect(writes.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(2);
   });
 
   it("returns a distinct timeout when the picker screen never appears", async () => {
@@ -2901,6 +3095,8 @@ describe("fleet model-switch waits", () => {
     };
     const runCommand = async (argv) => {
       calls.push(argv);
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
       if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
       if (argv[2] === "send-text") {
         if (argv[4] === "/model") {
@@ -3046,6 +3242,8 @@ describe("fleet model-switch waits", () => {
     const timeline = [];
     const concatenatedInput = "/thinking xhighTASK-MAIL-JARVIS-READER-20261012 [attempt=fixture]:";
     const runCommand = async (argv) => {
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
       if (argv[2] === "read") {
         let stdout;
         if (phase === "initial") stdout = "Idle\n⚡ claude-haiku:off\n❯";
@@ -6152,6 +6350,108 @@ describe("fleet question policy", () => {
     expect(questionPolicy(state.questionText)).toBeNull();
   });
 
+  it.each([
+    "⏺ Example transcript:\nQuestion pending\nShould we use the production auth account?\n❯",
+    "```text\nQuestion pending\nShould we use the production auth account?\n❯\n```",
+  ])("does not auto-answer a quoted question UI frame: %s", async paneScreen => {
+    const result = await runWatchCycle({ catTask: "Q-QUOTED-FRAME", paneScreen });
+    expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
+    expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("does not answer a ruled quoted question frame", async () => {
+    const question = "Should we use the production auth account?";
+    let staged = "";
+    const screen = () => `Example:\n───\nQuestion pending\n${question}\n❯${staged ? ` ${staged}` : ""}`;
+    const writes = [];
+    const answered = await answerPaneQuestion("fake-only:ruled-question", question, "Do not use it.", async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: screen() };
+      writes.push(argv.slice(2));
+      if (argv[2] === "send-text") staged = argv[4];
+      return { exitCode: 0, stdout: "" };
+    });
+    expect(classify(screen()).questionActionable).toBe(false);
+    expect(answered).toBe(false);
+    expect(writes).toEqual([]);
+  });
+
+  it("does not answer a blank-line quoted question frame", async () => {
+    const question = "Should we use the production auth account?";
+    let staged = "";
+    const questionScreen = () => `Example:\n\nQuestion pending\n${question}\n❯${staged ? ` ${staged}` : ""}`;
+    const questionWrites = [];
+    const answered = await answerPaneQuestion("fake-only:p1", question, "Do not use it.", async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: questionScreen() };
+      questionWrites.push(argv.slice(2));
+      if (argv[2] === "send-text") staged = argv[4];
+      return { exitCode: 0, stdout: "" };
+    });
+    expect(classify(questionScreen()).questionActionable).toBe(false);
+    expect(answered).toBe(false);
+    expect(questionWrites).toEqual([]);
+  });
+
+  it("does not answer a full-width quoted question frame", async () => {
+    const question = "Should we use the production auth account?";
+    const questionScreen = () => `Example:\n${"─".repeat(80)}\nQuestion pending\n${question}\n❯`;
+    const questionWrites = [];
+    const answered = await answerPaneQuestion("fake-only:fullwidth-question", question, "Do not use it.", async argv => {
+      if (argv[1] === "agent") return { exitCode: 0, stdout: "" };
+      if (argv[2] === "read") return { exitCode: 0, stdout: questionScreen() };
+      questionWrites.push(argv.slice(2));
+      return { exitCode: 0, stdout: "" };
+    });
+    expect(classify(questionScreen()).questionActionable).toBe(true);
+    expect(answered).toBe(false);
+    expect(questionWrites).toEqual([]);
+  });
+
+  it("does not answer a live question unless herdr reports blocked", async () => {
+    const question = "Should we use the production auth account?";
+    const questionWrites = [];
+    const answered = await answerPaneQuestion("w-question:p1", question, "Do not use it.", async argv => {
+      const agent = agentGetResult(argv, "idle");
+      if (agent) return agent;
+      if (argv[2] !== "read") questionWrites.push(argv.slice(2));
+      return { exitCode: 0, stdout: `Question pending\n${question}\n❯` };
+    });
+    expect(answered).toBe(false);
+    expect(questionWrites).toEqual([]);
+  });
+
+  it("does not auto-answer a plain-text quoted question frame", async () => {
+    const paneScreen = "Example:\nQuestion pending\nShould we use the production auth account?\n❯";
+    expect(classify(paneScreen).questionActionable).toBe(false);
+    const result = await runWatchCycle({ catTask: "Q-PLAIN-QUOTE", paneScreen });
+    expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
+    expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("does not append an answer to an occupied question input", async () => {
+    const question = "Should we use the production auth account?";
+    const calls = [];
+    expect(await answerPaneQuestion("w-question:p1", question, "Do not use it.", async argv => {
+      calls.push(argv);
+      return { exitCode: 0, stdout: `Question pending\n${question}\n❯ owner draft` };
+    })).toBe(false);
+    expect(calls.every(argv => argv[2] === "read")).toBe(true);
+  });
+
+  it("does not submit an answer after the question disappears during staging", async () => {
+    const question = "Should we use the production auth account?";
+    const calls = [];
+    let staged = false;
+    expect(await answerPaneQuestion("w-question:p1", question, "Do not use it.", async argv => {
+      calls.push(argv);
+      const agent = agentGetResult(argv, "blocked");
+      if (agent) return agent;
+      if (argv[2] === "send-text") staged = true;
+      return { exitCode: 0, stdout: staged ? "Working (1s)\n❯ Do not use it." : `Question pending\n${question}\n❯` };
+    })).toBe(false);
+    expect(calls.some(argv => argv[2] === "send-text")).toBe(true);
+    expect(calls.some(argv => argv[2] === "send-keys")).toBe(false);
+  });
+
   it("matches allowlisted policies only against the pending question", () => {
     const screen = [
       "Earlier response: I avoided using the production auth account.",
@@ -6245,6 +6545,54 @@ describe("fleet question policy", () => {
     expect(result.output).toContain("FLEET_QUESTION_NOTIFY owner=omonyang crm Q-NEAR-MISS");
     expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
     expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("holds an allowlisted question unless herdr reports blocked", async () => {
+    const result = await runWatchCycle({
+      catTask: "Q-HELD",
+      paneScreen: "Question pending\nShould we use the production auth account?\n❯",
+      fleetEnv: { HERDR_AGENT_STATUS: "idle" },
+    });
+    expect(result.output).toContain("FLEET_QUESTION_HELD crm Q-HELD policy=production-auth-prohibited agent_status=idle");
+    expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
+    expect(result.output).not.toContain("FLEET_QUESTION_SEND_FAILED");
+    expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("reads herdr agent status from agent get and agent list", () => {
+    const live = '{"id":"cli:agent:get","result":{"agent":{"agent":"gjc","agent_status":"idle","pane_id":"w2:p1"},"type":"agent_info"}}';
+    expect(parseHerdrAgentStatus(live, "w2:p1")).toBe("idle");
+    expect(parseHerdrAgentStatus(live.replace('"agent_status":"idle"', '"agent_status":"blocked"'), "w2:p1")).toBe("blocked");
+    expect(parseHerdrAgentStatus(live, "w6:p1")).toBeNull();
+    expect(parseHerdrAgentStatus(JSON.stringify({ result: { pane_id: "w6:p1", agent_status: "blocked" } }), "w6:p1")).toBe("blocked");
+    expect(parseHerdrAgentStatus(JSON.stringify({
+      result: { agents: [{ pane_id: "w1:p1", agent_status: "idle" }, { pane_id: "w6:p1", agent_status: "blocked" }] },
+    }), "w6:p1")).toBe("blocked");
+    expect(parseHerdrAgentStatus("not-json", "w6:p1")).toBeNull();
+    expect(parseHerdrAgentStatus(JSON.stringify({ result: { pane_id: "w1:p1", agent_status: "blocked" } }), "w6:p1")).toBeNull();
+    expect(parseHerdrAgentStatus('{"id":"cli:agent:get","result":{"agent":{"agent":"gjc","pane_id":"w2:p1"},"type":"agent_info"}}', "w2:p1")).toBeNull();
+  });
+
+  it("answers a blocked question reported in the live herdr agent envelope", async () => {
+    const pane = "w2:p1";
+    const question = "Should we use the production auth account?";
+    const answer = "Do not use it.";
+    const envelope = '{"id":"cli:agent:get","result":{"agent":{"agent":"gjc","agent_status":"blocked","pane_id":"w2:p1"},"type":"agent_info"}}';
+    let staged = "";
+    const writes = [];
+    const answered = await answerPaneQuestion(pane, question, answer, async argv => {
+      if (argv[1] === "agent" && argv[2] === "get") return { exitCode: 0, stdout: envelope };
+      if (argv[2] === "read") return { exitCode: 0, stdout: `Question pending\n${question}\n❯${staged ? ` ${staged}` : ""}` };
+      writes.push(argv.slice(2));
+      if (argv[2] === "send-text") staged = argv[4];
+      return { exitCode: 0, stdout: "" };
+    });
+    expect(parseHerdrAgentStatus(envelope, pane)).toBe("blocked");
+    expect(answered).toBe(true);
+    expect(writes).toEqual([
+      ["send-text", pane, answer],
+      ["send-keys", pane, "Enter"],
+    ]);
   });
 
   it("defers personal password or OTP use and answers through the fake pane", async () => {
@@ -6501,6 +6849,14 @@ describe("fleet review-stall request correlation", () => {
     expect([...pairReviewReplies([request], [{ ...reply, text: "PR #999 TASK-UNRELATED" }])]).toEqual([]);
   });
 
+  it.each(["1600.000001", "1791757469.519659"])("keeps the exact microsecond review deadline for %s", ts => {
+    const [seconds, micros] = ts.split(".");
+    const deadline = BigInt(seconds) * 1_000_000n + BigInt(micros) + 45n * 60n * 1_000_000n;
+    const request = { ts, thread_ts: ts, user: "UOTHER", text: "Cursor 검수 요청 PR #42 TASK-EXACT-DEADLINE" };
+    expect(reviewStallDrafts([request], [], Number(deadline - 1n) / 1000)).toEqual([]);
+    expect(reviewStallDrafts([request], [], Number(deadline) / 1000)).toHaveLength(1);
+  });
+
   it("alerts each unanswered request at its own 45-minute deadline", () => {
     const requests = [
       { ts: "1000.000001", thread_ts: "1000.000001", user: "UOTHER", text: "Cursor 검수 요청 PR #42 TASK-REQ-A" },
@@ -6512,7 +6868,7 @@ describe("fleet review-stall request correlation", () => {
     const alerted = new Set();
     const firstDeadline = reviewStallDrafts(requests, replies, 1000_000 + 45 * 60_000, alerted);
     expect(firstDeadline).toHaveLength(0);
-    const secondDeadline = reviewStallDrafts(requests, replies, 1600_000 + 45 * 60_000, alerted);
+    const secondDeadline = reviewStallDrafts(requests, replies, Number(requests[1].ts) * 1000 + 45 * 60_000, alerted);
     expect(secondDeadline).toHaveLength(1);
     expect(secondDeadline[0]).toContain("FLEET_REVIEW_STALL_DRAFT owner=omonyang");
     expect(secondDeadline[0]).toContain("TASK-REQ-B");

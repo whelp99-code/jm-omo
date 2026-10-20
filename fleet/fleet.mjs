@@ -4,6 +4,8 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { loadFleetConfig } from "./config.mjs";
+export { resolveFleetConfig } from "./config.mjs";
 
 const STATE = `${process.env.HOME}/.local/state/omonyang`;
 mkdirSync(STATE, { recursive: true });
@@ -116,34 +118,8 @@ const sh = async (cmd) => (await Bun.$`bash -c ${cmd}`.nothrow().quiet()).stdout
 const read = (pane) => sh(`herdr pane read ${pane} --source visible --format text 2>/dev/null`);
 const readPaneResult = (pane) => executeSignalCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
 const ROUTES = JSON.parse(await Bun.file(new URL("./routes.json", import.meta.url)).text());
-export function resolveFleetConfig(config, env = process.env) {
-  const envBoolean = (value, fallback) => value === undefined ? Boolean(fallback) : value === "true";
-  return {
-    ...config,
-    cats: config.cats.map((cat) => {
-      const envKey = `FLEET_CAT_${cat.id.replace(/[^a-z0-9]/gi, "_").toUpperCase()}_PANE`;
-      return { ...cat, pane: env[envKey] || cat.pane };
-    }),
-    slack: {
-      ...config.slack,
-      reviewChannel: env.FLEET_SLACK_REVIEW_CHANNEL || config.slack.reviewChannel,
-      cursorUserId: env.FLEET_CURSOR_USER_ID || config.slack.cursorUserId,
-      reviewReplyAppId: env.FLEET_REVIEW_REPLY_APP_ID || config.slack.reviewReplyAppId,
-    },
-    prLoop: {
-      ...config.prLoop,
-      enabled: envBoolean(env.FLEET_PR_LOOP_ENABLED, config.prLoop?.enabled),
-      autoMerge: envBoolean(env.FLEET_PR_LOOP_AUTO_MERGE, config.prLoop?.autoMerge),
-      deploy: config.prLoop?.deploy ?? {},
-      mergeMethods: config.prLoop?.mergeMethods ?? {},
-    },
-    agentMessengerCredentialPath: env.FLEET_AGENT_MESSENGER_CREDENTIAL_PATH
-      || config.agentMessengerCredentialPath,
-  };
-}
-const CONFIG = resolveFleetConfig(JSON.parse(await Bun.file(new URL("./fleet.config.json", import.meta.url)).text()));
+const CONFIG = loadFleetConfig();
 const CURSOR_USER_ID = CONFIG.slack.cursorUserId;
-const REVIEW_RELAY_USER_ID = "U0B81F5GR6V";
 const SLACK_REVIEW_CHANNEL = CONFIG.slack.reviewChannel;
 const REVIEW_REPLY_APP_ID = CONFIG.slack.reviewReplyAppId;
 const REVIEW_STALL_MS = 45 * 60 * 1000;
@@ -253,6 +229,7 @@ export function classify(screen) {
   const readyLine = [...joined.matchAll(/\b([A-Z]+_[A-Z_]*READY)\b([^❯─]{0,400})/g)].at(-1);
   const claimText = output.split("\n").filter((line) => /\bCursor\s+(?:ACCEPT|APPROVE)\b|\bPR READY\s+head=|\b(?:tests?\s+\d+\s+(?:passed|passing)|\d+\s+tests?\s+(?:passed|passing))\b|테스트\s*\d+\s*(?:개\s*)?통과/i.test(line)).join("\n");
   let questionText = "";
+  let questionActionable = false;
   if (state === "question") {
     const screenLines = screen.replace(/\r/g, "").split("\n");
     const marker = screenLines.findLastIndex(isQuestionStatusLine);
@@ -261,8 +238,10 @@ export function classify(screen) {
       ? screenLines.slice(marker + 1, prompt >= marker ? prompt : undefined)
       : output.split("\n").filter((line) => !isQuestionStatusLine(line)).slice(-3);
     questionText = questionLines.map((line) => line.trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(-800);
+    const live = currentQuestionFrame(screenLines);
+    questionActionable = Boolean(questionText) && live?.questionText === questionText;
   }
-  return { state, model, done, doneCandidates, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText };
+  return { state, model, done, doneCandidates, ready: ready ? { repo: ready[1], head: ready[2] } : null, readyLine: readyLine ? `${readyLine[1]}${readyLine[2]}`.replace(/\s+/g, " ").trim().slice(0, 300) : null, claimText, questionText, questionActionable };
 }
 
 export function completionBelongsToDispatchAttempt(task, marker) {
@@ -322,13 +301,41 @@ export function questionPolicy(question) {
   return QUESTION_POLICIES.find((policy) => policy.matches.test(question)) ?? null;
 }
 
+export function parseHerdrAgentStatus(stdout, pane = "") {
+  let data;
+  try { data = JSON.parse(stdout); } catch { return null; }
+  const result = data?.result;
+  const listed = Array.isArray(result?.agents) ? result.agents : [];
+  const nested = result?.agent && typeof result.agent === "object" ? [result.agent] : [];
+  const flat = result && typeof result.agent_status === "string" ? [result] : [];
+  const agent = [...listed, ...nested, ...flat].find((item) => !pane || item?.pane_id === pane || item?.pane === pane) ?? null;
+  return typeof agent?.agent_status === "string" ? agent.agent_status : null;
+}
+
+export async function paneAgentStatus(pane, runCommand = executeSignalCommand, signal = AbortSignal.timeout(10_000)) {
+  let result;
+  try { result = await runCommand(["herdr", "agent", "get", pane], signal); } catch (error) {
+    fleetError("HERDR_AGENT_STATUS", `pane=${pane}`, error);
+    return null;
+  }
+  if (result?.exitCode !== 0) return null;
+  return parseHerdrAgentStatus(result.stdout, pane);
+}
+
 export async function answerPaneQuestion(pane, expectedQuestion, answer, runCommand = executeSignalCommand) {
   const current = await runCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
   if (current.exitCode !== 0) return false;
   const state = classify(current.stdout);
-  if (state.state !== "question" || state.questionText !== expectedQuestion) return false;
+  if (!state.questionActionable || state.questionText !== expectedQuestion || !promptLineIsEmpty(current.stdout)) return false;
+  if (await paneAgentStatus(pane, runCommand) !== "blocked") return false;
   const send = await runCommand(["herdr", "pane", "send-text", pane, answer]);
   if (send.exitCode !== 0) return false;
+  const staged = await runCommand(["herdr", "pane", "read", pane, "--source", "visible", "--format", "text"]);
+  if (staged.exitCode !== 0) return false;
+  const stagedState = classify(staged.stdout);
+  const input = staged.stdout.replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
+  if (!stagedState.questionActionable || stagedState.questionText !== expectedQuestion
+    || input?.trim() !== `❯ ${answer}` || await paneAgentStatus(pane, runCommand) !== "blocked") return false;
   const enter = await runCommand(["herdr", "pane", "send-keys", pane, "Enter"]);
   return enter.exitCode === 0;
 }
@@ -790,6 +797,73 @@ async function pickModel(type) {
   return { ...ROUTES.cursorFallback, usage: u };
 }
 
+function paneWidth(lines) {
+  return lines.reduce((width, line) => Math.max(width, line.trimEnd().length), 0);
+}
+
+function fullWidthRule(line, width) {
+  const text = line.trim();
+  return /^[─━]+$/.test(text) && text.length >= 8 && text.length >= width;
+}
+
+function uiChrome(line, width) {
+  return /^\s*❯/.test(line)
+    || fullWidthRule(line, width)
+    || /(?:⚡|\([a-z-]+\)|\s)\s*[a-z][A-Za-z0-9._-]+:(?:low|medium|high|xhigh|minimal|off)\s*$/.test(line);
+}
+
+function contentAbovePrompt(lines) {
+  let prompt = lines.length - 1;
+  while (prompt >= 0 && !lines[prompt].trim()) prompt -= 1;
+  if (prompt < 0 || !/^\s*❯/.test(lines[prompt])) return null;
+  const width = paneWidth(lines);
+  let start = 0;
+  for (let index = prompt - 1; index >= 0; index -= 1) {
+    if (uiChrome(lines[index], width)) {
+      start = index + 1;
+      break;
+    }
+  }
+  const content = lines.slice(start, prompt).filter((line) => line.trim());
+  if (content.some((line) => /^[─━]+$/.test(line.trim()) && !fullWidthRule(line, width))) return null;
+  return { start, content };
+}
+
+function currentQuestionFrame(screenLines) {
+  const located = contentAbovePrompt(screenLines);
+  if (!located || !isQuestionStatusLine(located.content[0])) return null;
+  const body = located.content.slice(1);
+  if (body.some((line) => /^\s*(?:```|~~~|⏺|●|•|✻|Assistant:)/i.test(line))) return null;
+  if (screenLines.slice(0, located.start).filter((line) => /^\s*(?:```|~~~)/.test(line)).length % 2 !== 0) return null;
+  const questionText = body.map((line) => line.trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(-800);
+  return questionText ? { questionText } : null;
+}
+
+const PICKER_HEADER = /^\s*Select(?: a)? model\s*$/i;
+const PICKER_ROW = /^\s*(→)?\s*(\S+)\s+\[([^\]]+)\]\s*$/;
+
+export function activeModelPicker(screen) {
+  const located = contentAbovePrompt(String(screen).replace(/\r/g, "").split("\n"));
+  if (!located || !PICKER_HEADER.test(located.content[0] ?? "")) return null;
+  const rows = located.content.slice(1).map((line) => PICKER_ROW.exec(line));
+  if (!rows.length || rows.some((row) => !row)) return null;
+  const selected = rows.filter((row) => row[1]);
+  if (selected.length !== 1) return null;
+  return { model: selected[0][2], provider: selected[0][3] };
+}
+
+function pickerAlreadyOnScreen(before, picker) {
+  const previous = activeModelPicker(before);
+  if (previous?.model === picker.model && previous?.provider === picker.provider) return true;
+  const lines = String(before).replace(/\r/g, "").split("\n");
+  const hasHeader = lines.some((line) => PICKER_HEADER.test(line));
+  const hasRow = lines.some((line) => {
+    const row = PICKER_ROW.exec(line);
+    return row?.[2] === picker.model && row?.[3] === picker.provider;
+  });
+  return hasHeader && hasRow;
+}
+
 function promptLineContains(screen, text) {
   const input = String(screen).replace(/\r/g, "").split("\n").findLast((line) => /^\s*❯/.test(line));
   return Boolean(input?.includes(text));
@@ -849,8 +923,9 @@ export async function switchModel(pane, want, runCommand = executeSignalCommand,
     fleetError("MODEL_SWITCH_READ", `pane=${pane}`, `exit ${initial.exitCode}`);
     return `MODEL_SWITCH_FAILED ${pane} want=${want.provider}/${want.model} (pane read failed)`;
   }
-  const before = classify(initial.stdout).model;
-  if (before.startsWith(want.model)) return `MODEL_OK ${want.model}`;
+  const beforeScreen = initial.stdout;
+  const before = classify(beforeScreen).model;
+  if (before.split(":")[0] === want.model && (!want.thinking || before === `${want.model}:${want.thinking}`)) return `MODEL_OK ${want.model}`;
   const send = async (step, argv) => {
     try {
       const result = await runCommand(argv, AbortSignal.timeout(Math.max(1, deadline - Date.now())));
@@ -883,21 +958,34 @@ export async function switchModel(pane, want, runCommand = executeSignalCommand,
   if (!await send("submit-picker-command", ["herdr", "pane", "send-keys", pane, "Enter"])) {
     return failCleanly(commandFailure("picker submit"));
   }
-  if (!await wait((screen) => classify(screen).state === "model-picker")) {
+  const freshPicker = (screen) => {
+    const picker = activeModelPicker(screen);
+    if (!picker || pickerAlreadyOnScreen(beforeScreen, picker)) return null;
+    return picker;
+  };
+  if (!await wait((screen) => freshPicker(screen) !== null)) {
     return timeoutAndClean("catalog");
   }
+  const pickerStatus = async () => paneAgentStatus(pane, runCommand, AbortSignal.timeout(Math.max(1, deadline - Date.now())));
+  const holdForStatus = async (status) => failCleanly(`MODEL_SWITCH_HELD ${pane} agent_status=${status ?? "unknown"}`);
+  const openedStatus = await pickerStatus();
+  if (openedStatus !== "blocked" && openedStatus !== "idle") return holdForStatus(openedStatus);
   if (!await send("filter-model", ["herdr", "pane", "send-text", pane, want.model])) {
     return failCleanly(commandFailure("model filter"));
   }
-  const pick = await wait((screen) => screen.split(/\r?\n/).some((line) =>
-    line.includes(want.model) && line.includes(`[${want.provider}]`)));
+  const pick = await wait((screen) => {
+    const picker = freshPicker(screen);
+    return picker?.model === want.model && picker.provider === want.provider;
+  });
   if (!pick) {
     return timeoutAndClean("model-row");
   }
+  const selectStatus = await pickerStatus();
+  if (selectStatus !== "blocked" && selectStatus !== "idle") return holdForStatus(selectStatus);
   if (!await send("select-model", ["herdr", "pane", "send-keys", pane, "Enter"])) {
     return failCleanly(commandFailure("model selection"));
   }
-  let after = await wait((screen) => classify(screen).model.startsWith(want.model));
+  let after = await wait((screen) => classify(screen).model.split(":")[0] === want.model);
   if (!after) return timeoutAndClean("model-change");
   if (want.thinking && !classify(after).model.endsWith(`:${want.thinking}`)) {
     if (!await send("set-thinking", ["herdr", "pane", "send-text", pane, `/thinking ${want.thinking}`])) {
@@ -1135,15 +1223,18 @@ export function pairReviewReplies(requests, replies) {
 export function reviewStallDrafts(requests, replies, nowMs, alerted = new Set()) {
   const paired = pairReviewReplies(requests, replies);
   const drafts = [];
+  const nowMicros = BigInt(Math.round(nowMs * 1000));
   for (const request of requests) {
     const requestTs = String(request.ts ?? "");
-    const requestedAt = Math.floor(Number(requestTs) * 1000);
-    if (!isReviewRequest(request) || paired.has(requestTs) || !Number.isFinite(requestedAt)
-      || nowMs - requestedAt < REVIEW_STALL_MS || alerted.has(requestTs)) continue;
+    const timestamp = /^(\d+)(?:\.(\d{1,6}))?$/.exec(requestTs);
+    if (!isReviewRequest(request) || paired.has(requestTs) || !timestamp || alerted.has(requestTs)) continue;
+    const requestedAt = BigInt(timestamp[1]) * 1_000_000n + BigInt((timestamp[2] ?? "").padEnd(6, "0"));
+    const age = nowMicros - requestedAt;
+    if (age < BigInt(REVIEW_STALL_MS) * 1000n) continue;
     const channel = request.channel || SLACK_REVIEW_CHANNEL;
     const permalink = `https://app.slack.com/archives/${channel}/p${requestTs.replace(".", "")}`;
     const keys = reviewRequestKeys(request.text);
-    drafts.push(`FLEET_REVIEW_STALL_DRAFT owner=omonyang request=${permalink} request_ts=${requestTs} age=${Math.floor((nowMs - requestedAt) / 60000)}m keys=${keys.join(",") || "none"}`);
+    drafts.push(`FLEET_REVIEW_STALL_DRAFT owner=omonyang request=${permalink} request_ts=${requestTs} age=${age / 60_000_000n}m keys=${keys.join(",") || "none"}`);
     alerted.add(requestTs);
   }
   return drafts;
@@ -1629,13 +1720,13 @@ function claimPrLoopReviewPost(dbHandle, row) {
   return claimed ? token : null;
 }
 
-function buildPrLoopReviewRequest(repo, prNumber, url, head) {
+export function buildPrLoopReviewRequest(repo, prNumber, url, head) {
   const header = `서윤아, Cursor 검수 요청 ${repo}#${prNumber}`;
   const headLine = `head=${head}`;
   return {
     header,
     headLine,
-    text: [header, url, headLine, `[<@${REVIEW_RELAY_USER_ID}> 서윤]`].join("\n"),
+    text: [header, url, headLine, `[<@${CURSOR_USER_ID}> 서윤]`].join("\n"),
   };
 }
 
@@ -3262,6 +3353,7 @@ async function watch(intervalSec = 30) {
           readyHead: r.ready?.head ?? "",
           claimText: r.claimText ?? "",
           questionText: r.questionText ?? "",
+          questionActionable: r.questionActionable ?? false,
         });
         const previous = last.has(r.id) ? JSON.parse(last.get(r.id)) : null;
         if (!previous || last.get(r.id) !== sig) {
@@ -3313,24 +3405,30 @@ async function watch(intervalSec = 30) {
         }
         let retryQuestion = false;
         const questionChanged = r.id !== "omonyang" && r.state === "question"
-          && (!previous || previous.state !== "question" || r.questionText !== previous.questionText);
+          && (!previous || previous.state !== "question" || r.questionText !== previous.questionText
+            || r.questionActionable !== previous.questionActionable);
         if (questionChanged) {
           const taskKey = r.task || "-";
-          const policy = questionPolicy(r.questionText || "");
+          const policy = r.questionActionable ? questionPolicy(r.questionText || "") : null;
           if (policy) {
-            let answered = false;
-            try {
-              answered = await answerPaneQuestion(r.pane, r.questionText, policy.answer);
-            } catch (error) {
-              fleetError("AUTO_ANSWER", `cat=${r.id} task=${taskKey} policy=${policy.id}`, error);
-            }
-            if (answered) {
-              console.log(`FLEET_AUTO_ANSWER ${r.id} ${taskKey} policy=${policy.id}`);
-              console.log(`FLEET_QUESTION_ANSWERED ${r.id} ${taskKey} policy=${policy.id}`);
-              if (taskKey !== "-") log(taskKey, { ev: "question-auto-answer", policy: policy.id });
+            const agentStatus = await paneAgentStatus(r.pane);
+            if (agentStatus !== "blocked") {
+              console.log(`FLEET_QUESTION_HELD ${r.id} ${taskKey} policy=${policy.id} agent_status=${agentStatus ?? "unknown"}`);
             } else {
-              console.log(`FLEET_QUESTION_SEND_FAILED ${r.id} ${taskKey} policy=${policy.id}`);
-              retryQuestion = true;
+              let answered = false;
+              try {
+                answered = await answerPaneQuestion(r.pane, r.questionText, policy.answer);
+              } catch (error) {
+                fleetError("AUTO_ANSWER", `cat=${r.id} task=${taskKey} policy=${policy.id}`, error);
+              }
+              if (answered) {
+                console.log(`FLEET_AUTO_ANSWER ${r.id} ${taskKey} policy=${policy.id}`);
+                console.log(`FLEET_QUESTION_ANSWERED ${r.id} ${taskKey} policy=${policy.id}`);
+                if (taskKey !== "-") log(taskKey, { ev: "question-auto-answer", policy: policy.id });
+              } else {
+                console.log(`FLEET_QUESTION_SEND_FAILED ${r.id} ${taskKey} policy=${policy.id}`);
+                retryQuestion = true;
+              }
             }
           } else {
             const excerpt = (r.questionText || "unreadable").replace(/[\r\n\t]+/g, " ").replaceAll('"', "'").slice(0, 180);

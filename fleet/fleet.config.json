@@ -112,5 +112,9 @@
     "mergeMethods": {},
     "deploy": {}
   },
+  "usageWatch": {
+    "catIds": ["gajae"],
+    "orcaTerminals": ["term_8eac441f-f846-4a47-b602-1148570eda89"]
+  },
   "agentMessengerCredentialPath": "/home/jm/.nvm/versions/node/v24.19.0/lib/node_modules/agent-messenger/dist/src/platforms/slackbot/credential-manager.js"
 }
