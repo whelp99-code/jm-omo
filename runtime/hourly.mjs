@@ -7,6 +7,10 @@ import { loadFleetConfig } from '../fleet/config.mjs';
 export function agentMessengerIndexPath(env=process.env){
  return fileURLToPath(new URL('./index.js',pathToFileURL(loadFleetConfig(env).agentMessengerCredentialPath)));
 }
+export async function readHourlyCredentials(env=process.env){
+ const {SlackBotCredentialManager}=await import(agentMessengerIndexPath(env));
+ return new SlackBotCredentialManager().getCredentials();
+}
 export class Hourly {
  constructor(path){mkdirSync(dirname(path),{recursive:true,mode:0o700});this.db=new Database(path);this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS reports(slot INTEGER PRIMARY KEY, state TEXT NOT NULL, receipt TEXT, payload TEXT);');}
  seed(now){this.db.query("INSERT OR IGNORE INTO reports(slot,state) VALUES(?,'baseline')").run(Math.floor(now/3600000));}
@@ -33,8 +37,7 @@ if(import.meta.main&&!['--seed','--status','--preview'].some(flag=>process.argv.
   const text=buildHourlyText({now,bridge,states:reachable?lines.join(' · '):'세션 상태 조회 실패 — 확인 필요',...readDevelopmentStatus()});
   if(process.argv.includes('--preview')) console.log(text);
   else {
-   const {SlackBotCredentialManager}=await import(agentMessengerIndexPath());
-   const token=(await new SlackBotCredentialManager().getCredentials())?.token;
+   const token=(await readHourlyCredentials())?.token;
    if(!token)throw new Error('BOT_CREDENTIAL_UNAVAILABLE');
    const result=await report(store,now,text,async(body)=>{
     const response=await fetch('https://slack.com/api/chat.postMessage',{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:serializeReport(body),redirect:'error',signal:AbortSignal.timeout(10000)});

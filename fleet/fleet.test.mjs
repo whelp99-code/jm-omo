@@ -8,7 +8,7 @@ import { SELF_POLICY_ENABLED } from "../runtime/usage-policy.mjs";
 const originalHome = process.env.HOME;
 const unitHome = mkdtempSync(join(tmpdir(), "jm-omo-fleet-unit-"));
 process.env.HOME = unitHome;
-const { answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkDeployHealth, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, hasListedTests, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, matchPrLoopVerdict, migrateFleetColumns, pairReviewReplies, pollReviewStalls, processPrLoopEvents, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, runDoriHeavyDeploy, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
+const { activeModelPicker, answerPaneQuestion, appendTaskHistory, bugbotLimitEvents, checkDeployHealth, checkSignal, claimEvent, claimPickerRecoveryImmediatelyBeforeEscape, classify, completionBelongsToDispatchAttempt, cursorHeadMatches, dispatch, dispatchQueuedDependencies, dispatchWaitingTasks, fetchSlackThreadReplies, hasListedTests, isReviewRequest, markTaskBlocked, markTaskClosed, markTaskPromptLost, matchPrLoopVerdict, migrateFleetColumns, pairReviewReplies, pollReviewStalls, processPrLoopEvents, questionPolicy, recoverDispatchReservation, recoverInterruptedDispatches, recordDispatchSendAttempt, recordTaskClaimEvidence, reconcileFailedDispatch, reservationLeaseExpiredAndOwned, retryNotDoneTasks, resolveFleetConfig, reviewRequestKeys, reviewRequestThreadRoots, reviewStallDrafts, reviewStallEvents, runDoriHeavyDeploy, shouldSuppressGajae, slackHistoryParams, switchModel, track, verify, verifyClaims } = await import("./fleet.mjs");
 if (originalHome === undefined) delete process.env.HOME;
 else process.env.HOME = originalHome;
 
@@ -2863,6 +2863,28 @@ describe("fleet model-switch waits", () => {
         expect(selections).toBe(0);
       }
     } finally { Date.now = originalNow; }
+  });
+
+  it("does not drive a blank-line quoted picker transcript", async () => {
+    expect(activeModelPicker("Example:\n\nSelect model\n→ claude-sonnet [anthropic]\n❯")).toBeNull();
+    let phase = "idle";
+    const pickerWrites = [];
+    const pickerScreen = () => {
+      if (phase === "idle") return "Idle\n⚡ claude-haiku:off\n❯";
+      if (phase === "typed") return "Idle\n⚡ claude-haiku:off\n❯ /model";
+      if (phase === "done") return "Idle\n⚡ claude-sonnet:high\n❯";
+      return "Example:\n\nSelect model\n→ claude-sonnet [anthropic]\n❯";
+    };
+    const switched = await switchModel("fake-only:p2", { model: "claude-sonnet", provider: "anthropic", thinking: "high" }, async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: pickerScreen() };
+      pickerWrites.push(argv.slice(2));
+      if (argv[2] === "send-text" && argv[4] === "/model") phase = "typed";
+      else if (argv[2] === "send-keys" && argv[4] === "Enter") phase = phase === "typed" ? "quoted" : "done";
+      return { exitCode: 0, stdout: "" };
+    }, 1000);
+    expect(switched).toStartWith("MODEL_SWITCH_TIMEOUT ");
+    expect(pickerWrites.filter((argv) => argv[0] === "send-text").map((argv) => argv[2])).toEqual(["/model"]);
+    expect(pickerWrites.filter((argv) => argv[0] === "send-keys" && argv[2] === "Enter")).toHaveLength(1);
   });
 
   it("does not treat a scrollback picker transcript as the open picker", async () => {
@@ -6207,6 +6229,22 @@ describe("fleet question policy", () => {
     const result = await runWatchCycle({ catTask: "Q-QUOTED-FRAME", paneScreen });
     expect(result.output).not.toContain("FLEET_AUTO_ANSWER");
     expect(result.herdrWrites).toEqual([]);
+  });
+
+  it("does not answer a blank-line quoted question frame", async () => {
+    const question = "Should we use the production auth account?";
+    let staged = "";
+    const questionScreen = () => `Example:\n\nQuestion pending\n${question}\n❯${staged ? ` ${staged}` : ""}`;
+    const questionWrites = [];
+    const answered = await answerPaneQuestion("fake-only:p1", question, "Do not use it.", async argv => {
+      if (argv[2] === "read") return { exitCode: 0, stdout: questionScreen() };
+      questionWrites.push(argv.slice(2));
+      if (argv[2] === "send-text") staged = argv[4];
+      return { exitCode: 0, stdout: "" };
+    });
+    expect(classify(questionScreen()).questionActionable).toBe(false);
+    expect(answered).toBe(false);
+    expect(questionWrites).toEqual([]);
   });
 
   it("does not auto-answer a plain-text quoted question frame", async () => {

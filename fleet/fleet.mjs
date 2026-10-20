@@ -775,20 +775,31 @@ async function pickModel(type) {
   return { ...ROUTES.cursorFallback, usage: u };
 }
 
-function currentQuestionFrame(screenLines) {
-  const prompt = screenLines.findLastIndex((line) => /^\s*❯/.test(line));
+function uiChrome(line) {
+  return /^\s*❯/.test(line)
+    || /^\s*[─━]{3,}\s*$/.test(line)
+    || /(?:⚡|\([a-z-]+\)|\s)\s*[a-z][A-Za-z0-9._-]+:(?:low|medium|high|xhigh|minimal|off)\s*$/.test(line);
+}
+
+function contentAbovePrompt(lines) {
+  const prompt = lines.findLastIndex((line) => /^\s*❯/.test(line));
   if (prompt < 0) return null;
-  const frame = [];
+  let start = 0;
   for (let index = prompt - 1; index >= 0; index -= 1) {
-    const line = screenLines[index];
-    if (!line.trim() || /^\s*[─━]{3,}\s*$/.test(line) || /^\s*❯/.test(line)) break;
-    frame.unshift(line);
+    if (uiChrome(lines[index])) {
+      start = index + 1;
+      break;
+    }
   }
-  if (!isQuestionStatusLine(frame[0])) return null;
-  const body = frame.slice(1);
+  return { start, content: lines.slice(start, prompt).filter((line) => line.trim()) };
+}
+
+function currentQuestionFrame(screenLines) {
+  const located = contentAbovePrompt(screenLines);
+  if (!located || !isQuestionStatusLine(located.content[0])) return null;
+  const body = located.content.slice(1);
   if (body.some((line) => /^\s*(?:```|~~~|⏺|●|•|✻|Assistant:)/i.test(line))) return null;
-  const before = screenLines.slice(0, prompt - frame.length);
-  if (before.filter((line) => /^\s*(?:```|~~~)/.test(line)).length % 2 !== 0) return null;
+  if (screenLines.slice(0, located.start).filter((line) => /^\s*(?:```|~~~)/.test(line)).length % 2 !== 0) return null;
   const questionText = body.map((line) => line.trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(-800);
   return questionText ? { questionText } : null;
 }
@@ -797,17 +808,9 @@ const PICKER_HEADER = /^\s*Select(?: a)? model\s*$/i;
 const PICKER_ROW = /^\s*(→)?\s*(\S+)\s+\[([^\]]+)\]\s*$/;
 
 export function activeModelPicker(screen) {
-  const lines = String(screen).replace(/\r/g, "").split("\n");
-  const prompt = lines.findLastIndex((line) => /^\s*❯/.test(line));
-  if (prompt < 0) return null;
-  const frame = [];
-  for (let index = prompt - 1; index >= 0; index -= 1) {
-    const line = lines[index];
-    if (!line.trim()) break;
-    frame.unshift(line);
-  }
-  if (!PICKER_HEADER.test(frame[0] ?? "")) return null;
-  const rows = frame.slice(1).map((line) => PICKER_ROW.exec(line));
+  const located = contentAbovePrompt(String(screen).replace(/\r/g, "").split("\n"));
+  if (!located || !PICKER_HEADER.test(located.content[0] ?? "")) return null;
+  const rows = located.content.slice(1).map((line) => PICKER_ROW.exec(line));
   if (!rows.length || rows.some((row) => !row)) return null;
   const selected = rows.filter((row) => row[1]);
   if (selected.length !== 1) return null;

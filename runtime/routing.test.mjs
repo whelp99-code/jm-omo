@@ -44,14 +44,32 @@ describe("shared runtime routing configuration", () => {
     expect(result.calls).not.toContain("herdr pane read w2:p1");
   });
 
-  it("resolves the hourly credential manager beside the configured path", async () => {
+  it("imports hourly credentials from the configured SDK module", async () => {
+    const home = mkdtempSync(join(tmpdir(), "jmomo-hourly-import-"));
+    const log = join(home, "import.log");
+    const credential = join(home, "override/credential-manager.js");
     const source = new URL("./hourly.mjs", import.meta.url).href;
-    const hourly = fileURLToPath(new URL("./hourly.mjs", import.meta.url));
-    const result = await runRouting(["--eval", `const {agentMessengerIndexPath}=await import(${JSON.stringify(source)}); console.log(agentMessengerIndexPath());`],
-      { FLEET_AGENT_MESSENGER_CREDENTIAL_PATH: "/task/owned/credential-manager.js" });
-    expect(result.stdout.trim()).toBe("/task/owned/index.js");
-    expect(readFileSync(hourly, "utf8")).not.toContain("/home/jm/.nvm/versions/node/v24.19.0/lib/node_modules/agent-messenger");
-    expect(readFileSync(hourly, "utf8")).toContain("import(agentMessengerIndexPath())");
+    let child;
+    try {
+      child = Bun.spawn([process.execPath, "--preload", fileURLToPath(new URL("./fixtures/hourly-credential-preload.mjs", import.meta.url)),
+        "--eval", `const {readHourlyCredentials}=await import(${JSON.stringify(source)}); const creds=await readHourlyCredentials(); console.log(creds?.marker ?? "missing");`], {
+        env: { ...process.env, HOME: home, HOURLY_IMPORT_LOG: log, FLEET_AGENT_MESSENGER_CREDENTIAL_PATH: credential },
+        stdout: "pipe", stderr: "pipe", signal: AbortSignal.timeout(5_000),
+      });
+      const [exit, stdout, stderr] = await Promise.all([
+        child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+      ]);
+      expect(exit).toBe(0, stderr);
+      expect(stdout.trim()).toBe("override-import");
+      const imported = readFileSync(log, "utf8");
+      expect(imported).toContain(`override-import ${join(home, "override/index.js")}`);
+      expect(imported).not.toContain("default ");
+      expect(imported).not.toContain("v24.19.0");
+    } finally {
+      if (child && child.exitCode === null) { child.kill("SIGKILL"); await child.exited; }
+      rmSync(home, { recursive: true, force: true });
+      expect(existsSync(home)).toBe(false);
+    }
   });
 
   it("mentions the configured Cursor user in review requests", async () => {
