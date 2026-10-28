@@ -1,7 +1,17 @@
 #!/usr/bin/env bun
 // Limited recovery decisions for the existing watchdog. No live restart, timer, or Slack write.
 
-import { markAttempt, openRecoveryStore, readAttempt, reserveAttempt } from "./fleet-recovery-store.mjs";
+import { markAttempt, openRecoveryStore, readAttempt, reserveScope } from "./fleet-recovery-store.mjs";
+export function botKey(observation) {
+  if (!observation?.role || !observation.owner || !observation.session || !observation.generation) return null;
+  return JSON.stringify([observation.role, observation.owner, observation.session, observation.generation]);
+}
+
+const SAFE_PART = /^[A-Za-z0-9_.:|-]{1,160}$/;
+export function sharedKey(observation) {
+  if (observation?.sharedDependency !== true || !SAFE_PART.test(String(observation.cause ?? ""))) return null;
+  return JSON.stringify(["shared", observation.cause]);
+}
 export { openRecoveryStore };
 export const ROLES = ["dinobot", "gajaegun", "omonyang", "dori", "nahee", "seoyun", "cursor", "shared"];
 export const COOLDOWN_MS = 600_000;
@@ -26,7 +36,6 @@ export function supportMatrix() {
   });
 }
 
-const SAFE_PART = /^[A-Za-z0-9_.:|-]{1,160}$/;
 
 export function incidentKey(observation) {
   const parts = [observation?.role, observation?.owner, observation?.session, observation?.generation, observation?.cause];
@@ -148,14 +157,17 @@ export function evaluate(store, observation, nowMs, effects = {}) {
     incident.delivery = "unknown";
     commit(store, key, incident);
     const effect = decision.action === "reconnect_once" ? effects.reconnect : effects.notify;
+    if (typeof effect !== "function") {
+      incident.delivery = "not_dispatched";
+      incident.effectError = "adapter_absent";
+      incident.state = "ESCALATED";
+      commit(store, key, incident);
+      return { state: incident.state, reason: "adapter_absent", effects: counts, incident };
+    }
     let outcome = "failure";
     try {
-      const result = effect?.(observation);
-      if (result && typeof result.then === "function") {
-        outcome = "unknown";
-      } else {
-        outcome = "delivered";
-      }
+      const result = effect(observation);
+      outcome = result && typeof result.then === "function" ? "unknown" : "delivered";
     } catch {
       outcome = "failure";
     }
@@ -209,21 +221,32 @@ export function productionCallCount(sourceText) {
 }
 export function evaluateDurable(db, observation, nowMs, effects = {}) {
   const decision = classifyRole(observation, nowMs);
-  const key = incidentKey(observation);
-  if (!key || !db) return { state: "UNKNOWN", reason: "invalid_observation", reserved: false };
+  const key = parentKey(observation);
+  const bot = botKey(observation);
+  const shared = sharedKey(observation);
+  if (!key || !bot || !db) return { state: "UNKNOWN", reason: "invalid_observation", reserved: false, calls: 0 };
   if (decision.action !== "reconnect_once" && decision.action !== "notify" && decision.action !== "notify_parent") {
-    return { state: decision.state, reason: decision.reason, reserved: false };
+    return { state: decision.state, reason: decision.reason, reserved: false, calls: 0 };
   }
-  if (!reserveAttempt(db, key, nowMs)) return { state: "ESCALATED", reason: "attempt_reserved", reserved: false };
+  if (!reserveScope(db, key, shared ? null : bot, shared, nowMs)) {
+    return { state: "ESCALATED", reason: "attempt_reserved", reserved: false, calls: 0 };
+  }
+  const effect = decision.action === "reconnect_once" ? effects.reconnect : effects.notify;
+  if (typeof effect !== "function") {
+    markAttempt(db, key, "not_dispatched");
+    return { state: "ESCALATED", reason: "adapter_absent", reserved: true, calls: 0 };
+  }
   let outcome = "failure";
+  let calls = 0;
   try {
-    const effect = decision.action === "reconnect_once" ? effects.reconnect : effects.notify;
-    const result = effect?.(observation);
+    const result = effect(observation);
+    calls = 1;
     outcome = result && typeof result.then === "function" ? "unknown" : "delivered";
   } catch {
+    calls = 1;
     outcome = "failure";
   }
   const state = decision.action === "reconnect_once" && outcome === "delivered" ? "RECOVERY_REQUESTED" : "ESCALATED";
-  markAttempt(db, key, outcome === "failure" ? "failure" : state);
-  return { state, reason: outcome, reserved: true, attempts: readAttempt(db, key)?.attempts ?? 0 };
+  markAttempt(db, key, outcome === "delivered" ? state : outcome);
+  return { state, reason: outcome, reserved: true, calls, attempts: readAttempt(db, key)?.attempts ?? 0 };
 }

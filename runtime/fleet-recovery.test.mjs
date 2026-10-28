@@ -60,9 +60,9 @@ describe("fleet recovery fixture", () => {
 
   test("6 two workers lock one incident action", () => {
     const store = { incidents: {}, locks: {} };
-    const first = run({ receiverDown: true, officialReconnect: true }, store);
+    const first = run({ receiverDown: true, officialReconnect: true }, store, { reconnect() {} });
     delete store.incidents[incidentKey(obs())];
-    const second = evaluate(store, obs({ receiverDown: true, officialReconnect: true }), NOW);
+    const second = evaluate(store, obs({ receiverDown: true, officialReconnect: true }), NOW, { reconnect() {} });
     expect(first.effects.reconnect).toBe(1);
     expect(second.reason).toBe("incident_locked");
     expect(second.effects.reconnect).toBe(0);
@@ -180,6 +180,30 @@ describe("fleet recovery fixture", () => {
     expect(second.reserved).toBe(false);
     expect(second.reason).toBe("attempt_reserved");
     db.close();
+  });
+  test("omo counterexamples keep absent adapters and shared budgets at zero extra calls", () => {
+    const absent = evaluate({ incidents: Object.create(null), locks: Object.create(null) }, obs({ receiverDown: true, officialReconnect: true }), NOW);
+    expect(absent.state).toBe("ESCALATED");
+    expect(absent.reason).toBe("adapter_absent");
+    expect(absent.effects.reconnect).toBe(0);
+    expect(absent.incident.delivery).toBe("not_dispatched");
+    const dir = mkdtempSync(join(tmpdir(), "omo-counter-"));
+    const database = openRecoveryStore(join(dir, "budget.sqlite"));
+    let calls = 0;
+    const first = evaluateDurable(database, obs({ cause: "receiver-a", receiverDown: true, officialReconnect: true }), NOW, { reconnect() { calls += 1; } });
+    const second = evaluateDurable(database, obs({ cause: "receiver-b", receiverDown: true, officialReconnect: true }), NOW, { reconnect() { calls += 1; } });
+    expect(first.calls).toBe(1);
+    expect(second.calls).toBe(0);
+    expect(second.reason).toBe("attempt_reserved");
+    expect(calls).toBe(1);
+    const sharedDb = openRecoveryStore(join(dir, "shared.sqlite"));
+    let notices = 0;
+    const dori = evaluateDurable(sharedDb, obs({ role: "dori", sharedDependency: true, cause: "slack" }), NOW, { notify() { notices += 1; } });
+    const gajae = evaluateDurable(sharedDb, obs({ role: "gajaegun", sharedDependency: true, cause: "slack" }), NOW, { notify() { notices += 1; } });
+    expect(dori.calls + gajae.calls).toBe(1);
+    expect(notices).toBe(1);
+    database.close();
+    sharedDb.close();
   });
 
   test("production module has no live effect calls", () => {

@@ -15,6 +15,19 @@ export function openRecoveryStore(path) {
   )`);
   return db;
 }
+export function reserveScope(db, key, botKey, sharedKey, nowMs) {
+  const run = db.transaction(() => {
+    const incident = db.query("SELECT attempts FROM recovery_budget WHERE incident_key = ?").get(key);
+    const bot = botKey ? db.query("SELECT attempts FROM recovery_budget WHERE incident_key = ?").get(botKey) : null;
+    const shared = sharedKey ? db.query("SELECT attempts FROM recovery_budget WHERE incident_key = ?").get(sharedKey) : null;
+    if ((incident && incident.attempts >= 1) || (bot && bot.attempts >= 1) || (shared && shared.attempts >= 1)) return false;
+    for (const scope of [key, botKey, sharedKey].filter(Boolean)) {
+      db.query("INSERT INTO recovery_budget (incident_key, attempts, state, last_at) VALUES (?, 1, 'reserved', ?)").run(scope, nowMs);
+    }
+    return true;
+  });
+  return run.immediate();
+}
 
 export function reserveAttempt(db, key, nowMs) {
   const run = db.transaction(() => {
