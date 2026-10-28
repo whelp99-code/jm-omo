@@ -19,29 +19,13 @@ export function openStageStore(path, nowMs = Date.now()) {
     db.exec("PRAGMA foreign_keys=ON");
     const fk = db.query("PRAGMA foreign_keys").get();
     if (fk?.foreign_keys !== 1) return closed(db, "schema_failed");
+    const userTables = db.query("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
+    if (userTables.length === 0) return initializeSchema(db, nowMs, started);
+    const meta = userTables.find((table) => table.name === "meta");
+    if (!meta || meta.sql !== "CREATE TABLE meta (schema_version INTEGER PRIMARY KEY)") return closed(db, "unsupported_schema");
     const versions = db.query("SELECT schema_version FROM meta ORDER BY schema_version").all();
-    if (versions.length === 0) return initializeSchema(db, nowMs, started);
     if (versions.length !== 1 || versions[0].schema_version !== 1) return closed(db, "unsupported_schema");
     return { ok: true, db, budgetMs: DB_BUDGET_MS, openedAt: nowMs };
-  } catch (error) {
-    if (db) {
-      try { db.close(); } catch { /* already closed */ }
-    }
-    if (error instanceof Error && /no such table/i.test(error.message)) {
-      return openEmptySchema(path, nowMs, started);
-    }
-    return { ok: false, reason: /busy/i.test(String(error)) ? "busy" : "schema_failed" };
-  }
-}
-
-function openEmptySchema(path, nowMs, started) {
-  let db;
-  try {
-    db = new Database(path);
-    db.exec(`PRAGMA busy_timeout=${DB_BUDGET_MS}`);
-    db.exec("PRAGMA foreign_keys=ON");
-    if (db.query("PRAGMA foreign_keys").get()?.foreign_keys !== 1) return closed(db, "schema_failed");
-    return initializeSchema(db, nowMs, started);
   } catch (error) {
     if (db) {
       try { db.close(); } catch { /* already closed */ }
@@ -51,24 +35,34 @@ function openEmptySchema(path, nowMs, started) {
 }
 
 function initializeSchema(db, nowMs, started) {
-  db.exec(`CREATE TABLE IF NOT EXISTS meta (schema_version INTEGER PRIMARY KEY);
-      CREATE TABLE IF NOT EXISTS incidents (
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const existing = db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
+    if (existing.length !== 0) {
+      db.exec("ROLLBACK");
+      return closed(db, "unsupported_schema");
+    }
+    db.exec(`CREATE TABLE meta (schema_version INTEGER PRIMARY KEY);
+      CREATE TABLE incidents (
         id TEXT PRIMARY KEY, scope_kind TEXT NOT NULL, scope_key TEXT NOT NULL,
         qstate TEXT NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER,
         revision INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS aliases (
+      CREATE TABLE aliases (
         observation_key TEXT PRIMARY KEY, incident_id TEXT NOT NULL REFERENCES incidents(id));
-      CREATE TABLE IF NOT EXISTS bot_locks (
+      CREATE TABLE bot_locks (
         bot_key TEXT PRIMARY KEY, incident_id TEXT NOT NULL REFERENCES incidents(id), held_generation TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS attempts (
+      CREATE TABLE attempts (
         incident_id TEXT NOT NULL REFERENCES incidents(id), kind TEXT NOT NULL,
         phase TEXT NOT NULL, budget_used INTEGER NOT NULL, outcome TEXT NOT NULL,
         opened_at INTEGER NOT NULL, PRIMARY KEY (incident_id, kind));
-      CREATE TABLE IF NOT EXISTS target_history (
+      CREATE TABLE target_history (
         bot_key TEXT PRIMARY KEY, last_incident_id TEXT NOT NULL REFERENCES incidents(id), last_at INTEGER NOT NULL);`);
-  db.query("INSERT OR IGNORE INTO meta (schema_version) VALUES (1)").run();
-  const versions = db.query("SELECT schema_version FROM meta ORDER BY schema_version").all();
-  if (versions.length !== 1 || versions[0].schema_version !== 1) return closed(db, "unsupported_schema");
+    db.query("INSERT INTO meta (schema_version) VALUES (1)").run();
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* not open */ }
+    return closed(db, /busy/i.test(String(error)) ? "busy" : "schema_failed");
+  }
   if (Date.now() - started > DB_BUDGET_MS) return closed(db, "busy");
   return { ok: true, db, budgetMs: DB_BUDGET_MS, openedAt: nowMs };
 }
