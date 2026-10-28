@@ -18,7 +18,7 @@ describe("stage A durable reducer", () => {
     const opened = db();
     expect(opened.ok).toBe(true);
     const first = transition(opened.db, base);
-    const second = transition(opened.db, { ...base, observationKey: '["dori","o","s","g2","other"]', generation: "g2", independentEpisode: false });
+    const second = transition(opened.db, { ...base, observationKey: '["dori","o","s","g","other"]', independentEpisode: false });
     expect(first.reserved).toBe(true);
     expect(second.reserved).toBe(false);
     expect(second.reason).toBe("budget_used");

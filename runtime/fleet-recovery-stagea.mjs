@@ -83,7 +83,7 @@ function canonicalTuple(value, size) {
 }
 
 function invalidCommand(command) {
-  if (!command || typeof command !== "object" || Array.isArray(command)) return "untrusted_clock";
+  if (command == null || typeof command !== "object" || Array.isArray(command)) return "invalid_command";
   if (command.trustedClock !== true) return "untrusted_clock";
   const observation = canonicalTuple(command.observationKey, 5);
   const bot = canonicalTuple(command.botKey, 3);
@@ -95,6 +95,11 @@ function invalidCommand(command) {
   if (!Number.isSafeInteger(command.nowMs) || command.nowMs < 0) return "invalid_command";
   return null;
 }
+function storedScope(lock, db) {
+  if (!lock) return null;
+  return db.query("SELECT scope_kind FROM incidents WHERE id = ?").get(lock.incident_id)?.scope_kind ?? null;
+}
+
 
 
 export function transition(db, command) {
@@ -103,11 +108,21 @@ export function transition(db, command) {
   const run = db.transaction(() => {
     const alias = db.query("SELECT incident_id FROM aliases WHERE observation_key = ?").get(command.observationKey);
     const lock = db.query("SELECT incident_id FROM bot_locks WHERE bot_key = ?").get(command.botKey);
-    const shared = command.sharedKey
-      ? db.query("SELECT id FROM incidents WHERE scope_kind = 'shared' AND scope_key = ? AND closed_at IS NULL").get(command.sharedKey)
+    const supplied = command.sharedKey
+      ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE scope_kind = 'shared' AND scope_key = ? AND closed_at IS NULL").get(command.sharedKey)
       : null;
-    const incidentId = alias?.incident_id ?? shared?.id ?? lock?.incident_id ?? null;
+    if (alias && lock && alias.incident_id !== lock.incident_id) return { ok: false, reason: "store_invalid" };
+    if (alias && supplied && alias.incident_id !== supplied.id) return { ok: false, reason: "identity_mismatch" };
+    const incidentId = alias?.incident_id ?? supplied?.id ?? (storedScope(lock, db) === "shared" ? null : lock?.incident_id) ?? null;
     if (!incidentId && command.independentEpisode !== true) return { ok: false, reason: "missing_independence_evidence" };
+    const stored = incidentId
+      ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId)
+      : null;
+    if (incidentId && !stored) return { ok: false, reason: "store_invalid" };
+    if (stored?.scope_kind === "bot" && stored.scope_key !== command.botKey) return { ok: false, reason: "identity_mismatch" };
+    if (stored?.scope_kind === "shared" && command.sharedKey && stored.scope_key !== command.sharedKey) return { ok: false, reason: "identity_mismatch" };
+    if (stored?.scope_kind === "shared" && command.kind === "recovery") return { ok: false, reason: "shared_dependency" };
+    if (lock && stored && lock.incident_id !== stored.id) return { ok: false, reason: "store_invalid" };
     const id = incidentId ?? `ep-${command.observationKey}`;
     if (!incidentId) {
       db.query("INSERT INTO incidents (id, scope_kind, scope_key, qstate, opened_at, closed_at, revision) VALUES (?, ?, ?, 'UNKNOWN', ?, NULL, 1)")
