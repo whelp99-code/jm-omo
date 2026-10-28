@@ -11,12 +11,47 @@ export function openStageStore(path, nowMs = Date.now()) {
   if (typeof path !== "string" || FORBIDDEN.some((prefix) => path.startsWith(prefix))) {
     return { ok: false, reason: "native_db_refused" };
   }
+  let db;
   try {
-    const db = new Database(path);
+    db = new Database(path);
     db.exec(`PRAGMA busy_timeout=${DB_BUDGET_MS}`);
     if (Date.now() - started > DB_BUDGET_MS) return closed(db, "busy");
-    db.exec("PRAGMA journal_mode=WAL");
-    db.exec(`CREATE TABLE IF NOT EXISTS meta (schema_version INTEGER PRIMARY KEY);
+    db.exec("PRAGMA foreign_keys=ON");
+    const fk = db.query("PRAGMA foreign_keys").get();
+    if (fk?.foreign_keys !== 1) return closed(db, "schema_failed");
+    const versions = db.query("SELECT schema_version FROM meta ORDER BY schema_version").all();
+    if (versions.length === 0) return initializeSchema(db, nowMs, started);
+    if (versions.length !== 1 || versions[0].schema_version !== 1) return closed(db, "unsupported_schema");
+    return { ok: true, db, budgetMs: DB_BUDGET_MS, openedAt: nowMs };
+  } catch (error) {
+    if (db) {
+      try { db.close(); } catch { /* already closed */ }
+    }
+    if (error instanceof Error && /no such table/i.test(error.message)) {
+      return openEmptySchema(path, nowMs, started);
+    }
+    return { ok: false, reason: /busy/i.test(String(error)) ? "busy" : "schema_failed" };
+  }
+}
+
+function openEmptySchema(path, nowMs, started) {
+  let db;
+  try {
+    db = new Database(path);
+    db.exec(`PRAGMA busy_timeout=${DB_BUDGET_MS}`);
+    db.exec("PRAGMA foreign_keys=ON");
+    if (db.query("PRAGMA foreign_keys").get()?.foreign_keys !== 1) return closed(db, "schema_failed");
+    return initializeSchema(db, nowMs, started);
+  } catch (error) {
+    if (db) {
+      try { db.close(); } catch { /* already closed */ }
+    }
+    return { ok: false, reason: /busy/i.test(String(error)) ? "busy" : "schema_failed" };
+  }
+}
+
+function initializeSchema(db, nowMs, started) {
+  db.exec(`CREATE TABLE IF NOT EXISTS meta (schema_version INTEGER PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS incidents (
         id TEXT PRIMARY KEY, scope_kind TEXT NOT NULL, scope_key TEXT NOT NULL,
         qstate TEXT NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER,
@@ -31,12 +66,11 @@ export function openStageStore(path, nowMs = Date.now()) {
         opened_at INTEGER NOT NULL, PRIMARY KEY (incident_id, kind));
       CREATE TABLE IF NOT EXISTS target_history (
         bot_key TEXT PRIMARY KEY, last_incident_id TEXT NOT NULL REFERENCES incidents(id), last_at INTEGER NOT NULL);`);
-    db.query("INSERT OR IGNORE INTO meta (schema_version) VALUES (1)").run();
-    if (Date.now() - started > DB_BUDGET_MS) return closed(db, "busy");
-    return { ok: true, db, budgetMs: DB_BUDGET_MS, openedAt: nowMs };
-  } catch (error) {
-    return { ok: false, reason: /busy/i.test(String(error)) ? "busy" : "schema_failed" };
-  }
+  db.query("INSERT OR IGNORE INTO meta (schema_version) VALUES (1)").run();
+  const versions = db.query("SELECT schema_version FROM meta ORDER BY schema_version").all();
+  if (versions.length !== 1 || versions[0].schema_version !== 1) return closed(db, "unsupported_schema");
+  if (Date.now() - started > DB_BUDGET_MS) return closed(db, "busy");
+  return { ok: true, db, budgetMs: DB_BUDGET_MS, openedAt: nowMs };
 }
 
 function closed(db, reason) {
