@@ -128,7 +128,7 @@ export function transition(db, command) {
     if (lockParent && supplied && lockParent.id !== supplied.id) return { ok: false, reason: "store_invalid" };
     const history = db.query("SELECT bot_key, last_incident_id, last_at FROM target_history WHERE bot_key = ?").get(command.botKey);
     const historical = history ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(history.last_incident_id) : null;
-    if (history && (!historical || storedScopeValid(historical, command))) return { ok: false, reason: "store_invalid" };
+    if (history && (!historical || storedScopeValid(historical, command) === "store_invalid")) return { ok: false, reason: "store_invalid" };
     const referenced = [alias?.incident_id, supplied?.id, lock?.incident_id, history?.last_incident_id].filter(Boolean);
     if (new Set(referenced).size > 1) return { ok: false, reason: "store_invalid" };
     const incidentId = referenced[0] ?? null;
