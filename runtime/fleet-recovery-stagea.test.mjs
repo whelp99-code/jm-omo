@@ -27,8 +27,8 @@ describe("stage A durable reducer", () => {
 
   test("shared dependency ignores role", () => {
     const opened = db();
-    const first = transition(opened.db, { ...base, sharedKey: "slack" });
-    const second = transition(opened.db, { ...base, role: "dinobot", observationKey: '["dinobot","o","s","g","slack"]', botKey: '["dinobot","o","runtime-2"]', sharedKey: "slack", independentEpisode: false });
+    const first = transition(opened.db, { ...base, sharedKey: '["slack","tenant","dependency"]' });
+    const second = transition(opened.db, { ...base, role: "dinobot", observationKey: '["dinobot","o","s","g","slack"]', botKey: '["dinobot","o","runtime-2"]', sharedKey: '["slack","tenant","dependency"]', independentEpisode: false });
     expect(first.incidentId).toBe(second.incidentId);
     expect(second.reserved).toBe(false);
     opened.db.close();

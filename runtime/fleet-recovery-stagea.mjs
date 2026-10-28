@@ -71,10 +71,35 @@ function closed(db, reason) {
   db.close();
   return { ok: false, reason };
 }
+const COMMAND_ROLES = new Set(["dinobot", "gajaegun", "omonyang", "dori", "nahee", "seoyun", "cursor"]);
+
+function canonicalTuple(value, size) {
+  if (typeof value !== "string") return null;
+  let parsed;
+  try { parsed = JSON.parse(value); } catch { return null; }
+  if (!Array.isArray(parsed) || parsed.length !== size || JSON.stringify(parsed) !== value) return null;
+  if (!parsed.every((part) => typeof part === "string" && part.length >= 1 && part.length <= 160)) return null;
+  return parsed;
+}
+
+function invalidCommand(command) {
+  if (!command || typeof command !== "object" || Array.isArray(command)) return "untrusted_clock";
+  if (command.trustedClock !== true) return "untrusted_clock";
+  const observation = canonicalTuple(command.observationKey, 5);
+  const bot = canonicalTuple(command.botKey, 3);
+  const shared = command.sharedKey == null ? null : canonicalTuple(command.sharedKey, 3);
+  if (!observation || !bot || (command.sharedKey != null && !shared)) return "invalid_command";
+  if (!COMMAND_ROLES.has(observation[0]) || observation[0] !== bot[0] || observation[1] !== bot[1]) return "invalid_command";
+  if (command.generation !== observation[3]) return "invalid_command";
+  if (command.kind !== "recovery" && command.kind !== "notification") return "invalid_command";
+  if (!Number.isSafeInteger(command.nowMs) || command.nowMs < 0) return "invalid_command";
+  return null;
+}
+
 
 export function transition(db, command) {
-  if (!command || command.trustedClock !== true || !Number.isFinite(command.nowMs)) return { ok: false, reason: "untrusted_clock" };
-  if (!command.observationKey || !command.botKey || !command.generation) return { ok: false, reason: "missing_identity" };
+  const rejected = invalidCommand(command);
+  if (rejected) return { ok: false, reason: rejected };
   const run = db.transaction(() => {
     const alias = db.query("SELECT incident_id FROM aliases WHERE observation_key = ?").get(command.observationKey);
     const lock = db.query("SELECT incident_id FROM bot_locks WHERE bot_key = ?").get(command.botKey);
