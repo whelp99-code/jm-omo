@@ -1,6 +1,9 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
-import { evaluate, incidentKey, loadStore, productionCallCount, recovered, supportMatrix } from "./fleet-recovery.mjs";
+import { evaluate, evaluateDurable, incidentKey, loadStore, openRecoveryStore, productionCallCount, recovered, supportMatrix } from "./fleet-recovery.mjs";
 
 const NOW = Date.parse("2026-10-29T01:00:00.000Z");
 const WINDOW = {
@@ -75,7 +78,8 @@ describe("fleet recovery fixture", () => {
 
   test("8 restarted watcher restores dedup", () => {
     const saved = incidentKey(obs());
-    const text = JSON.stringify({ incidents: { [saved]: { key: saved, state: "RECOVERY_REQUESTED", budgetUsed: true, lastAt: NOW, notifications: 1 } }, locks: {} });
+    const record = { key: saved, state: "RECOVERY_REQUESTED", budgetUsed: true, lastAt: NOW, notifications: 1, attempts: 1 };
+    const text = JSON.stringify({ incidents: { [saved]: record }, locks: {} });
     const store = loadStore(text);
     expect(run({ receiverDown: true, officialReconnect: true }, store).effects.reconnect).toBe(0);
     expect(store.incidents[saved].budgetUsed).toBe(true);
@@ -90,11 +94,15 @@ describe("fleet recovery fixture", () => {
   });
 
   test("10 and 11 reply proof is exact", () => {
-    expect(recovered({
-      inputId: "a", replyInputId: "a", session: "s", replySession: "s", generation: "g", replyGeneration: "g",
-      provider: "p", replyProvider: "p", model: "m", replyModel: "m", replyId: "r", threadReread: true, expectedAccount: true, inference: true,
-    })).toBe(true);
-    expect(recovered({ ack: true, inputId: "a", replyInputId: "a", session: "s", replySession: "s", generation: "g", replyGeneration: "g", provider: "p", replyProvider: "p", model: "m", replyModel: "m", replyId: "r", threadReread: true, expectedAccount: true, inference: true })).toBe(false);
+    const proof = {
+      inputId: "a", actualInputId: "a", session: "s", actualSession: "s", generation: "g", actualGeneration: "g",
+      provider: "p", actualProvider: "p", model: "m", actualModel: "m", expectedAccountId: "acc", actualAccountId: "acc",
+      expectedThreadId: "th", actualThreadId: "th", expectedReplyId: "r", actualReplyId: "r", threadReread: true, inference: true,
+    };
+    expect(recovered(proof)).toBe(true);
+    expect(recovered({ ...proof, actualReplyId: "" })).toBe(false);
+    expect(recovered({ ...proof, actualAccountId: "other" })).toBe(false);
+    expect(recovered({ ...proof, ack: true })).toBe(false);
     expect(recovered({ pong: true })).toBe(false);
     expect(recovered({ globalMax: true })).toBe(false);
     expect(run({ replyUnlinked: true }).state).toBe("VERIFYING");
@@ -126,10 +134,10 @@ describe("fleet recovery fixture", () => {
 
   test("16 missing heartbeat is unsupported and notification failure is not recovery", () => {
     const matrix = supportMatrix();
-    expect(matrix.find((item) => item.role === "seoyun").reason).toBe("no_verified_remote_api");
+    expect(matrix.find((item) => item.role === "seoyun").reason).toBe("remote_api_unverified");
     const result = run({ authExpired: true });
     expect(result.state).not.toBe("RECOVERED");
-    expect(recovered(null)).toBe(false);
+    expect(supportMatrix().find((item) => item.role === "seoyun").reason).toBe("remote_api_unverified");
   });
   test("diagnostics v2 counterexamples stay closed", () => {
     const nan = evaluate({ incidents: Object.create(null), locks: Object.create(null) }, obs({ receiverDown: true, officialReconnect: true }), Number.NaN);
@@ -140,7 +148,10 @@ describe("fleet recovery fixture", () => {
     const crashing = { incidents: Object.create(null), locks: Object.create(null), commits: [], commit(text) { this.commits.push(text); } };
     const crashed = run({ receiverDown: true, officialReconnect: true }, crashing, { reconnect() { throw new Error("down"); } });
     expect(crashed.reason).toBe("effect_failed");
-    const reloaded = loadStore(crashing.commits[0]);
+    const saved = JSON.parse(crashing.commits[0]);
+    const key = incidentKey(obs());
+    saved.incidents[key] = { ...saved.incidents[key], key, state: "ESCALATED", lastAt: NOW, attempts: 1 };
+    const reloaded = loadStore(JSON.stringify(saved));
     expect(run({ receiverDown: true, officialReconnect: true }, reloaded).effects.reconnect).toBe(0);
     const notices = { incidents: Object.create(null), locks: Object.create(null) };
     expect(run({ authExpired: true }, notices, { notify() {} }).effects.notify).toBe(1);
@@ -148,6 +159,27 @@ describe("fleet recovery fixture", () => {
     expect(() => loadStore(JSON.stringify({ incidents: [], locks: {} }))).toThrow();
     expect(incidentKey(obs({ owner: "a|b" }))).not.toBe(incidentKey(obs({ owner: "a", session: "b|s1" })));
     expect(recovered({ inputId: "a", replyInputId: "b", session: "s", replySession: "s", generation: "g", replyGeneration: "g", provider: "p", replyProvider: "p", model: null, replyModel: null, replyId: "r", threadReread: true, expectedAccount: true, inference: true })).toBe(false);
+  });
+  test("final repair reserves one notify attempt and rejects bad records", () => {
+    const failing = { incidents: Object.create(null), locks: Object.create(null) };
+    let tries = 0;
+    for (let i = 0; i < 3; i += 1) {
+      run({ authExpired: true }, failing, { notify() { tries += 1; throw new Error("down"); } });
+    }
+    expect(tries).toBe(1);
+    expect(run({ authExpired: true }, { incidents: Object.create(null), locks: Object.create(null) }).state).toBe("ESCALATED");
+    expect(run({ role: "unlisted" }).state).toBe("UNKNOWN");
+    expect(() => loadStore(JSON.stringify({ incidents: { bad: 7 }, locks: {} }))).toThrow();
+    expect(() => loadStore(JSON.stringify({ incidents: { bad: { key: "bad", state: "MADE_UP", lastAt: NOW } }, locks: {} }))).toThrow();
+    expect(supportMatrix().find((item) => item.role === "nahee").support).toBe("unsupported");
+    const dbPath = join(mkdtempSync(join(tmpdir(), "fleet-repair-")), "budget.sqlite");
+    const db = openRecoveryStore(dbPath);
+    const first = evaluateDurable(db, obs({ receiverDown: true, officialReconnect: true }), NOW, { reconnect() {} });
+    const second = evaluateDurable(db, obs({ receiverDown: true, officialReconnect: true }), NOW, { reconnect() { throw new Error("again"); } });
+    expect(first.reserved).toBe(true);
+    expect(second.reserved).toBe(false);
+    expect(second.reason).toBe("attempt_reserved");
+    db.close();
   });
 
   test("production module has no live effect calls", () => {

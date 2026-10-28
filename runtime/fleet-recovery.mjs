@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 // Limited recovery decisions for the existing watchdog. No live restart, timer, or Slack write.
 
-export const ROLES = ["dinobot", "gajaegun", "omonyang", "dori", "nahee", "seoyun", "cursor"];
+import { markAttempt, openRecoveryStore, readAttempt, reserveAttempt } from "./fleet-recovery-store.mjs";
+export { openRecoveryStore };
+export const ROLES = ["dinobot", "gajaegun", "omonyang", "dori", "nahee", "seoyun", "cursor", "shared"];
 export const COOLDOWN_MS = 600_000;
 export const SUSPECT_MS = 300_000;
 export const STATES = new Set([
@@ -15,13 +17,12 @@ const REMOTE = {
   cursor: { owner: "cursor-operator", app: "A08SKDT6QUW" },
 };
 
-export function supportMatrix(adapters = {}) {
-  return ROLES.map((role) => {
+export function supportMatrix() {
+  return ROLES.filter((role) => role !== "shared").map((role) => {
     if (REMOTE[role]) {
-      const api = adapters[role]?.managementApi === true;
-      return { role, support: api ? "supported" : "unsupported", owner: REMOTE[role].owner, reason: api ? "verified_remote_api" : "no_verified_remote_api" };
+      return { role, support: "unsupported", owner: REMOTE[role].owner, reason: "remote_api_unverified" };
     }
-    return { role, support: "supported", owner: "existing_native_owner", reason: "existing_supervisor_path" };
+    return { role, support: "decision_only", owner: "existing_native_owner", reason: "no_live_adapter" };
   });
 }
 
@@ -36,7 +37,7 @@ export function incidentKey(observation) {
 function validObservation(observation, nowMs) {
   if (!Number.isFinite(nowMs)) return false;
   if (!observation || typeof observation !== "object" || Array.isArray(observation)) return false;
-  if (!incidentKey(observation)) return false;
+  if (!ROLES.includes(observation.role) || observation.role === "shared" || !incidentKey(observation)) return false;
   if (observation.ownerMismatch === true || observation.schemaError === true) return false;
   if (observation.pidReused === true || observation.partialAttribution === true) return false;
   const observed = Date.parse(observation.observedAt);
@@ -80,14 +81,15 @@ export function recovered(proof) {
   if (!proof || typeof proof !== "object") return false;
   if (proof.ack || proof.pong || proof.globalMax || proof.healthz || proof.exit0) return false;
   const same = (left, right) => typeof left === "string" && left.length > 0 && left === right;
-  return same(proof.inputId, proof.replyInputId)
-    && same(proof.session, proof.replySession)
-    && same(proof.generation, proof.replyGeneration)
-    && same(proof.provider, proof.replyProvider)
-    && same(proof.model, proof.replyModel)
-    && typeof proof.replyId === "string"
+  return same(proof.inputId, proof.actualInputId)
+    && same(proof.session, proof.actualSession)
+    && same(proof.generation, proof.actualGeneration)
+    && same(proof.provider, proof.actualProvider)
+    && same(proof.model, proof.actualModel)
+    && same(proof.expectedAccountId, proof.actualAccountId)
+    && same(proof.expectedThreadId, proof.actualThreadId)
+    && same(proof.expectedReplyId, proof.actualReplyId)
     && proof.threadReread === true
-    && proof.expectedAccount === true
     && proof.inference === true;
 }
 
@@ -136,28 +138,34 @@ export function evaluate(store, observation, nowMs, effects = {}) {
   incident.lastAt = nowMs;
   if (lock) store.locks[lock] = key;
   if (decision.action === "reconnect_once" || decision.action === "notify" || decision.action === "notify_parent") {
+    if (existing?.attempts >= 1) {
+      return { state: existing.state, reason: "attempt_reserved", effects: counts, incident: existing };
+    }
+    incident.attempts = 1;
     incident.budgetUsed = true;
     incident.uncertain = true;
     incident.state = "ESCALATED";
+    incident.delivery = "unknown";
     commit(store, key, incident);
+    const effect = decision.action === "reconnect_once" ? effects.reconnect : effects.notify;
+    let outcome = "failure";
     try {
-      if (decision.action === "reconnect_once") {
-        effects.reconnect?.(observation);
-        counts.reconnect = 1;
+      const result = effect?.(observation);
+      if (result && typeof result.then === "function") {
+        outcome = "unknown";
       } else {
-        effects.notify?.(key);
-        counts.notify = 1;
-        incident.notifications = 1;
+        outcome = "delivered";
       }
-      incident.uncertain = observation.resultUnknown === true;
-      incident.state = incident.uncertain ? "ESCALATED" : "RECOVERY_REQUESTED";
-      incident.effectError = null;
-    } catch (error) {
-      incident.effectError = "effect_failed";
-      incident.state = "ESCALATED";
-      counts.reconnect = decision.action === "reconnect_once" ? 1 : 0;
-      counts.notify = decision.action === "reconnect_once" ? 0 : 1;
+    } catch {
+      outcome = "failure";
     }
+    incident.delivery = outcome;
+    incident.effectError = outcome === "failure" ? "effect_failed" : null;
+    incident.state = decision.action === "reconnect_once" && outcome === "delivered" && observation.resultUnknown !== true
+      ? "RECOVERY_REQUESTED"
+      : "ESCALATED";
+    if (decision.action === "reconnect_once") counts.reconnect = 1;
+    else counts.notify = 1;
     commit(store, key, incident);
     return { state: incident.state, reason: incident.effectError ?? decision.reason, effects: counts, incident };
   }
@@ -169,26 +177,53 @@ export function evaluate(store, observation, nowMs, effects = {}) {
   return { state: incident.state, reason: decision.reason, effects: counts, incident };
 }
 
-function safeRecord(value) {
+function incidentRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (typeof value.key !== "string" || !STATES.has(value.state) || !Number.isFinite(value.lastAt)) return null;
+  if (value.attempts != null && (!Number.isInteger(value.attempts) || value.attempts < 0)) return null;
+  return value;
+}
+
+function safeRecord(value, records = false) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const out = Object.create(null);
   for (const [key, item] of Object.entries(value)) {
     if (key === "__proto__" || key === "constructor" || key === "prototype") return null;
+    if (records && item != null && (typeof item !== "object" || !incidentRecord(item))) return null;
     out[key] = item;
   }
   return out;
 }
-
 export function loadStore(text) {
   if (!text) return { incidents: Object.create(null), locks: Object.create(null) };
   const parsed = JSON.parse(text);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("bad store");
-  const incidents = safeRecord(parsed.incidents);
-  const locks = safeRecord(parsed.locks);
+  const incidents = safeRecord(parsed.incidents, true);
+  const locks = safeRecord(parsed.locks, false);
   if (!incidents || !locks) throw new Error("bad store");
   return { incidents, locks };
 }
 
 export function productionCallCount(sourceText) {
   return sourceText.split("\n").filter((line) => /\bspawnSync\(|\bsystemctl\b|\bslackWrite\b|\bsetInterval\(/.test(line)).length;
+}
+export function evaluateDurable(db, observation, nowMs, effects = {}) {
+  const decision = classifyRole(observation, nowMs);
+  const key = incidentKey(observation);
+  if (!key || !db) return { state: "UNKNOWN", reason: "invalid_observation", reserved: false };
+  if (decision.action !== "reconnect_once" && decision.action !== "notify" && decision.action !== "notify_parent") {
+    return { state: decision.state, reason: decision.reason, reserved: false };
+  }
+  if (!reserveAttempt(db, key, nowMs)) return { state: "ESCALATED", reason: "attempt_reserved", reserved: false };
+  let outcome = "failure";
+  try {
+    const effect = decision.action === "reconnect_once" ? effects.reconnect : effects.notify;
+    const result = effect?.(observation);
+    outcome = result && typeof result.then === "function" ? "unknown" : "delivered";
+  } catch {
+    outcome = "failure";
+  }
+  const state = decision.action === "reconnect_once" && outcome === "delivered" ? "RECOVERY_REQUESTED" : "ESCALATED";
+  markAttempt(db, key, outcome === "failure" ? "failure" : state);
+  return { state, reason: outcome, reserved: true, attempts: readAttempt(db, key)?.attempts ?? 0 };
 }
