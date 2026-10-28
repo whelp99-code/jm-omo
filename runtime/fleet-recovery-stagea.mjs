@@ -95,6 +95,17 @@ function invalidCommand(command) {
   if (!Number.isSafeInteger(command.nowMs) || command.nowMs < 0) return "invalid_command";
   return null;
 }
+function storedScopeValid(stored, command) {
+  if (!stored) return null;
+  if (stored.scope_kind !== "bot" && stored.scope_kind !== "shared") return "store_invalid";
+  const key = canonicalTuple(stored.scope_key, 3);
+  if (!key) return "store_invalid";
+  if (stored.scope_kind === "bot" && (stored.scope_key !== command.botKey || !COMMAND_ROLES.has(key[0]))) return "identity_mismatch";
+  if (stored.scope_kind === "shared" && command.sharedKey && stored.scope_key !== command.sharedKey) return "identity_mismatch";
+  if (stored.scope_kind === "shared" && command.kind === "recovery") return "shared_dependency";
+  return null;
+}
+
 function storedScope(lock, db) {
   if (!lock) return null;
   return db.query("SELECT scope_kind FROM incidents WHERE id = ?").get(lock.incident_id)?.scope_kind ?? null;
@@ -121,9 +132,8 @@ export function transition(db, command) {
       ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId)
       : null;
     if (incidentId && !stored) return { ok: false, reason: "store_invalid" };
-    if (stored?.scope_kind === "bot" && stored.scope_key !== command.botKey) return { ok: false, reason: "identity_mismatch" };
-    if (stored?.scope_kind === "shared" && command.sharedKey && stored.scope_key !== command.sharedKey) return { ok: false, reason: "identity_mismatch" };
-    if (stored?.scope_kind === "shared" && command.kind === "recovery") return { ok: false, reason: "shared_dependency" };
+    const scopeRejected = storedScopeValid(stored, command);
+    if (scopeRejected) return { ok: false, reason: scopeRejected };
     if (lock && stored && lock.incident_id !== stored.id) return { ok: false, reason: "store_invalid" };
     const id = incidentId ?? `ep-${command.observationKey}`;
     if (!incidentId) {
