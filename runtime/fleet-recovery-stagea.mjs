@@ -113,7 +113,9 @@ export function transition(db, command) {
       : null;
     if (alias && lock && alias.incident_id !== lock.incident_id) return { ok: false, reason: "store_invalid" };
     if (alias && supplied && alias.incident_id !== supplied.id) return { ok: false, reason: "identity_mismatch" };
-    const incidentId = alias?.incident_id ?? supplied?.id ?? (storedScope(lock, db) === "shared" ? null : lock?.incident_id) ?? null;
+    const lockParent = lock ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(lock.incident_id) : null;
+    if (lockParent && supplied && lockParent.id !== supplied.id) return { ok: false, reason: "store_invalid" };
+    const incidentId = alias?.incident_id ?? supplied?.id ?? lockParent?.id ?? null;
     if (!incidentId && command.independentEpisode !== true) return { ok: false, reason: "missing_independence_evidence" };
     const stored = incidentId
       ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId)
