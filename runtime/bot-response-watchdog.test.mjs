@@ -16,6 +16,7 @@ function bot(name, extra = {}) {
     generation: "g1",
     sessionId: `${name}-session`,
     processAlive: true,
+    processEvidence: "bound",
     pidAlive: true,
     receiverPresent: true,
     working: false,
@@ -95,7 +96,7 @@ describe("PR1 readonly observation", () => {
 
   test("6. current provider auth error is not hidden by an old success", () => {
     const current = run({
-      omonyang: bot("omonyang", { provider: "anthropic-subscription", providerError: "invalid_grant", providerErrorGeneration: "g1" }),
+      omonyang: bot("omonyang", { provider: "anthropic-subscription", providerError: "invalid_grant", providerErrorProvider: "anthropic-subscription", providerErrorGeneration: "g1" }),
     }).bots.find((item) => item.bot === "omonyang");
     const old = run({
       omonyang: bot("omonyang", { provider: "chatgpt-subscription", providerError: "invalid_grant", providerErrorGeneration: "old" }),
@@ -153,5 +154,91 @@ describe("PR1 readonly observation", () => {
     expect(report.externalWatch).toBe("unsupported");
     expect(report.bots.every((item) => item.recoveryInvoked === false && item.modelInvoked === false && item.slackWrite === false)).toBe(true);
     expect(report.bots.find((item) => item.bot === "dori").autostart).toBe("unconfirmed");
+  });
+  test("F1 db readable is not process alive", () => {
+    const row = collect({
+      now: NOW,
+      omonyang: bot("omonyang"),
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: { dbReadable: true, sessionId: "present", processAlive: true, source: "db", observedAt: FRESH },
+    }).bots.find((item) => item.bot === "gajaegun");
+    expect(row.state).toBe("unconfirmed");
+    expect(row.processEvidence).not.toBe("bound");
+  });
+
+  test("F3 invalid now is unconfirmed", () => {
+    for (const now of [undefined, "not-a-time"]) {
+      const report = collect({ now, omonyang: bot("omonyang"), dinobot: bot("dinobot"), dori: bot("dori"), gajaegun: bot("gajaegun") });
+      expect(report.bots.every((item) => item.state === "unconfirmed" && item.reason === "invalid_now")).toBe(true);
+    }
+  });
+
+  test("F4 collection skew is not a future clock", () => {
+    const late = new Date(Date.parse(NOW) + 5).toISOString();
+    const inside = collect({
+      now: NOW,
+      omonyang: bot("omonyang", { observedAt: late, collectSkewMs: 2000 }),
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    }).bots.find((item) => item.bot === "omonyang");
+    const beyond = collect({
+      now: NOW,
+      omonyang: bot("omonyang", { observedAt: new Date(Date.parse(NOW) + 5000).toISOString(), collectSkewMs: 2000 }),
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: bot("gajaegun"),
+    }).bots.find((item) => item.bot === "omonyang");
+    expect(inside.state).toBe("idle_or_working");
+    expect(beyond.state).toBe("unconfirmed");
+  });
+
+  test("F5 auth requires current provider and generation", () => {
+    const missing = collect({
+      now: NOW,
+      omonyang: bot("omonyang", { provider: null, generation: null, providerError: "invalid_grant", providerErrorGeneration: null }),
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: bot("gajaegun"),
+    }).bots.find((item) => item.bot === "omonyang");
+    expect(missing.state).not.toBe("auth_required");
+  });
+
+  test("F6 unbound pid is not alive", () => {
+    const row = collect({
+      now: NOW,
+      omonyang: bot("omonyang"),
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: { observedAt: FRESH, sessionId: "gajaegun-session", pid: 9, pidAlive: false, processAlive: true, source: "pid" },
+    }).bots.find((item) => item.bot === "gajaegun");
+    expect(row.state).toBe("unconfirmed");
+  });
+
+  test("F7 snapshot bot cannot overwrite adapter", () => {
+    const report = collect({
+      now: NOW,
+      omonyang: { ...bot("omonyang"), bot: "dinobot", processAlive: false },
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    });
+    expect(report.bots.find((item) => item.bot === "dinobot").state).toBe("idle_or_working");
+    expect(report.bots.find((item) => item.bot === "omonyang").state).toBe("fault");
+  });
+
+  test("F9 read error does not copy the raw message", () => {
+    const report = collect({
+      now: NOW,
+      omonyang: bot("omonyang"),
+      dinobot: bot("dinobot"),
+      dori: { readError: "permission denied token=xoxb-do-not-log", body: "secret conversation" },
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    });
+    const text = JSON.stringify(report);
+    expect(text).not.toContain("xoxb-do-not-log");
+    expect(text).not.toContain("secret conversation");
+    expect(report.bots.find((item) => item.bot === "dori").readError).toBe("unreadable");
   });
 });
