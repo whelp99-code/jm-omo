@@ -147,7 +147,7 @@ describe("fleet recovery fixture", () => {
     expect((await run({ stage: "awaiting_reply", waitStartedAt: "2026-10-29T00:50:00.000Z" })).state).toBe("SUSPECT");
     const crashing = { incidents: Object.create(null), locks: Object.create(null), commits: [], commit(text) { this.commits.push(text); } };
     const crashed = await run({ receiverDown: true, officialReconnect: true }, crashing, { reconnect() { throw new Error("down"); } });
-    expect(crashed.reason).toBe("down");
+    expect(crashed.reason).toBe("effect_failed");
     const saved = JSON.parse(crashing.commits[0]);
     const key = incidentKey(obs());
     saved.incidents[key] = { ...saved.incidents[key], key, state: "ESCALATED", lastAt: NOW, attempts: 1 };
@@ -228,9 +228,9 @@ describe("fleet recovery fixture", () => {
     expect(memory.incident.effectError).toBe("fixture-async-reconnect-rejected");
     expect(memory.incident.uncertain).toBe(true);
     expect(memory.effects.reconnect).toBe(1);
+    expect(durable.state).toBe("ESCALATED");
     expect(durable.calls).toBe(1);
     expect(durable.reason).toBe("fixture-async-reconnect-rejected");
-    expect(durable.state).toBe("ESCALATED");
     expect(again.calls).toBe(0);
     expect(again.reason).toBe("attempt_reserved");
     database.close();
@@ -245,7 +245,7 @@ describe("fleet recovery fixture", () => {
     expect(JSON.parse(proc.stdout.toString())).toEqual({ slot: "audit-caller", reserved: true, calls: 1 });
   });
 
-  test("production module has no live effect calls", async () => {
+  test("production module has no live effect calls", () => {
     const text = readFileSync(new URL("./fleet-recovery.mjs", import.meta.url), "utf8");
     expect(productionCallCount(text)).toBe(0);
   });

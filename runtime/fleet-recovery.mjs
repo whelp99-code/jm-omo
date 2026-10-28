@@ -12,15 +12,6 @@ export function sharedKey(observation) {
   if (observation?.sharedDependency !== true || !SAFE_PART.test(String(observation.cause ?? ""))) return null;
   return JSON.stringify(["shared", observation.cause]);
 }
-export async function settleEffect(effect, observation) {
-  if (typeof effect !== "function") return { outcome: "not_dispatched", calls: 0, error: "adapter_absent" };
-  try {
-    const result = await effect(observation);
-    return { outcome: "delivered", calls: 1, value: result ?? null };
-  } catch (error) {
-    return { outcome: "failure", calls: 1, error: error instanceof Error ? error.message : "effect_failed" };
-  }
-}
 export { openRecoveryStore };
 export const ROLES = ["dinobot", "gajaegun", "omonyang", "dori", "nahee", "seoyun", "cursor", "shared"];
 export const COOLDOWN_MS = 600_000;
@@ -173,15 +164,34 @@ export async function evaluate(store, observation, nowMs, effects = {}) {
       commit(store, key, incident);
       return { state: incident.state, reason: "adapter_absent", effects: counts, incident };
     }
-    const settled = await settleEffect(effect, observation);
-    incident.delivery = settled.outcome === "not_dispatched" ? "not_dispatched" : settled.outcome;
-    incident.effectError = settled.outcome === "failure" ? settled.error : settled.outcome === "not_dispatched" ? "adapter_absent" : null;
-    incident.uncertain = settled.outcome !== "delivered" || observation.resultUnknown === true;
-    incident.state = decision.action === "reconnect_once" && settled.outcome === "delivered" && observation.resultUnknown !== true
+    let outcome = "failure";
+    let effectError = "effect_failed";
+    try {
+      const result = effect(observation);
+      if (result && typeof result.then === "function") {
+        try {
+          await result;
+          outcome = "delivered";
+          effectError = null;
+        } catch (error) {
+          outcome = "failure";
+          effectError = error instanceof Error ? error.message : "effect_failed";
+        }
+      } else {
+        outcome = "delivered";
+        effectError = null;
+      }
+    } catch {
+      outcome = "failure";
+      effectError = "effect_failed";
+    }
+    incident.delivery = outcome;
+    incident.effectError = outcome === "failure" ? effectError : null;
+    incident.state = decision.action === "reconnect_once" && outcome === "delivered" && observation.resultUnknown !== true
       ? "RECOVERY_REQUESTED"
       : "ESCALATED";
-    if (decision.action === "reconnect_once" && settled.calls === 1) counts.reconnect = 1;
-    if (decision.action !== "reconnect_once" && settled.calls === 1) counts.notify = 1;
+    if (decision.action === "reconnect_once") counts.reconnect = 1;
+    else counts.notify = 1;
     commit(store, key, incident);
     return { state: incident.state, reason: incident.effectError ?? decision.reason, effects: counts, incident };
   }
@@ -236,14 +246,35 @@ export async function evaluateDurable(db, observation, nowMs, effects = {}) {
     return { state: "ESCALATED", reason: "attempt_reserved", reserved: false, calls: 0 };
   }
   const effect = decision.action === "reconnect_once" ? effects.reconnect : effects.notify;
-  const settled = await settleEffect(effect, observation);
-  const state = decision.action === "reconnect_once" && settled.outcome === "delivered" ? "RECOVERY_REQUESTED" : "ESCALATED";
-  markAttempt(db, key, settled.outcome === "delivered" ? state : settled.outcome);
-  return {
-    state: settled.outcome === "not_dispatched" ? "ESCALATED" : state,
-    reason: settled.error ?? settled.outcome,
-    reserved: true,
-    calls: settled.calls,
-    attempts: readAttempt(db, key)?.attempts ?? 0,
-  };
+  if (typeof effect !== "function") {
+    markAttempt(db, key, "not_dispatched");
+    return { state: "ESCALATED", reason: "adapter_absent", reserved: true, calls: 0 };
+  }
+  let outcome = "failure";
+  let calls = 0;
+  let reason = "failure";
+  try {
+    const result = effect(observation);
+    calls = 1;
+    if (result && typeof result.then === "function") {
+      try {
+        await result;
+        outcome = "delivered";
+        reason = outcome;
+      } catch (error) {
+        outcome = "failure";
+        reason = error instanceof Error ? error.message : "effect_failed";
+      }
+    } else {
+      outcome = "delivered";
+      reason = outcome;
+    }
+  } catch {
+    calls = 1;
+    outcome = "failure";
+    reason = "failure";
+  }
+  const state = decision.action === "reconnect_once" && outcome === "delivered" ? "RECOVERY_REQUESTED" : "ESCALATED";
+  markAttempt(db, key, outcome === "delivered" ? state : outcome);
+  return { state, reason, reserved: true, calls, attempts: readAttempt(db, key)?.attempts ?? 0 };
 }
