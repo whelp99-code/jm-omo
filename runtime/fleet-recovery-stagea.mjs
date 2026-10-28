@@ -122,15 +122,18 @@ export function transition(db, command) {
     const supplied = command.sharedKey
       ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE scope_kind = 'shared' AND scope_key = ? AND closed_at IS NULL").get(command.sharedKey)
       : null;
-    if (alias && lock && alias.incident_id !== lock.incident_id) return { ok: false, reason: "store_invalid" };
-    if (alias && supplied && alias.incident_id !== supplied.id) return { ok: false, reason: "identity_mismatch" };
-    const lockParent = lock ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(lock.incident_id) : null;
-    if (lockParent && supplied && lockParent.id !== supplied.id) return { ok: false, reason: "store_invalid" };
     const history = db.query("SELECT bot_key, last_incident_id, last_at FROM target_history WHERE bot_key = ?").get(command.botKey);
     const historical = history ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(history.last_incident_id) : null;
-    if (history && (!historical || storedScopeValid(historical, command) === "store_invalid")) return { ok: false, reason: "store_invalid" };
+    if (history && (!historical || historical.scope_kind !== "bot" && historical.scope_kind !== "shared" || !canonicalTuple(historical.scope_key, 3))) {
+      return { ok: false, reason: "store_invalid" };
+    }
+    if (history && historical.scope_kind === "bot" && (historical.scope_key !== command.botKey || !COMMAND_ROLES.has(canonicalTuple(historical.scope_key, 3)[0]))) {
+      return { ok: false, reason: "store_invalid" };
+    }
     const referenced = [alias?.incident_id, supplied?.id, lock?.incident_id, history?.last_incident_id].filter(Boolean);
     if (new Set(referenced).size > 1) return { ok: false, reason: "store_invalid" };
+    if (alias && lock && alias.incident_id !== lock.incident_id) return { ok: false, reason: "store_invalid" };
+    if (alias && supplied && alias.incident_id !== supplied.id) return { ok: false, reason: "identity_mismatch" };
     const incidentId = referenced[0] ?? null;
     if (!incidentId) return { ok: false, reason: "missing_independence_evidence" };
     const stored = db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId);
