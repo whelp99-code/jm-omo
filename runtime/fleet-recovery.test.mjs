@@ -16,7 +16,7 @@ function obs(extra = {}) {
   };
 }
 
-function run(extra = {}, store = { incidents: {}, locks: {} }, effects = {}) {
+function run(extra = {}, store = { incidents: Object.create(null), locks: Object.create(null) }, effects = {}) {
   return evaluate(store, obs(extra), NOW, effects);
 }
 
@@ -86,12 +86,15 @@ describe("fleet recovery fixture", () => {
     const shared = run({ sharedDependency: true, role: "dinobot", cause: "slack" });
     expect(auth.effects.restart).toBe(0);
     expect(shared.effects.restart).toBe(0);
-    expect(shared.incident.key).toBe("parent|slack");
+    expect(shared.incident.key).toBe(JSON.stringify(["shared", "shared", "shared", "shared", "slack"]));
   });
 
   test("10 and 11 reply proof is exact", () => {
-    expect(recovered({ inputId: "a", sameInput: true, sameSession: true, sameGeneration: true, inference: true, replyId: "r", threadReread: true, expectedAccount: true })).toBe(true);
-    expect(recovered({ ack: true, inputId: "a", sameInput: true, sameSession: true, sameGeneration: true, inference: true, replyId: "r", threadReread: true, expectedAccount: true })).toBe(false);
+    expect(recovered({
+      inputId: "a", replyInputId: "a", session: "s", replySession: "s", generation: "g", replyGeneration: "g",
+      provider: "p", replyProvider: "p", model: "m", replyModel: "m", replyId: "r", threadReread: true, expectedAccount: true, inference: true,
+    })).toBe(true);
+    expect(recovered({ ack: true, inputId: "a", replyInputId: "a", session: "s", replySession: "s", generation: "g", replyGeneration: "g", provider: "p", replyProvider: "p", model: "m", replyModel: "m", replyId: "r", threadReread: true, expectedAccount: true, inference: true })).toBe(false);
     expect(recovered({ pong: true })).toBe(false);
     expect(recovered({ globalMax: true })).toBe(false);
     expect(run({ replyUnlinked: true }).state).toBe("VERIFYING");
@@ -127,6 +130,24 @@ describe("fleet recovery fixture", () => {
     const result = run({ authExpired: true });
     expect(result.state).not.toBe("RECOVERED");
     expect(recovered(null)).toBe(false);
+  });
+  test("diagnostics v2 counterexamples stay closed", () => {
+    const nan = evaluate({ incidents: Object.create(null), locks: Object.create(null) }, obs({ receiverDown: true, officialReconnect: true }), Number.NaN);
+    expect(nan.effects.reconnect).toBe(0);
+    expect(run({ collectionFinishedAt: "2026-10-29T02:00:00.000Z" }).state).toBe("UNKNOWN");
+    expect(run({ processDead: true, attributed: true }).state).toBe("ESCALATED");
+    expect(run({ stage: "awaiting_reply", waitStartedAt: "2026-10-29T00:50:00.000Z" }).state).toBe("SUSPECT");
+    const crashing = { incidents: Object.create(null), locks: Object.create(null), commits: [], commit(text) { this.commits.push(text); } };
+    const crashed = run({ receiverDown: true, officialReconnect: true }, crashing, { reconnect() { throw new Error("down"); } });
+    expect(crashed.reason).toBe("effect_failed");
+    const reloaded = loadStore(crashing.commits[0]);
+    expect(run({ receiverDown: true, officialReconnect: true }, reloaded).effects.reconnect).toBe(0);
+    const notices = { incidents: Object.create(null), locks: Object.create(null) };
+    expect(run({ authExpired: true }, notices, { notify() {} }).effects.notify).toBe(1);
+    expect(run({ authExpired: true }, notices, { notify() {} }).effects.notify).toBe(0);
+    expect(() => loadStore(JSON.stringify({ incidents: [], locks: {} }))).toThrow();
+    expect(incidentKey(obs({ owner: "a|b" }))).not.toBe(incidentKey(obs({ owner: "a", session: "b|s1" })));
+    expect(recovered({ inputId: "a", replyInputId: "b", session: "s", replySession: "s", generation: "g", replyGeneration: "g", provider: "p", replyProvider: "p", model: null, replyModel: null, replyId: "r", threadReread: true, expectedAccount: true, inference: true })).toBe(false);
   });
 
   test("production module has no live effect calls", () => {
