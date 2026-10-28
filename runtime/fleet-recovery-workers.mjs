@@ -12,6 +12,6 @@ const observation = {
   officialReconnect: true,
 };
 let calls = 0;
-const result = evaluateDurable(db, observation, now, { reconnect() { calls += 1; } });
+const result = await evaluateDurable(db, observation, now, { reconnect() { calls += 1; } });
 db.close();
 process.stdout.write(`${JSON.stringify({ slot, reserved: result.reserved, calls })}\n`);
