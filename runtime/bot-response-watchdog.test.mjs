@@ -3,25 +3,40 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ageClass, collect, forbiddenCallSites, openReadonly } from "./bot-response-watchdog.mjs";
+import { acceptHealthRecord, ageClass, attribution, collect, forbiddenCallSites, healthCheckedAt, openReadonly } from "./bot-response-watchdog.mjs";
 
 const NOW = "2026-10-28T06:00:00.000Z";
 const FRESH = "2026-10-28T05:59:30.000Z";
 const STALE = "2026-10-28T05:57:00.000Z";
 
+function windowFor(observedAt, finishedAt = NOW) {
+  const observedMs = Date.parse(observedAt);
+  const finishedMs = Date.parse(finishedAt);
+  if (!Number.isFinite(observedMs) || !Number.isFinite(finishedMs)) {
+    return { collectionStartedAt: FRESH, collectionFinishedAt: NOW };
+  }
+  const started = Math.min(observedMs, finishedMs);
+  const finished = Math.max(observedMs, finishedMs, Date.parse(NOW));
+  return {
+    collectionStartedAt: new Date(started).toISOString(),
+    collectionFinishedAt: new Date(finished).toISOString(),
+  };
+}
+
 function bot(name, extra = {}) {
+  const observedAt = extra.observedAt ?? FRESH;
   return {
     source: `${name}-fixture`,
-    observedAt: FRESH,
+    observedAt,
     generation: "g1",
     sessionId: `${name}-session`,
     processAlive: true,
-    processEvidence: "bound",
     pidAlive: true,
     receiverPresent: true,
     working: false,
-    ...extra,
     sessionMatchesProcess: true,
+    ...windowFor(observedAt),
+    ...extra,
   };
 }
 
@@ -175,24 +190,25 @@ describe("PR1 readonly observation", () => {
     }
   });
 
-  test("F4 collection skew is not a future clock", () => {
-    const late = new Date(Date.parse(NOW) + 5).toISOString();
+  test("F4 collection window rejects an observation after finish", () => {
+    const started = new Date(Date.parse(NOW) - 1000).toISOString();
     const inside = collect({
       now: NOW,
-      omonyang: bot("omonyang", { observedAt: late, collectSkewMs: 2000 }),
+      omonyang: bot("omonyang", { observedAt: new Date(Date.parse(NOW) - 5).toISOString(), collectionStartedAt: started, collectionFinishedAt: NOW }),
       dinobot: bot("dinobot"),
       dori: bot("dori"),
       gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
     }).bots.find((item) => item.bot === "omonyang");
-    const beyond = collect({
+    const afterFinish = collect({
       now: NOW,
-      omonyang: bot("omonyang", { observedAt: new Date(Date.parse(NOW) + 5000).toISOString(), collectSkewMs: 2000 }),
+      omonyang: bot("omonyang", { observedAt: new Date(Date.parse(NOW) + 5).toISOString(), collectionStartedAt: started, collectionFinishedAt: NOW }),
       dinobot: bot("dinobot"),
       dori: bot("dori"),
       gajaegun: bot("gajaegun"),
     }).bots.find((item) => item.bot === "omonyang");
     expect(inside.state).toBe("idle_or_working");
-    expect(beyond.state).toBe("unconfirmed");
+    expect(afterFinish.state).toBe("unconfirmed");
+    expect(afterFinish.reason).toBe("stale_or_bad_clock");
   });
 
   test("F5 auth requires current provider and generation", () => {
@@ -261,8 +277,99 @@ describe("PR1 readonly observation", () => {
     expect(matched.state).toBe("idle_or_working");
   });
 
-  test("NaN skew does not admit a future observation", () => {
-    expect(ageClass(new Date(Date.parse(NOW) + 5000).toISOString(), Date.parse(NOW), Number.NaN)).toBe("unconfirmed");
+  test("invalid clock values stay rejected", () => {
+    expect(ageClass(FRESH, Date.parse(NOW), Number.NaN)).toBe("unconfirmed");
+    expect(ageClass(FRESH, Date.parse(NOW), "2000")).toBe("unconfirmed");
+    expect(ageClass(FRESH, Date.parse(NOW), -1)).toBe("unconfirmed");
+    expect(ageClass(FRESH, Date.parse(NOW), Number.POSITIVE_INFINITY)).toBe("unconfirmed");
+  });
+  test("false attribution and missing pidAlive stay unconfirmed", () => {
+    const deadForeign = collect({
+      now: NOW,
+      omonyang: bot("omonyang"),
+      dinobot: bot("dinobot"),
+      dori: bot("dori", { pid: 9, pidAlive: false, sessionMatchesProcess: false }),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    }).bots.find((item) => item.bot === "dori");
+    const missingAlive = collect({
+      now: NOW,
+      omonyang: bot("omonyang"),
+      dinobot: bot("dinobot", { pid: 4, pidAlive: undefined }),
+      dori: bot("dori"),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    }).bots.find((item) => item.bot === "dinobot");
+    const deadAttributed = collect({
+      now: NOW,
+      omonyang: bot("omonyang"),
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: false, pidSessionId: "gajaegun-session", sessionMatchesProcess: true }),
+    }).bots.find((item) => item.bot === "gajaegun");
+    const alive = collect({
+      now: NOW,
+      omonyang: bot("omonyang"),
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    }).bots.find((item) => item.bot === "gajaegun");
+    expect(deadForeign.state).toBe("unconfirmed");
+    expect(deadForeign.reason).not.toBe("process_absent");
+    expect(missingAlive.state).toBe("unconfirmed");
+    expect(missingAlive.reason).not.toBe("process_absent");
+    expect(deadAttributed.state).toBe("fault");
+    expect(deadAttributed.reason).toBe("process_absent");
+    expect(alive.state).toBe("idle_or_working");
+    expect(attribution({ sessionId: "s", generation: "g", sessionMatchesProcess: false, pid: 9, pidAlive: false }).reason).toBe("process_not_attributed");
+  });
+
+  test("future health time is not fresh and is not replaced by collection time", () => {
+    const now = Date.parse(NOW);
+    expect(healthCheckedAt(now / 1000 + 3600, now).ok).toBe(false);
+    expect(healthCheckedAt(now / 1000 - 30, now).ok).toBe(true);
+    expect(healthCheckedAt(Number.NaN, now).ok).toBe(false);
+  });
+  test("bad json shapes fail closed without hiding the original time", () => {
+    const now = Date.parse(NOW);
+    for (const bad of [null, "text", [], { runtime_pid: 1 }]) {
+      expect(acceptHealthRecord(bad, now).ok).toBe(false);
+    }
+    const future = acceptHealthRecord({ runtime_pid: 1, session_id: "s", checked_at: now / 1000 + 3600 }, now);
+    expect(future.ok).toBe(false);
+    expect(future.reason).toBe("stale_or_future_health");
+  });
+
+  test("metadata allowlist drops nested synthetic markers", () => {
+    const report = collect({
+      now: NOW,
+      omonyang: bot("omonyang", { source: { body: "SYNTH_BODY", code: "SYNTH_CODE" } }),
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    });
+    const text = JSON.stringify(report);
+    expect(text).not.toContain("SYNTH_BODY");
+    expect(text).not.toContain("SYNTH_CODE");
+    expect(report.bots.find((item) => item.bot === "omonyang").source).toBe(null);
+  });
+
+  test("bad health shape isolates one bot", () => {
+    const report = collect({
+      now: NOW,
+      omonyang: null,
+      dinobot: bot("dinobot"),
+      dori: bot("dori"),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    });
+    expect(report.bots.find((item) => item.bot === "omonyang").state).toBe("unconfirmed");
+    expect(report.bots.filter((item) => item.state === "idle_or_working")).toHaveLength(3);
+    expect(report.bots.find((item) => item.bot === "omonyang").readError).toBe("missing");
+  });
+
+  test("clock exceptions stay rejected", () => {
+    expect(ageClass(FRESH, Date.parse(NOW), { collectionStartedAt: NOW, collectionFinishedAt: FRESH })).toBe("unconfirmed");
+    expect(ageClass(FRESH, Date.parse(NOW), { collectionStartedAt: "bad", collectionFinishedAt: NOW })).toBe("unconfirmed");
+    expect(ageClass("not-a-time", Date.parse(NOW), windowFor(FRESH))).toBe("unconfirmed");
+    expect(ageClass(FRESH, Number.NaN, windowFor(FRESH))).toBe("unconfirmed");
   });
 
   test("corrupt sqlite open does not throw", () => {

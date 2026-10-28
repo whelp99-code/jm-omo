@@ -8,7 +8,14 @@ import { existsSync, readFileSync } from "node:fs";
 
 export const BOTS = ["omonyang", "dinobot", "dori", "gajaegun"];
 export const FRESH_MS = 120_000;
-export const COLLECT_SKEW_MS = 2_000;
+export const OUTPUT_FIELDS = [
+  "bot", "identity", "source", "observedAt", "generation", "sessionId",
+  "receiverPresent", "provider", "providerError", "providerErrorGeneration",
+  "dbReadable", "processEvidence", "replyLink", "autostart", "externalWatch",
+  "recoveryInvoked", "modelInvoked", "slackWrite", "stalePidRejected",
+  "collectedFields", "uncollectedFields", "state", "reason", "readError",
+  "attribution", "processAlive", "processAbsent", "healthCheckedAt",
+];
 export const READ_ERROR_KINDS = new Set([
   "missing", "missing_adapter", "missing_db", "permission_denied", "query_failed",
   "readonly_query_failed", "systemctl_failed", "inspect_failed", "unreadable", "unsupported",
@@ -33,14 +40,41 @@ export function requireNow(value) {
   return parsed;
 }
 
-export function ageClass(observedAt, nowMs, skewMs = 0) {
+export function ageClass(observedAt, nowMs, bounds = {}) {
   if (!Number.isFinite(nowMs)) return "unconfirmed";
-  if (typeof skewMs !== "number" || !Number.isFinite(skewMs) || skewMs < 0 || skewMs > COLLECT_SKEW_MS) return "unconfirmed";
+  if (bounds == null || typeof bounds !== "object" || Array.isArray(bounds)) return "unconfirmed";
   const parsed = parseTime(observedAt);
   if (!parsed.ok) return "unconfirmed";
-  if (parsed.ms > nowMs + skewMs) return "unconfirmed";
+  const started = parseTime(bounds.collectionStartedAt);
+  const finished = parseTime(bounds.collectionFinishedAt ?? nowMs);
+  if (!started.ok || !finished.ok) return "unconfirmed";
+  if (started.ms > finished.ms) return "unconfirmed";
+  if (parsed.ms < started.ms || parsed.ms > finished.ms || parsed.ms > nowMs) return "unconfirmed";
   if (nowMs - parsed.ms > FRESH_MS) return "unconfirmed";
   return "fresh";
+}
+
+export function healthCheckedAt(value, collectedAtMs) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return { ok: false, reason: "bad_health_time" };
+  const ms = value * 1000;
+  if (!Number.isFinite(collectedAtMs) || ms > collectedAtMs || collectedAtMs - ms > FRESH_MS) {
+    return { ok: false, reason: "stale_or_future_health", ms };
+  }
+  return { ok: true, ms };
+}
+export function acceptHealthRecord(value, collectedAtMs) {
+  const record = value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  if (!record || !("runtime_pid" in record) || !("session_id" in record) || !("checked_at" in record)) {
+    return { ok: false, reason: "bad_health_shape" };
+  }
+  const checked = healthCheckedAt(record.checked_at, collectedAtMs);
+  if (!checked.ok) return checked;
+  return {
+    ok: true,
+    pid: Number.isInteger(Number(record.runtime_pid)) ? Number(record.runtime_pid) : null,
+    sessionId: typeof record.session_id === "string" ? record.session_id : null,
+    checkedAtMs: checked.ms,
+  };
 }
 
 function safeReadError(value) {
@@ -53,17 +87,25 @@ export function attribution(snapshot) {
   if (!sessionId || !generation) return { bound: false, reason: "missing_session_or_generation" };
   if (snapshot.pidSessionId && snapshot.pidSessionId !== sessionId) return { bound: false, reason: "foreign_pid_session" };
   if (snapshot.ownerSessionId && snapshot.ownerSessionId !== sessionId) return { bound: false, reason: "foreign_owner_session" };
-  if (snapshot.pid != null && snapshot.pidAlive !== true) return { bound: false, reason: "dead_pid", processAbsent: true };
   if (snapshot.sessionMatchesProcess !== true) return { bound: false, reason: "process_not_attributed" };
+  if (snapshot.pid != null && snapshot.pidAlive == null) return { bound: false, reason: "missing_pid_alive" };
+  if (snapshot.pid != null && snapshot.pidAlive === false) return { bound: false, reason: "dead_pid", processAbsent: true };
   if (snapshot.processAlive !== true) return { bound: false, reason: "process_absent", processAbsent: true };
   return { bound: true, reason: "attributed" };
 }
 
+function publicRow(bot, extra = {}) {
+  const row = {};
+  for (const key of OUTPUT_FIELDS) {
+    if (bot[key] !== undefined) row[key] = bot[key];
+  }
+  return { ...row, ...extra };
+}
+
 export function classify(bot) {
-  const base = {
-    bot: bot.bot,
+  const base = publicRow(bot, {
     identity: bot.identity ?? bot.sessionId ?? null,
-    source: bot.source ?? null,
+    source: typeof bot.source === "string" ? bot.source : null,
     observedAt: bot.observedAt ?? null,
     generation: bot.generation ?? null,
     sessionId: bot.sessionId ?? null,
@@ -80,16 +122,17 @@ export function classify(bot) {
     modelInvoked: false,
     slackWrite: false,
     stalePidRejected: bot.stalePidRejected === true,
-    collectedFields: bot.collectedFields ?? [],
-    uncollectedFields: bot.uncollectedFields ?? [],
-  };
+    collectedFields: Array.isArray(bot.collectedFields) ? bot.collectedFields.filter((item) => typeof item === "string") : [],
+    uncollectedFields: Array.isArray(bot.uncollectedFields) ? bot.uncollectedFields.filter((item) => typeof item === "string") : [],
+    healthCheckedAt: typeof bot.healthCheckedAt === "number" ? bot.healthCheckedAt : null,
+  });
   if (!Number.isFinite(bot.nowMs)) {
     return { ...base, state: "unconfirmed", reason: "invalid_now" };
   }
   if (bot.readError) {
     return { ...base, state: "unconfirmed", reason: "read_failed", readError: safeReadError(bot.readError) };
   }
-  if (ageClass(bot.observedAt, bot.nowMs, bot.collectSkewMs ?? 0) !== "fresh") {
+  if (ageClass(bot.observedAt, bot.nowMs, bot) !== "fresh") {
     return { ...base, state: "unconfirmed", reason: "stale_or_bad_clock" };
   }
   if (bot.maintenance === true) return { ...base, state: "maintenance", reason: "intentional_stop" };
@@ -159,18 +202,27 @@ export function openReadonly(path) {
   }
 }
 
+function readErrorRow(bot, snapshot) {
+  return {
+    bot,
+    identity: `${bot}:unconfirmed`,
+    readError: safeReadError(snapshot?.readError ?? "missing"),
+    source: typeof snapshot?.source === "string" ? snapshot.source : null,
+    observedAt: snapshot?.observedAt ?? null,
+  };
+}
+
 export function readGajaegun(snapshot) {
-  if (snapshot.readError) {
-    return { bot: "gajaegun", readError: safeReadError(snapshot.readError), source: snapshot.source ?? null, observedAt: snapshot.observedAt ?? null };
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) || snapshot.readError) {
+    return readErrorRow("gajaegun", snapshot);
   }
   const normalized = readGeneric("gajaegun", snapshot);
   return {
     ...normalized,
     dbReadable: snapshot.dbReadable ?? null,
     boundConversationSession: snapshot.boundConversationSession ?? null,
-    runtimeProcessIdentity: snapshot.runtimeProcessIdentity ?? (snapshot.pid ? String(snapshot.pid) : null),
+    runtimeProcessIdentity: snapshot.runtimeProcessIdentity ?? null,
     sessionId: snapshot.sessionId ?? null,
-    boundConversationSession: snapshot.boundConversationSession ?? null,
     identity: snapshot.sessionId ?? snapshot.boundConversationSession ?? null,
     attribution: normalized.attribution,
     stalePidRejected: normalized.stalePidRejected,
@@ -178,23 +230,18 @@ export function readGajaegun(snapshot) {
 }
 
 export function readGeneric(bot, snapshot) {
-  if (!snapshot || snapshot.readError) {
-    return {
-      bot,
-      identity: `${bot}:unconfirmed`,
-      readError: safeReadError(snapshot?.readError ?? "missing"),
-      source: snapshot?.source ?? null,
-      observedAt: snapshot?.observedAt ?? null,
-    };
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) || snapshot.readError) {
+    return readErrorRow(bot, snapshot);
   }
   const { bot: ignoredBot, processEvidence: ignoredEvidence, ...rest } = snapshot;
   const attributed = attribution(rest);
   return {
     ...rest,
     bot,
+    source: typeof rest.source === "string" ? rest.source : null,
     sessionId: rest.sessionId ?? null,
     boundConversationSession: rest.boundConversationSession ?? null,
-    runtimeProcessIdentity: rest.runtimeProcessIdentity ?? (rest.pid ? String(rest.pid) : null),
+    runtimeProcessIdentity: rest.runtimeProcessIdentity ?? null,
     processAlive: attributed.bound,
     processAbsent: attributed.processAbsent === true,
     stalePidRejected: rest.pidAlive === true && Boolean(rest.pidSessionId) && rest.pidSessionId !== rest.sessionId,
@@ -238,16 +285,15 @@ function systemctlShow(unit) {
   return {
     source: unit,
     observedAt: new Date().toISOString(),
-    unitType: fields.Type ?? null,
-    processAlive: fields.Type === "simple" && active,
-    processEvidence: fields.Type === "simple" && active ? "bound" : "unconfirmed",
     pid: active ? Number(fields.MainPID) : null,
     pidAlive: active,
-    generation: active ? fields.MainPID : null,
     receiverPresent: null,
     autostart: "unconfirmed",
+    generation: null,
+    sessionId: null,
+    sessionMatchesProcess: false,
     collectedFields: ["ActiveState", "MainPID", "Type"],
-    uncollectedFields: ["provider", "replyLink"],
+    uncollectedFields: ["provider", "replyLink", "generation", "processAttribution", "sessionId"],
   };
 }
 
@@ -259,38 +305,27 @@ function readJsonFile(path) {
   }
 }
 
-function procAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  return existsSync(`/proc/${pid}/cmdline`);
-}
-
 function readOmonyang() {
   const healthPath = "/home/jm/.omo/omonyang/recovery-health.json";
+  const collectedAt = new Date().toISOString();
   const health = readJsonFile(healthPath);
-  const observedAt = new Date().toISOString();
-  if (!health.ok) return { readError: health.reason, source: healthPath, observedAt };
-  const pid = Number(health.value.runtime_pid);
-  const sessionId = typeof health.value.session_id === "string" ? health.value.session_id : null;
-  const checkedAt = Number(health.value.checked_at);
-  const freshHealth = Number.isFinite(checkedAt) && Date.now() - checkedAt * 1000 <= FRESH_MS;
-  let cmdline = "";
-  try { cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8"); } catch { cmdline = ""; }
-  const sessionMatchesProcess = freshHealth && sessionId !== null && cmdline.includes(sessionId) && cmdline.includes("오모냥");
+  if (!health.ok) return { readError: health.reason, source: healthPath, observedAt: collectedAt };
+  const accepted = acceptHealthRecord(health.value, Date.parse(collectedAt));
+  if (!accepted.ok) return { readError: "unreadable", source: healthPath, observedAt: collectedAt, healthCheckedAt: accepted.reason === "stale_or_future_health" ? null : null };
   return {
-    source: "recovery-health.json+/proc/cmdline",
-    observedAt,
-    sessionId,
-    identity: sessionId,
-    generation: sessionMatchesProcess ? String(pid) : null,
-    pid,
-    pidAlive: cmdline.length > 0,
-    pidSessionId: sessionMatchesProcess ? sessionId : null,
-    processAlive: sessionMatchesProcess,
-    sessionMatchesProcess,
-    healthCheckedAt: Number.isFinite(checkedAt) ? checkedAt : null,
-    healthProducer: "/home/jm/.omo/omonyang/bin/omonyang-recovery.py",
-    collectedFields: ["session_id", "runtime_pid", "checked_at", "cmdline"],
-    uncollectedFields: ["provider", "receiver", "replyLink", "processStartTime"],
+    source: "recovery-health.json",
+    observedAt: collectedAt,
+    sessionId: accepted.sessionId,
+    identity: accepted.sessionId,
+    generation: null,
+    pid: accepted.pid,
+    pidAlive: null,
+    sessionMatchesProcess: false,
+    processAlive: false,
+    healthCheckedAt: accepted.checkedAtMs,
+    healthFresh: true,
+    collectedFields: ["session_id", "runtime_pid", "checked_at"],
+    uncollectedFields: ["provider", "receiver", "replyLink", "processStartTime", "generation", "processAttribution"],
   };
 }
 
@@ -307,7 +342,7 @@ function readDori() {
   const processes = Array.isArray(parsed.processes) ? parsed.processes : [];
   const identity = parsed.nativeOwner?.processIdentity ?? null;
   const matched = processes.find((item) => item.processIdentity === identity);
-  const sessionMatchesProcess = sessionId !== null && ownerSessionId === sessionId && matched != null && parsed.nativeOwner?.alive === true;
+  const sessionMatchesProcess = false;
   return {
     source: "dori-runtime-cli.ts inspect",
     observedAt,
@@ -315,31 +350,39 @@ function readDori() {
     ownerSessionId,
     identity: sessionId,
     pid: matched?.pid ?? null,
-    pidAlive: matched != null,
-    pidSessionId: sessionMatchesProcess ? sessionId : null,
-    processAlive: sessionMatchesProcess,
+    pidAlive: matched == null ? null : parsed.nativeOwner?.alive === true,
+    pidSessionId: null,
+    processAlive: false,
     sessionMatchesProcess,
-    generation: sessionMatchesProcess ? identity : null,
-    runtimeProcessIdentity: identity,
+    generation: null,
+    runtimeProcessIdentity: null,
     collectedFields: ["sessionId", "nativeOwner.sessionId", "processes.processIdentity"],
-    uncollectedFields: ["provider", "replyLink"],
+    uncollectedFields: ["provider", "replyLink", "generation", "processStartTime", "processAttribution"],
   };
 }
 
 export function liveOnce() {
-  const started = Date.now();
-  const gajaegun = readGajaegunLive();
-  const omonyang = readOmonyang();
-  const dinobot = { ...systemctlShow("dinobot.service"), receiverPresent: null, autostart: "systemd" };
-  const dori = readDori();
-  const finished = Date.now();
-  return collect({
-    now: new Date(finished).toISOString(),
-    omonyang: { ...omonyang, collectSkewMs: COLLECT_SKEW_MS },
-    dinobot: { ...dinobot, collectSkewMs: COLLECT_SKEW_MS },
-    dori: { ...dori, collectSkewMs: COLLECT_SKEW_MS },
-    gajaegun: { ...gajaegun, collectSkewMs: COLLECT_SKEW_MS, collectionStartedAt: new Date(started).toISOString() },
-  });
+  const started = new Date().toISOString();
+  const adapters = [
+    ["gajaegun", readGajaegunLive],
+    ["omonyang", readOmonyang],
+    ["dinobot", () => ({ ...systemctlShow("dinobot.service"), receiverPresent: null, autostart: "systemd" })],
+    ["dori", readDori],
+  ];
+  const input = { now: null };
+  for (const [bot, read] of adapters) {
+    try {
+      input[bot] = read();
+    } catch {
+      input[bot] = { readError: "unreadable", source: bot, observedAt: new Date().toISOString() };
+    }
+  }
+  const finished = new Date().toISOString();
+  input.now = finished;
+  for (const bot of BOTS) {
+    input[bot] = { ...input[bot], collectionStartedAt: started, collectionFinishedAt: finished };
+  }
+  return collect(input);
 }
 
 function readGajaegunLive() {
@@ -362,18 +405,18 @@ function readGajaegunLive() {
     source: "gajaeway-gateway.service+adapter+db-ro",
     observedAt,
     dbReadable,
-    processAlive: gateway.processAlive === true,
     pid: gateway.pid ?? null,
     pidAlive: gateway.pidAlive === true,
-    runtimeProcessIdentity: gateway.pid ? String(gateway.pid) : null,
+    runtimeProcessIdentity: null,
     sessionId: null,
     boundConversationSession: null,
     generation: null,
     sessionMatchesProcess: false,
-    receiverPresent: adapter.processAlive === true ? true : null,
+    processAlive: false,
+    receiverPresent: adapter.pidAlive === true ? true : null,
     provider: null,
     collectedFields: ["gateway.ActiveState", "adapter.ActiveState", "db.readable"],
-    uncollectedFields: ["boundConversationSession", "provider", "replyLink"],
+    uncollectedFields: ["boundConversationSession", "provider", "replyLink", "generation", "processAttribution"],
   };
 }
 
