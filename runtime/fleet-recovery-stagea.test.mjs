@@ -17,7 +17,11 @@ describe("stage A durable reducer", () => {
   test("same bot different cause shares one budget", () => {
     const opened = db();
     expect(opened.ok).toBe(true);
-    const first = transition(opened.db, base);
+    const incident = '["dori","o","runtime-1"]';
+    opened.db.query("INSERT INTO incidents VALUES (?,?,?,?,?,NULL,?)").run("I1", "bot", incident, "UNKNOWN", 1000, 1);
+    opened.db.query("INSERT INTO aliases VALUES (?,?)").run(base.observationKey, "I1");
+    opened.db.query("INSERT INTO bot_locks VALUES (?,?,?)").run(base.botKey, "I1", "g");
+    const first = transition(opened.db, { ...base, independentEpisode: false });
     const second = transition(opened.db, { ...base, observationKey: '["dori","o","s","g2","other"]', generation: "g2", independentEpisode: false });
     expect(first.reserved).toBe(true);
     expect(second.reserved).toBe(false);
@@ -27,8 +31,12 @@ describe("stage A durable reducer", () => {
 
   test("shared dependency ignores role", () => {
     const opened = db();
-    const first = transition(opened.db, { ...base, sharedKey: '["slack","tenant","dependency"]' });
-    const second = transition(opened.db, { ...base, role: "dinobot", observationKey: '["dinobot","o","s","g","slack"]', botKey: '["dinobot","o","runtime-2"]', sharedKey: '["slack","tenant","dependency"]', independentEpisode: false });
+    const shared = '["slack","tenant","dependency"]';
+    opened.db.query("INSERT INTO incidents VALUES (?,?,?,?,?,NULL,?)").run("P", "shared", shared, "UNKNOWN", 1000, 1);
+    opened.db.query("INSERT INTO aliases VALUES (?,?)").run(base.observationKey, "P");
+    opened.db.query("INSERT INTO bot_locks VALUES (?,?,?)").run(base.botKey, "P", "g");
+    const first = transition(opened.db, { ...base, sharedKey: shared, independentEpisode: false });
+    const second = transition(opened.db, { ...base, observationKey: '["dinobot","o","s","g","slack"]', botKey: '["dinobot","o","runtime-2"]', sharedKey: shared, independentEpisode: false });
     expect(first.incidentId).toBe(second.incidentId);
     expect(second.reserved).toBe(false);
     opened.db.close();
@@ -37,6 +45,7 @@ describe("stage A durable reducer", () => {
   test("missing independence and untrusted clock fail closed", () => {
     const opened = db();
     expect(transition(opened.db, { ...base, independentEpisode: false }).reason).toBe("missing_independence_evidence");
+    expect(transition(opened.db, { ...base, independentEpisode: true }).reason).toBe("missing_independence_evidence");
     expect(transition(opened.db, { ...base, trustedClock: false }).reason).toBe("untrusted_clock");
     opened.db.close();
   });
@@ -44,7 +53,10 @@ describe("stage A durable reducer", () => {
   test("native db and bad outcome are refused", () => {
     expect(openStageStore("/home/jm/.gajaegun/gajaeway/gateway.db").reason).toBe("native_db_refused");
     const opened = db();
-    const prepared = transition(opened.db, base);
+    opened.db.query("INSERT INTO incidents VALUES (?,?,?,?,?,NULL,?)").run("I1", "bot", base.botKey, "UNKNOWN", 1000, 1);
+    opened.db.query("INSERT INTO aliases VALUES (?,?)").run(base.observationKey, "I1");
+    opened.db.query("INSERT INTO bot_locks VALUES (?,?,?)").run(base.botKey, "I1", "g");
+    const prepared = transition(opened.db, { ...base, independentEpisode: false });
     expect(settle(opened.db, prepared.incidentId, "notification", "made_up").reason).toBe("bad_enum");
     expect(settle(opened.db, prepared.incidentId, "notification", "unknown").outcome).toBe("unknown");
     opened.db.close();

@@ -126,20 +126,20 @@ export function transition(db, command) {
     if (alias && supplied && alias.incident_id !== supplied.id) return { ok: false, reason: "identity_mismatch" };
     const lockParent = lock ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(lock.incident_id) : null;
     if (lockParent && supplied && lockParent.id !== supplied.id) return { ok: false, reason: "store_invalid" };
-    const incidentId = alias?.incident_id ?? supplied?.id ?? lockParent?.id ?? null;
-    if (!incidentId && command.independentEpisode !== true) return { ok: false, reason: "missing_independence_evidence" };
-    const stored = incidentId
-      ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId)
-      : null;
-    if (incidentId && !stored) return { ok: false, reason: "store_invalid" };
+    const history = db.query("SELECT bot_key, last_incident_id, last_at FROM target_history WHERE bot_key = ?").get(command.botKey);
+    if (history) {
+      const historical = db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(history.last_incident_id);
+      if (!historical || (historical.scope_kind === "bot" && historical.scope_key !== command.botKey)) return { ok: false, reason: "store_invalid" };
+    }
+    const incidentId = alias?.incident_id ?? supplied?.id ?? lockParent?.id ?? history?.last_incident_id ?? null;
+    if (!incidentId) return { ok: false, reason: "missing_independence_evidence" };
+    const stored = db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId);
+    if (!stored) return { ok: false, reason: "store_invalid" };
     const scopeRejected = storedScopeValid(stored, command);
     if (scopeRejected) return { ok: false, reason: scopeRejected };
-    if (lock && stored && lock.incident_id !== stored.id) return { ok: false, reason: "store_invalid" };
-    const id = incidentId ?? `ep-${command.observationKey}`;
-    if (!incidentId) {
-      db.query("INSERT INTO incidents (id, scope_kind, scope_key, qstate, opened_at, closed_at, revision) VALUES (?, ?, ?, 'UNKNOWN', ?, NULL, 1)")
-        .run(id, command.sharedKey ? "shared" : "bot", command.sharedKey ?? command.botKey, command.nowMs);
-    }
+    if (lock && lock.incident_id !== stored.id) return { ok: false, reason: "store_invalid" };
+    if (history && history.last_incident_id !== stored.id && !alias && !supplied) return { ok: false, reason: "store_invalid" };
+    const id = stored.id;
     db.query("INSERT OR IGNORE INTO aliases (observation_key, incident_id) VALUES (?, ?)").run(command.observationKey, id);
     db.query("INSERT INTO bot_locks (bot_key, incident_id, held_generation) VALUES (?, ?, ?) ON CONFLICT(bot_key) DO NOTHING")
       .run(command.botKey, id, command.generation);
