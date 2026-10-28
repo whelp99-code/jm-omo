@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { collect, forbiddenCallSites, openReadonly } from "./bot-response-watchdog.mjs";
+import { ageClass, collect, forbiddenCallSites, openReadonly } from "./bot-response-watchdog.mjs";
 
 const NOW = "2026-10-28T06:00:00.000Z";
 const FRESH = "2026-10-28T05:59:30.000Z";
@@ -21,6 +21,7 @@ function bot(name, extra = {}) {
     receiverPresent: true,
     working: false,
     ...extra,
+    sessionMatchesProcess: true,
   };
 }
 
@@ -240,5 +241,34 @@ describe("PR1 readonly observation", () => {
     expect(text).not.toContain("xoxb-do-not-log");
     expect(text).not.toContain("secret conversation");
     expect(report.bots.find((item) => item.bot === "dori").readError).toBe("unreadable");
+  });
+  test("generic foreign pid is not bound", () => {
+    const foreign = collect({
+      now: NOW,
+      omonyang: bot("omonyang"),
+      dinobot: bot("dinobot"),
+      dori: bot("dori", { pid: 9, pidAlive: true, pidSessionId: "other-session" }),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    }).bots.find((item) => item.bot === "dori");
+    const matched = collect({
+      now: NOW,
+      omonyang: bot("omonyang"),
+      dinobot: bot("dinobot"),
+      dori: bot("dori", { pid: 9, pidAlive: true, pidSessionId: "dori-session" }),
+      gajaegun: bot("gajaegun", { pid: 1, pidAlive: true, pidSessionId: "gajaegun-session" }),
+    }).bots.find((item) => item.bot === "dori");
+    expect(foreign.state).toBe("unconfirmed");
+    expect(matched.state).toBe("idle_or_working");
+  });
+
+  test("NaN skew does not admit a future observation", () => {
+    expect(ageClass(new Date(Date.parse(NOW) + 5000).toISOString(), Date.parse(NOW), Number.NaN)).toBe("unconfirmed");
+  });
+
+  test("corrupt sqlite open does not throw", () => {
+    const dir = mkdtempSync(join(tmpdir(), "watchdog-corrupt-"));
+    const path = join(dir, "broken.db");
+    writeFileSync(path, "not a database");
+    expect(openReadonly(path).ok).toBe(false);
   });
 });

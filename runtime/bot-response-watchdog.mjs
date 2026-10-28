@@ -35,6 +35,7 @@ export function requireNow(value) {
 
 export function ageClass(observedAt, nowMs, skewMs = 0) {
   if (!Number.isFinite(nowMs)) return "unconfirmed";
+  if (typeof skewMs !== "number" || !Number.isFinite(skewMs) || skewMs < 0 || skewMs > COLLECT_SKEW_MS) return "unconfirmed";
   const parsed = parseTime(observedAt);
   if (!parsed.ok) return "unconfirmed";
   if (parsed.ms > nowMs + skewMs) return "unconfirmed";
@@ -44,6 +45,18 @@ export function ageClass(observedAt, nowMs, skewMs = 0) {
 
 function safeReadError(value) {
   return READ_ERROR_KINDS.has(value) ? value : "unreadable";
+}
+
+export function attribution(snapshot) {
+  const sessionId = typeof snapshot.sessionId === "string" && snapshot.sessionId.length > 0 ? snapshot.sessionId : null;
+  const generation = snapshot.generation ?? null;
+  if (!sessionId || !generation) return { bound: false, reason: "missing_session_or_generation" };
+  if (snapshot.pidSessionId && snapshot.pidSessionId !== sessionId) return { bound: false, reason: "foreign_pid_session" };
+  if (snapshot.ownerSessionId && snapshot.ownerSessionId !== sessionId) return { bound: false, reason: "foreign_owner_session" };
+  if (snapshot.pid != null && snapshot.pidAlive !== true) return { bound: false, reason: "dead_pid", processAbsent: true };
+  if (snapshot.sessionMatchesProcess !== true) return { bound: false, reason: "process_not_attributed" };
+  if (snapshot.processAlive !== true) return { bound: false, reason: "process_absent", processAbsent: true };
+  return { bound: true, reason: "attributed" };
 }
 
 export function classify(bot) {
@@ -86,9 +99,7 @@ export function classify(bot) {
   if (currentAuthError(bot)) {
     return { ...base, state: "auth_required", reason: "current_provider_auth" };
   }
-  if (bot.processAlive === false && bot.processEvidence === "bound") {
-    return { ...base, state: "fault", reason: "process_absent" };
-  }
+  if (bot.processAbsent === true) return { ...base, state: "fault", reason: "process_absent" };
   if (bot.receiverPresent === false && bot.processAlive === true && bot.processEvidence === "bound") {
     return { ...base, state: "fault", reason: "receiver_absent" };
   }
@@ -138,42 +149,31 @@ export function redact(value) {
 }
 
 export function openReadonly(path) {
-  if (!existsSync(path)) return { ok: false, reason: "missing_db" };
-  const db = new Database(path, { readonly: true, create: false });
-  return { ok: true, db };
+  try {
+    if (!existsSync(path)) return { ok: false, reason: "missing_db" };
+    const db = new Database(path, { readonly: true, create: false });
+    db.query("SELECT 1").get();
+    return { ok: true, db };
+  } catch {
+    return { ok: false, reason: "unreadable" };
+  }
 }
 
 export function readGajaegun(snapshot) {
   if (snapshot.readError) {
     return { bot: "gajaegun", readError: safeReadError(snapshot.readError), source: snapshot.source ?? null, observedAt: snapshot.observedAt ?? null };
   }
-  const stalePidRejected = snapshot.pidAlive === true && Boolean(snapshot.pidSessionId) && snapshot.pidSessionId !== snapshot.sessionId;
-  const bound = Boolean(snapshot.pid) && snapshot.pidAlive === true && snapshot.pidSessionId === snapshot.sessionId && Boolean(snapshot.sessionId);
+  const normalized = readGeneric("gajaegun", snapshot);
   return {
-    bot: "gajaegun",
-    identity: snapshot.sessionId ?? null,
-    source: snapshot.source ?? "gateway-readonly",
-    observedAt: snapshot.observedAt,
-    generation: bound ? snapshot.generation ?? String(snapshot.pid) : null,
-    sessionId: snapshot.sessionId ?? null,
-    processAlive: bound ? true : (snapshot.processEvidence === "bound" ? snapshot.processAlive : null),
-    processEvidence: bound ? "bound" : "unconfirmed",
-    receiverPresent: snapshot.receiverPresent ?? null,
+    ...normalized,
     dbReadable: snapshot.dbReadable ?? null,
-    provider: snapshot.provider ?? null,
-    providerError: snapshot.providerError ?? null,
-    providerErrorProvider: snapshot.providerErrorProvider ?? null,
-    providerErrorGeneration: snapshot.providerErrorGeneration ?? null,
-    working: snapshot.working === true,
-    awaitingHuman: snapshot.awaitingHuman === true,
-    intentionalSilence: snapshot.intentionalSilence === true,
-    plannedStop: snapshot.plannedStop === true,
-    maintenance: snapshot.maintenance === true,
-    autostart: snapshot.autostart ?? "systemd",
-    stalePidRejected,
-    collectedFields: snapshot.collectedFields ?? [],
-    uncollectedFields: snapshot.uncollectedFields ?? [],
-    collectSkewMs: snapshot.collectSkewMs ?? 0,
+    boundConversationSession: snapshot.boundConversationSession ?? null,
+    runtimeProcessIdentity: snapshot.runtimeProcessIdentity ?? (snapshot.pid ? String(snapshot.pid) : null),
+    sessionId: snapshot.sessionId ?? null,
+    boundConversationSession: snapshot.boundConversationSession ?? null,
+    identity: snapshot.sessionId ?? snapshot.boundConversationSession ?? null,
+    attribution: normalized.attribution,
+    stalePidRejected: normalized.stalePidRejected,
   };
 }
 
@@ -187,14 +187,19 @@ export function readGeneric(bot, snapshot) {
       observedAt: snapshot?.observedAt ?? null,
     };
   }
-  const { bot: ignoredBot, ...rest } = snapshot;
-  const bound = rest.processEvidence === "bound";
-  const pidAlive = rest.pidAlive === true && Boolean(rest.pid);
+  const { bot: ignoredBot, processEvidence: ignoredEvidence, ...rest } = snapshot;
+  const attributed = attribution(rest);
   return {
     ...rest,
     bot,
-    processAlive: bound ? rest.processAlive === true && (rest.pid == null || pidAlive) : null,
-    processEvidence: bound && rest.processAlive === true ? "bound" : rest.processEvidence ?? "unconfirmed",
+    sessionId: rest.sessionId ?? null,
+    boundConversationSession: rest.boundConversationSession ?? null,
+    runtimeProcessIdentity: rest.runtimeProcessIdentity ?? (rest.pid ? String(rest.pid) : null),
+    processAlive: attributed.bound,
+    processAbsent: attributed.processAbsent === true,
+    stalePidRejected: rest.pidAlive === true && Boolean(rest.pidSessionId) && rest.pidSessionId !== rest.sessionId,
+    processEvidence: attributed.bound ? "bound" : "unconfirmed",
+    attribution: attributed.reason,
     providerErrorGeneration: rest.providerErrorGeneration ?? null,
   };
 }
@@ -265,21 +270,27 @@ function readOmonyang() {
   const observedAt = new Date().toISOString();
   if (!health.ok) return { readError: health.reason, source: healthPath, observedAt };
   const pid = Number(health.value.runtime_pid);
-  const alive = procAlive(pid);
+  const sessionId = typeof health.value.session_id === "string" ? health.value.session_id : null;
+  const checkedAt = Number(health.value.checked_at);
+  const freshHealth = Number.isFinite(checkedAt) && Date.now() - checkedAt * 1000 <= FRESH_MS;
+  let cmdline = "";
+  try { cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8"); } catch { cmdline = ""; }
+  const sessionMatchesProcess = freshHealth && sessionId !== null && cmdline.includes(sessionId) && cmdline.includes("오모냥");
   return {
-    source: "recovery-health.json",
+    source: "recovery-health.json+/proc/cmdline",
     observedAt,
-    sessionId: typeof health.value.session_id === "string" ? health.value.session_id : null,
-    identity: typeof health.value.session_id === "string" ? health.value.session_id : null,
-    generation: alive ? String(pid) : null,
-    pid: alive ? pid : null,
-    pidAlive: alive,
-    processAlive: alive,
-    processEvidence: alive ? "bound" : "unconfirmed",
-    recoveryUnit: "not-runtime-evidence",
-    autostart: "existing-timer-unverified",
-    collectedFields: ["session_id", "runtime_pid", "proc"],
-    uncollectedFields: ["provider", "receiver", "replyLink"],
+    sessionId,
+    identity: sessionId,
+    generation: sessionMatchesProcess ? String(pid) : null,
+    pid,
+    pidAlive: cmdline.length > 0,
+    pidSessionId: sessionMatchesProcess ? sessionId : null,
+    processAlive: sessionMatchesProcess,
+    sessionMatchesProcess,
+    healthCheckedAt: Number.isFinite(checkedAt) ? checkedAt : null,
+    healthProducer: "/home/jm/.omo/omonyang/bin/omonyang-recovery.py",
+    collectedFields: ["session_id", "runtime_pid", "checked_at", "cmdline"],
+    uncollectedFields: ["provider", "receiver", "replyLink", "processStartTime"],
   };
 }
 
@@ -292,20 +303,25 @@ function readDori() {
   let parsed;
   try { parsed = JSON.parse(result.stdout); } catch { return { readError: "unreadable", source: cli, observedAt }; }
   const sessionId = typeof parsed.sessionId === "string" ? parsed.sessionId : null;
+  const ownerSessionId = parsed.nativeOwner?.sessionId ?? null;
   const processes = Array.isArray(parsed.processes) ? parsed.processes : [];
-  const nativeAlive = parsed.nativeOwner?.alive === true;
-  const bound = processes.length > 0 || nativeAlive;
+  const identity = parsed.nativeOwner?.processIdentity ?? null;
+  const matched = processes.find((item) => item.processIdentity === identity);
+  const sessionMatchesProcess = sessionId !== null && ownerSessionId === sessionId && matched != null && parsed.nativeOwner?.alive === true;
   return {
     source: "dori-runtime-cli.ts inspect",
     observedAt,
     sessionId,
+    ownerSessionId,
     identity: sessionId,
-    processAlive: bound,
-    processEvidence: bound ? "bound" : "unconfirmed",
-    generation: parsed.nativeOwner?.processIdentity ?? null,
-    provider: null,
-    autostart: "unconfirmed",
-    collectedFields: ["sessionId", "processes", "nativeOwner.alive"],
+    pid: matched?.pid ?? null,
+    pidAlive: matched != null,
+    pidSessionId: sessionMatchesProcess ? sessionId : null,
+    processAlive: sessionMatchesProcess,
+    sessionMatchesProcess,
+    generation: sessionMatchesProcess ? identity : null,
+    runtimeProcessIdentity: identity,
+    collectedFields: ["sessionId", "nativeOwner.sessionId", "processes.processIdentity"],
     uncollectedFields: ["provider", "replyLink"],
   };
 }
@@ -328,33 +344,33 @@ export function liveOnce() {
 
 function readGajaegunLive() {
   const observedAt = new Date().toISOString();
-  const gateway = systemctlShow("gajaeway-gateway.service");
-  const adapter = systemctlShow("gajaeway-adapter-slack.service");
-  const db = openReadonly("/home/jm/.gajaegun/gajaeway/gateway.db");
+  let gateway = { readError: "systemctl_failed" };
+  let adapter = { readError: "systemctl_failed" };
   let dbReadable = false;
-  if (db.ok) {
-    try {
-      db.db.query("SELECT 1").get();
-      dbReadable = true;
-    } catch {
-      dbReadable = false;
-    } finally {
-      db.db.close();
+  try { gateway = systemctlShow("gajaeway-gateway.service"); } catch { gateway = { readError: "systemctl_failed" }; }
+  try { adapter = systemctlShow("gajaeway-adapter-slack.service"); } catch { adapter = { readError: "systemctl_failed" }; }
+  try {
+    const db = openReadonly("/home/jm/.gajaegun/gajaeway/gateway.db");
+    if (db.ok) {
+      try { db.db.query("SELECT 1").get(); dbReadable = true; } catch { dbReadable = false; }
+      finally { db.db.close(); }
     }
+  } catch {
+    dbReadable = false;
   }
-  const bound = gateway.processEvidence === "bound";
   return {
     source: "gajaeway-gateway.service+adapter+db-ro",
     observedAt,
     dbReadable,
-    processAlive: bound,
-    processEvidence: bound ? "bound" : "unconfirmed",
-    pid: gateway.pid,
-    pidAlive: gateway.pidAlive,
-    pidSessionId: bound ? `pid:${gateway.pid}` : null,
-    sessionId: bound ? `pid:${gateway.pid}` : null,
-    generation: gateway.generation,
-    receiverPresent: adapter.processEvidence === "bound" ? true : null,
+    processAlive: gateway.processAlive === true,
+    pid: gateway.pid ?? null,
+    pidAlive: gateway.pidAlive === true,
+    runtimeProcessIdentity: gateway.pid ? String(gateway.pid) : null,
+    sessionId: null,
+    boundConversationSession: null,
+    generation: null,
+    sessionMatchesProcess: false,
+    receiverPresent: adapter.processAlive === true ? true : null,
     provider: null,
     collectedFields: ["gateway.ActiveState", "adapter.ActiveState", "db.readable"],
     uncollectedFields: ["boundConversationSession", "provider", "replyLink"],
