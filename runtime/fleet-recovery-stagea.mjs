@@ -127,18 +127,16 @@ export function transition(db, command) {
     const lockParent = lock ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(lock.incident_id) : null;
     if (lockParent && supplied && lockParent.id !== supplied.id) return { ok: false, reason: "store_invalid" };
     const history = db.query("SELECT bot_key, last_incident_id, last_at FROM target_history WHERE bot_key = ?").get(command.botKey);
-    if (history) {
-      const historical = db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(history.last_incident_id);
-      if (!historical || (historical.scope_kind === "bot" && historical.scope_key !== command.botKey)) return { ok: false, reason: "store_invalid" };
-    }
-    const incidentId = alias?.incident_id ?? supplied?.id ?? lockParent?.id ?? history?.last_incident_id ?? null;
+    const historical = history ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(history.last_incident_id) : null;
+    if (history && (!historical || storedScopeValid(historical, command) === "store_invalid")) return { ok: false, reason: "store_invalid" };
+    const referenced = [alias?.incident_id, supplied?.id, lock?.incident_id, history?.last_incident_id].filter(Boolean);
+    if (new Set(referenced).size > 1) return { ok: false, reason: "store_invalid" };
+    const incidentId = referenced[0] ?? null;
     if (!incidentId) return { ok: false, reason: "missing_independence_evidence" };
     const stored = db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId);
     if (!stored) return { ok: false, reason: "store_invalid" };
     const scopeRejected = storedScopeValid(stored, command);
     if (scopeRejected) return { ok: false, reason: scopeRejected };
-    if (lock && lock.incident_id !== stored.id) return { ok: false, reason: "store_invalid" };
-    if (history && history.last_incident_id !== stored.id && !alias && !supplied) return { ok: false, reason: "store_invalid" };
     const id = stored.id;
     db.query("INSERT OR IGNORE INTO aliases (observation_key, incident_id) VALUES (?, ?)").run(command.observationKey, id);
     db.query("INSERT INTO bot_locks (bot_key, incident_id, held_generation) VALUES (?, ?, ?) ON CONFLICT(bot_key) DO NOTHING")
