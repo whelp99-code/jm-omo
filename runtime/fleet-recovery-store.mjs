@@ -1,10 +1,27 @@
 import { Database } from "bun:sqlite";
+import { realpathSync } from "node:fs";
 
-const FORBIDDEN = ["/home/jm/.gajaegun/gajaeway/gateway.db", "/home/jm/.dinobot/"];
+const FORBIDDEN = [
+  "/home/jm/.gajaegun/gajaeway/gateway.db",
+  "/home/jm/.dinobot",
+];
+
+function refusedNativePath(path) {
+  let canonical;
+  try {
+    canonical = realpathSync(path);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw new Error("native db refused");
+    const slash = path.lastIndexOf("/");
+    const parent = realpathSync(slash <= 0 ? "/" : path.slice(0, slash));
+    canonical = `${parent}${slash <= 0 ? "/" : ""}${path.slice(slash + 1)}`;
+  }
+  return FORBIDDEN.some((prefix) => canonical === prefix || canonical.startsWith(`${prefix}/`));
+}
 
 export function openRecoveryStore(path) {
-  if (typeof path !== "string" || path.length === 0) throw new Error("missing fixture path");
-  if (FORBIDDEN.some((prefix) => path.startsWith(prefix))) throw new Error("native db refused");
+  if (typeof path !== "string" || path.length === 0 || path.includes("\0")) throw new Error("missing fixture path");
+  if (refusedNativePath(path)) throw new Error("native db refused");
   const db = new Database(path);
   db.exec("PRAGMA journal_mode=WAL");
   db.exec(`CREATE TABLE IF NOT EXISTS recovery_budget (

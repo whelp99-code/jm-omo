@@ -42,10 +42,10 @@ describe("stage A durable reducer", () => {
     opened.db.close();
   });
 
-  test("missing independence and untrusted clock fail closed", () => {
+  test("untrusted clock and raw independence flag fail closed", () => {
     const opened = db();
     expect(transition(opened.db, { ...base, independentEpisode: false }).reason).toBe("missing_independence_evidence");
-    expect(transition(opened.db, { ...base, independentEpisode: true }).reason).toBe("missing_independence_evidence");
+    expect(transition(opened.db, { ...base, independentEpisode: "true" }).reason).toBe("missing_independence_evidence");
     expect(transition(opened.db, { ...base, trustedClock: false }).reason).toBe("untrusted_clock");
     opened.db.close();
   });
@@ -59,6 +59,18 @@ describe("stage A durable reducer", () => {
     const prepared = transition(opened.db, { ...base, independentEpisode: false });
     expect(settle(opened.db, prepared.incidentId, "notification", "made_up").reason).toBe("bad_enum");
     expect(settle(opened.db, prepared.incidentId, "notification", "unknown").outcome).toBe("unknown");
+    opened.db.close();
+  });
+  test("independent episode is created once and shared recovery is refused", () => {
+    const opened = db();
+    const first = transition(opened.db, base);
+    const second = transition(opened.db, { ...base, observationKey: '["dori","o","s","g","other"]' });
+    expect(first).toMatchObject({ reserved: true, reason: "prepared" });
+    expect(second).toMatchObject({ reserved: false, reason: "budget_used", incidentId: first.incidentId });
+    const shared = '["slack","tenant","dependency"]';
+    const recovery = transition(opened.db, { ...base, kind: "recovery", sharedKey: shared, observationKey: '["dinobot","o","s","g","slack"]', botKey: '["dinobot","o","runtime"]' });
+    expect(recovery).toMatchObject({ ok: false, reason: "shared_dependency" });
+    expect(opened.db.query("SELECT COUNT(*) AS n FROM incidents WHERE scope_kind = 'shared'").get().n).toBe(0);
     opened.db.close();
   });
 });

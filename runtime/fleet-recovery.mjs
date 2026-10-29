@@ -274,7 +274,8 @@ export async function evaluateDurable(db, observation, nowMs, effects = {}) {
     outcome = "failure";
     reason = "failure";
   }
-  const state = decision.action === "reconnect_once" && outcome === "delivered" ? "RECOVERY_REQUESTED" : "ESCALATED";
+  const confirmed = decision.action === "reconnect_once" && outcome === "delivered" && observation.resultUnknown !== true;
+  const state = confirmed ? "RECOVERY_REQUESTED" : "ESCALATED";
   markAttempt(db, key, outcome === "delivered" ? state : outcome);
   return { state, reason, reserved: true, calls, attempts: readAttempt(db, key)?.attempts ?? 0 };
 }

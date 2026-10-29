@@ -21,11 +21,7 @@ export function openStageStore(path, nowMs = Date.now()) {
     if (fk?.foreign_keys !== 1) return closed(db, "schema_failed");
     const userTables = db.query("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
     if (userTables.length === 0) return initializeSchema(db, nowMs, started);
-    const meta = userTables.find((table) => table.name === "meta");
-    if (!meta || meta.sql !== "CREATE TABLE meta (schema_version INTEGER PRIMARY KEY)") return closed(db, "unsupported_schema");
-    const versions = db.query("SELECT schema_version FROM meta ORDER BY schema_version").all();
-    if (versions.length !== 1 || versions[0].schema_version !== 1) return closed(db, "unsupported_schema");
-    return { ok: true, db, budgetMs: DB_BUDGET_MS, openedAt: nowMs };
+    return existingSchema(db, nowMs, started);
   } catch (error) {
     if (db) {
       try { db.close(); } catch { /* already closed */ }
@@ -37,10 +33,10 @@ export function openStageStore(path, nowMs = Date.now()) {
 function initializeSchema(db, nowMs, started) {
   db.exec("BEGIN IMMEDIATE");
   try {
-    const existing = db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
+    const existing = db.query("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
     if (existing.length !== 0) {
       db.exec("ROLLBACK");
-      return closed(db, "unsupported_schema");
+      return existingSchema(db, nowMs, started);
     }
     db.exec(`CREATE TABLE meta (schema_version INTEGER PRIMARY KEY);
       CREATE TABLE incidents (
@@ -63,6 +59,16 @@ function initializeSchema(db, nowMs, started) {
     try { db.exec("ROLLBACK"); } catch { /* not open */ }
     return closed(db, /busy/i.test(String(error)) ? "busy" : "schema_failed");
   }
+  if (Date.now() - started > DB_BUDGET_MS) return closed(db, "busy");
+  return { ok: true, db, budgetMs: DB_BUDGET_MS, openedAt: nowMs };
+}
+
+function existingSchema(db, nowMs, started) {
+  const userTables = db.query("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
+  const meta = userTables.find((table) => table.name === "meta");
+  if (!meta || meta.sql !== "CREATE TABLE meta (schema_version INTEGER PRIMARY KEY)") return closed(db, "unsupported_schema");
+  const versions = db.query("SELECT schema_version FROM meta ORDER BY schema_version").all();
+  if (versions.length !== 1 || versions[0].schema_version !== 1) return closed(db, "unsupported_schema");
   if (Date.now() - started > DB_BUDGET_MS) return closed(db, "busy");
   return { ok: true, db, budgetMs: DB_BUDGET_MS, openedAt: nowMs };
 }
@@ -130,12 +136,26 @@ export function transition(db, command) {
     if (history && historical.scope_kind === "bot" && (historical.scope_key !== command.botKey || !COMMAND_ROLES.has(canonicalTuple(historical.scope_key, 3)[0]))) {
       return { ok: false, reason: "store_invalid" };
     }
+    if (command.sharedKey && command.kind === "recovery") return { ok: false, reason: "shared_dependency" };
     const referenced = [alias?.incident_id, supplied?.id, lock?.incident_id, history?.last_incident_id].filter(Boolean);
     if (new Set(referenced).size > 1) return { ok: false, reason: "store_invalid" };
     if (alias && lock && alias.incident_id !== lock.incident_id) return { ok: false, reason: "store_invalid" };
     if (alias && supplied && alias.incident_id !== supplied.id) return { ok: false, reason: "identity_mismatch" };
     const incidentId = referenced[0] ?? null;
-    if (!incidentId) return { ok: false, reason: "missing_independence_evidence" };
+    if (!incidentId) {
+      if (command.independentEpisode !== true) return { ok: false, reason: "missing_independence_evidence" };
+      const id = `ep-${command.nowMs}-${command.observationKey}`;
+      const scopeKind = command.sharedKey ? "shared" : "bot";
+      const scopeKey = command.sharedKey ?? command.botKey;
+      db.query("INSERT INTO incidents (id, scope_kind, scope_key, qstate, opened_at, closed_at, revision) VALUES (?, ?, ?, 'UNKNOWN', ?, NULL, 1)")
+        .run(id, scopeKind, scopeKey, command.nowMs);
+      db.query("INSERT INTO aliases (observation_key, incident_id) VALUES (?, ?)").run(command.observationKey, id);
+      db.query("INSERT INTO bot_locks (bot_key, incident_id, held_generation) VALUES (?, ?, ?)").run(command.botKey, id, command.generation);
+      db.query("INSERT INTO attempts (incident_id, kind, phase, budget_used, outcome, opened_at) VALUES (?, ?, 'PREPARED', 1, 'pending', ?)")
+        .run(id, command.kind, command.nowMs);
+      db.query("INSERT INTO target_history (bot_key, last_incident_id, last_at) VALUES (?, ?, ?)").run(command.botKey, id, command.nowMs);
+      return { ok: true, reserved: true, reason: "prepared", incidentId: id, phase: "PREPARED" };
+    }
     const stored = db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId);
     if (!stored) return { ok: false, reason: "store_invalid" };
     const scopeRejected = storedScopeValid(stored, command);

@@ -249,4 +249,16 @@ describe("fleet recovery fixture", () => {
     const text = readFileSync(new URL("./fleet-recovery.mjs", import.meta.url), "utf8");
     expect(productionCallCount(text)).toBe(0);
   });
+  test("durable unknown reconnect stays escalated", async () => {
+    const db = openRecoveryStore(join(mkdtempSync(join(tmpdir(), "unknown-durable-")), "budget.sqlite"));
+    const result = await evaluateDurable(db, obs({ receiverDown: true, officialReconnect: true, resultUnknown: true }), NOW, { reconnect() {} });
+    expect(result.state).toBe("ESCALATED");
+    expect(result.calls).toBe(1);
+    db.close();
+  });
+
+  test("native recovery path aliases are refused before opening", () => {
+    expect(() => openRecoveryStore("/home/jm/.gajaegun/gajaeway/./gateway.db")).toThrow("native db refused");
+    expect(() => openRecoveryStore("/home/jm/.dinobot/alias.sqlite")).toThrow("native db refused");
+  });
 });
