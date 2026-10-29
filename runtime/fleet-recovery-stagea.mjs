@@ -123,7 +123,7 @@ export function transition(db, command) {
   const rejected = invalidCommand(command);
   if (rejected) return { ok: false, reason: rejected };
   const run = db.transaction(() => {
-    const present = (value) => value != null && String(value).length > 0;
+    const present = (value) => typeof value === "string" && value.length > 0;
     const alias = db.query("SELECT incident_id FROM aliases WHERE observation_key = ?").get(command.observationKey);
     const lock = db.query("SELECT incident_id FROM bot_locks WHERE bot_key = ?").get(command.botKey);
     const parents = command.sharedKey
@@ -149,13 +149,13 @@ export function transition(db, command) {
     }
     const ids = refs.map(([, , id]) => id).filter(present);
     if (new Set(ids).size > 1) return { ok: false, reason: "store_invalid" };
-    if (command.sharedKey && command.kind === "recovery") return { ok: false, reason: "shared_dependency" };
     const incidentId = ids[0] ?? null;
     if (!incidentId) return { ok: false, reason: "missing_independence_evidence" };
     const stored = db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId);
     if (!stored) return { ok: false, reason: "store_invalid" };
     const scopeRejected = storedScopeValid(stored, command);
     if (scopeRejected) return { ok: false, reason: scopeRejected };
+    if (command.sharedKey && command.kind === "recovery") return { ok: false, reason: "shared_dependency" };
     const id = stored.id;
     db.query("INSERT OR IGNORE INTO aliases (observation_key, incident_id) VALUES (?, ?)").run(command.observationKey, id);
     db.query("INSERT INTO bot_locks (bot_key, incident_id, held_generation) VALUES (?, ?, ?) ON CONFLICT(bot_key) DO NOTHING")
