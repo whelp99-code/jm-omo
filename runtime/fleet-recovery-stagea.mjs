@@ -123,39 +123,35 @@ export function transition(db, command) {
   const rejected = invalidCommand(command);
   if (rejected) return { ok: false, reason: rejected };
   const run = db.transaction(() => {
+    const present = (value) => value != null && String(value).length > 0;
     const alias = db.query("SELECT incident_id FROM aliases WHERE observation_key = ?").get(command.observationKey);
     const lock = db.query("SELECT incident_id FROM bot_locks WHERE bot_key = ?").get(command.botKey);
-    const supplied = command.sharedKey
-      ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE scope_kind = 'shared' AND scope_key = ? AND closed_at IS NULL").get(command.sharedKey)
-      : null;
+    const parents = command.sharedKey
+      ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE scope_kind = 'shared' AND scope_key = ? AND closed_at IS NULL").all(command.sharedKey)
+      : [];
     const history = db.query("SELECT bot_key, last_incident_id, last_at FROM target_history WHERE bot_key = ?").get(command.botKey);
     const historical = history ? db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(history.last_incident_id) : null;
+    const refs = [
+      ["alias", alias, alias?.incident_id],
+      ["lock", lock, lock?.incident_id],
+      ["history", history, history?.last_incident_id],
+      ...parents.map((parent) => ["shared", parent, parent.id]),
+    ];
+    if (refs.some(([, row, id]) => row && !present(id)) || parents.length > 1) return { ok: false, reason: "store_invalid" };
+    if (parents.some((parent) => parent.scope_kind !== "shared" || parent.scope_key !== command.sharedKey || !canonicalTuple(parent.scope_key, 3))) {
+      return { ok: false, reason: "store_invalid" };
+    }
     if (history && (!historical || historical.scope_kind !== "bot" && historical.scope_kind !== "shared" || !canonicalTuple(historical.scope_key, 3))) {
       return { ok: false, reason: "store_invalid" };
     }
     if (history && historical.scope_kind === "bot" && (historical.scope_key !== command.botKey || !COMMAND_ROLES.has(canonicalTuple(historical.scope_key, 3)[0]))) {
       return { ok: false, reason: "store_invalid" };
     }
+    const ids = refs.map(([, , id]) => id).filter(present);
+    if (new Set(ids).size > 1) return { ok: false, reason: "store_invalid" };
     if (command.sharedKey && command.kind === "recovery") return { ok: false, reason: "shared_dependency" };
-    const referenced = [alias?.incident_id, supplied?.id, lock?.incident_id, history?.last_incident_id].filter(Boolean);
-    if (new Set(referenced).size > 1) return { ok: false, reason: "store_invalid" };
-    if (alias && lock && alias.incident_id !== lock.incident_id) return { ok: false, reason: "store_invalid" };
-    if (alias && supplied && alias.incident_id !== supplied.id) return { ok: false, reason: "identity_mismatch" };
-    const incidentId = referenced[0] ?? null;
-    if (!incidentId) {
-      if (command.independentEpisode !== true) return { ok: false, reason: "missing_independence_evidence" };
-      const id = `ep-${command.nowMs}-${command.observationKey}`;
-      const scopeKind = command.sharedKey ? "shared" : "bot";
-      const scopeKey = command.sharedKey ?? command.botKey;
-      db.query("INSERT INTO incidents (id, scope_kind, scope_key, qstate, opened_at, closed_at, revision) VALUES (?, ?, ?, 'UNKNOWN', ?, NULL, 1)")
-        .run(id, scopeKind, scopeKey, command.nowMs);
-      db.query("INSERT INTO aliases (observation_key, incident_id) VALUES (?, ?)").run(command.observationKey, id);
-      db.query("INSERT INTO bot_locks (bot_key, incident_id, held_generation) VALUES (?, ?, ?)").run(command.botKey, id, command.generation);
-      db.query("INSERT INTO attempts (incident_id, kind, phase, budget_used, outcome, opened_at) VALUES (?, ?, 'PREPARED', 1, 'pending', ?)")
-        .run(id, command.kind, command.nowMs);
-      db.query("INSERT INTO target_history (bot_key, last_incident_id, last_at) VALUES (?, ?, ?)").run(command.botKey, id, command.nowMs);
-      return { ok: true, reserved: true, reason: "prepared", incidentId: id, phase: "PREPARED" };
-    }
+    const incidentId = ids[0] ?? null;
+    if (!incidentId) return { ok: false, reason: "missing_independence_evidence" };
     const stored = db.query("SELECT id, scope_kind, scope_key FROM incidents WHERE id = ?").get(incidentId);
     if (!stored) return { ok: false, reason: "store_invalid" };
     const scopeRejected = storedScopeValid(stored, command);

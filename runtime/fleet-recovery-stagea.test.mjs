@@ -61,16 +61,21 @@ describe("stage A durable reducer", () => {
     expect(settle(opened.db, prepared.incidentId, "notification", "unknown").outcome).toBe("unknown");
     opened.db.close();
   });
-  test("independent episode is created once and shared recovery is refused", () => {
+  test("empty, duplicate, and raw episode authority fail closed", () => {
     const opened = db();
-    const first = transition(opened.db, base);
-    const second = transition(opened.db, { ...base, observationKey: '["dori","o","s","g","other"]' });
-    expect(first).toMatchObject({ reserved: true, reason: "prepared" });
-    expect(second).toMatchObject({ reserved: false, reason: "budget_used", incidentId: first.incidentId });
+    opened.db.exec("PRAGMA foreign_keys=OFF");
+    opened.db.query("INSERT INTO aliases VALUES (?,?)").run(base.observationKey, "");
+    opened.db.exec("PRAGMA foreign_keys=ON");
+    expect(transition(opened.db, base).reason).toBe("store_invalid");
+    opened.db.query("DELETE FROM aliases");
+    const fresh = openStageStore(join(mkdtempSync(join(tmpdir(), "stagea-")), "fresh.sqlite"), 1_000);
     const shared = '["slack","tenant","dependency"]';
-    const recovery = transition(opened.db, { ...base, kind: "recovery", sharedKey: shared, observationKey: '["dinobot","o","s","g","slack"]', botKey: '["dinobot","o","runtime"]' });
-    expect(recovery).toMatchObject({ ok: false, reason: "shared_dependency" });
-    expect(opened.db.query("SELECT COUNT(*) AS n FROM incidents WHERE scope_kind = 'shared'").get().n).toBe(0);
+    opened.db.query("INSERT INTO incidents VALUES (?,?,?,?,?,NULL,?)").run("P1", "shared", shared, "UNKNOWN", 1000, 1);
+    opened.db.query("INSERT INTO incidents VALUES (?,?,?,?,?,NULL,?)").run("P2", "shared", shared, "UNKNOWN", 1000, 1);
+    expect(transition(opened.db, { ...base, sharedKey: shared, kind: "recovery" }).reason).toBe("store_invalid");
+    expect(transition(fresh.db, { ...base, independentEpisode: true }).reason).toBe("missing_independence_evidence");
+    expect(opened.db.query("SELECT COUNT(*) AS n FROM attempts").get().n).toBe(0);
     opened.db.close();
+    fresh.db.close();
   });
 });
