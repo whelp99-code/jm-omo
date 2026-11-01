@@ -1,14 +1,19 @@
+import { refusedNativePath } from "./fleet-recovery-store.mjs";
 import { Database } from "bun:sqlite";
 
 const DB_BUDGET_MS = 2_000;
-const FORBIDDEN = ["/home/jm/.gajaegun/gajaeway/gateway.db", "/home/jm/.dinobot/"];
 const QSTATES = new Set(["UNKNOWN", "HEALTHY", "ESCALATED", "RECOVERY_REQUESTED"]);
 const PHASES = new Set(["PREPARED", "DISPATCH_INTENT", "SETTLED"]);
 const OUTCOMES = new Set(["pending", "accepted", "delivered", "failed", "unknown", "not_dispatched"]);
 
 export function openStageStore(path, nowMs = Date.now()) {
   const started = Date.now();
-  if (typeof path !== "string" || FORBIDDEN.some((prefix) => path.startsWith(prefix))) {
+  if (typeof path !== "string" || path.length === 0 || path.includes("\0")) {
+    return { ok: false, reason: "native_db_refused" };
+  }
+  try {
+    if (refusedNativePath(path)) return { ok: false, reason: "native_db_refused" };
+  } catch {
     return { ok: false, reason: "native_db_refused" };
   }
   let db;

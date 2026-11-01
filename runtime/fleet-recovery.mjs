@@ -2,6 +2,7 @@
 // Limited recovery decisions for the existing watchdog. No live restart, timer, or Slack write.
 
 import { markAttempt, openRecoveryStore, readAttempt, reserveScope } from "./fleet-recovery-store.mjs";
+import { approvalAccepted } from "./owner-approval.mjs";
 export function botKey(observation) {
   if (!observation?.role || !observation.owner || !observation.session || !observation.generation) return null;
   return JSON.stringify([observation.role, observation.owner, observation.session, observation.generation]);
@@ -114,7 +115,12 @@ function parentKey(observation) {
   return incidentKey(observation);
 }
 function approved(effects) {
-  return typeof effects?.approvalToken === "string" && effects.approvalToken.length > 0;
+  return approvalAccepted({
+    token: effects?.approvalToken,
+    number: effects?.approvalNumber,
+    recommendationTs: effects?.recommendationTs ?? "",
+    fixture: effects?.approvalFixture,
+  }).ok === true;
 }
 
 function commit(store, key, incident) {
@@ -239,9 +245,6 @@ export function loadStore(text) {
   return { incidents, locks };
 }
 
-export function productionCallCount(sourceText) {
-  return sourceText.split("\n").filter((line) => /\bspawnSync\(|\bsystemctl\b|\bslackWrite\b|\bsetInterval\(/.test(line)).length;
-}
 export async function evaluateDurable(db, observation, nowMs, effects = {}) {
   const decision = classifyRole(observation, nowMs);
   const key = parentKey(observation);

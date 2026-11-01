@@ -52,6 +52,8 @@ describe("stage A durable reducer", () => {
 
   test("native db and bad outcome are refused", () => {
     expect(openStageStore("/home/jm/.gajaegun/gajaeway/gateway.db").reason).toBe("native_db_refused");
+    expect(openStageStore("/home/jm/.gajaegun/gajaeway/./gateway.db").reason).toBe("native_db_refused");
+    expect(openStageStore("/home/jm/.dinobot/alias.sqlite").reason).toBe("native_db_refused");
     const opened = db();
     opened.db.query("INSERT INTO incidents VALUES (?,?,?,?,?,NULL,?)").run("I1", "bot", base.botKey, "UNKNOWN", 1000, 1);
     opened.db.query("INSERT INTO aliases VALUES (?,?)").run(base.observationKey, "I1");

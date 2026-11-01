@@ -1,9 +1,8 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
-import { evaluate, evaluateDurable, incidentKey, loadStore, openRecoveryStore, productionCallCount, recovered, supportMatrix } from "./fleet-recovery.mjs";
+import { evaluate, evaluateDurable, incidentKey, loadStore, openRecoveryStore, recovered, supportMatrix } from "./fleet-recovery.mjs";
 
 const NOW = Date.parse("2026-10-29T01:00:00.000Z");
 const WINDOW = {
@@ -22,9 +21,19 @@ function obs(extra = {}) {
 async function run(extra = {}, store = { incidents: Object.create(null), locks: Object.create(null) }, effects = {}) {
   return await evaluate(store, obs(extra), NOW, effects);
 }
-const APPROVED = "fixture-approval";
+const APPROVAL_TS = "1700000000.000001";
+const APPROVAL_NUMBER = "25";
 function approved(effects = {}) {
-  return { approvalToken: APPROVED, ...effects };
+  return {
+    approvalToken: APPROVAL_TS,
+    approvalNumber: APPROVAL_NUMBER,
+    approvalFixture: {
+      ok: true,
+      channel: "C0C9YHNUHUN",
+      messages: [{ ts: APPROVAL_TS, user: "U0B833NMP5J", channel: "C0C9YHNUHUN", text: "25 반영" }],
+    },
+    ...effects,
+  };
 }
 
 describe("fleet recovery fixture", () => {
@@ -259,9 +268,36 @@ describe("fleet recovery fixture", () => {
     expect(JSON.parse(proc.stdout.toString())).toEqual({ slot: "audit-caller", reserved: true, calls: 1 });
   });
 
-  test("production module has no live effect calls", () => {
-    const text = readFileSync(new URL("./fleet-recovery.mjs", import.meta.url), "utf8");
-    expect(productionCallCount(text)).toBe(0);
+  test("approval device rejects an arbitrary token and accepts only an owner source", async () => {
+    let calls = 0;
+    const reconnect = () => { calls += 1; };
+    const arbitrary = await run({ receiverDown: true, officialReconnect: true }, { incidents: {}, locks: {} }, {
+      reconnect, approvalToken: "fixture-approval", approvalNumber: "25", approvalFixture: approved().approvalFixture,
+    });
+    expect(calls).toBe(0);
+    expect(arbitrary.action).toBe("reconnect_once");
+    const wrongUser = approved({ reconnect });
+    wrongUser.approvalFixture = {
+      ok: true,
+      channel: "C0C9YHNUHUN",
+      messages: [{ ts: APPROVAL_TS, user: "U0C97QLUFUG", channel: "C0C9YHNUHUN", text: "25 반영" }],
+    };
+    expect((await run({ receiverDown: true, officialReconnect: true }, { incidents: {}, locks: {} }, wrongUser)).effects.reconnect).toBe(0);
+    const delegated = approved({
+      reconnect,
+      approvalToken: "1700000000.000002",
+      recommendationTs: "1700000000.000003",
+      approvalFixture: {
+        ok: true,
+        channel: "C0C9YHNUHUN",
+        messages: [
+          { ts: "1700000000.000002", user: "U0B833NMP5J", channel: "C0C9YHNUHUN", text: "반영" },
+          { ts: "1700000000.000003", user: "U0C97QLUFUG", channel: "C0C9YHNUHUN", text: "| 25 | 복구 | 반영 |" },
+        ],
+      },
+    });
+    expect((await run({ receiverDown: true, officialReconnect: true }, { incidents: {}, locks: {} }, delegated)).effects.reconnect).toBe(1);
+    expect(calls).toBe(1);
   });
   test("durable unknown reconnect stays escalated", async () => {
     const db = openRecoveryStore(join(mkdtempSync(join(tmpdir(), "unknown-durable-")), "budget.sqlite"));

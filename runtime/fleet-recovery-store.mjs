@@ -6,7 +6,7 @@ const FORBIDDEN = [
   "/home/jm/.dinobot",
 ];
 
-function refusedNativePath(path) {
+export function refusedNativePath(path) {
   let canonical;
   try {
     canonical = realpathSync(path);

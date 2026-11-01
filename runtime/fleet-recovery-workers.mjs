@@ -12,6 +12,15 @@ const observation = {
   officialReconnect: true,
 };
 let calls = 0;
-const result = await evaluateDurable(db, observation, now, { approvalToken: "fixture-approval", reconnect() { calls += 1; } });
+const result = await evaluateDurable(db, observation, now, {
+  approvalToken: "1700000000.000001",
+  approvalNumber: "25",
+  approvalFixture: {
+    ok: true,
+    channel: "C0C9YHNUHUN",
+    messages: [{ ts: "1700000000.000001", user: "U0B833NMP5J", channel: "C0C9YHNUHUN", text: "25 반영" }],
+  },
+  reconnect() { calls += 1; },
+});
 db.close();
 process.stdout.write(`${JSON.stringify({ slot, reserved: result.reserved, calls })}\n`);
