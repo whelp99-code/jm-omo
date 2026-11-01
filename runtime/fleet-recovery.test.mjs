@@ -22,6 +22,10 @@ function obs(extra = {}) {
 async function run(extra = {}, store = { incidents: Object.create(null), locks: Object.create(null) }, effects = {}) {
   return await evaluate(store, obs(extra), NOW, effects);
 }
+const APPROVED = "fixture-approval";
+function approved(effects = {}) {
+  return { approvalToken: APPROVED, ...effects };
+}
 
 describe("fleet recovery fixture", () => {
   test("1 working states do not restart", async () => {
@@ -50,19 +54,26 @@ describe("fleet recovery fixture", () => {
     expect(result.effects.restart).toBe(0);
   });
 
-  test("5 official reconnect is once across repeated evaluations", async () => {
+  test("5 official reconnect without approval returns the decision only", async () => {
     const store = { incidents: {}, locks: {} };
     let calls = 0;
     const effects = { reconnect() { calls += 1; } };
-    for (let i = 0; i < 10; i += 1) await run({ receiverDown: true, officialReconnect: true }, store, effects);
+    const decision = await run({ receiverDown: true, officialReconnect: true }, store, effects);
+    expect(calls).toBe(0);
+    expect(decision.state).toBe("CONFIRMED_FAULT");
+    expect(decision.action).toBe("reconnect_once");
+    expect(decision.reason).toBe("official_reconnect");
+    expect(decision.effects.reconnect).toBe(0);
+    expect(store.locks).toEqual({});
+    for (let i = 0; i < 10; i += 1) await run({ receiverDown: true, officialReconnect: true }, store, approved(effects));
     expect(calls).toBe(1);
   });
 
   test("6 two workers lock one incident action", async () => {
     const store = { incidents: {}, locks: {} };
-    const first = await run({ receiverDown: true, officialReconnect: true }, store, { reconnect() {} });
+    const first = await run({ receiverDown: true, officialReconnect: true }, store, approved({ reconnect() {} }));
     delete store.incidents[incidentKey(obs())];
-    const second = await evaluate(store, obs({ receiverDown: true, officialReconnect: true }), NOW, { reconnect() {} });
+    const second = await evaluate(store, obs({ receiverDown: true, officialReconnect: true }), NOW, approved({ reconnect() {} }));
     expect(first.effects.reconnect).toBe(1);
     expect(second.reason).toBe("incident_locked");
     expect(second.effects.reconnect).toBe(0);
@@ -70,7 +81,7 @@ describe("fleet recovery fixture", () => {
 
   test("7 unknown result consumes budget", async () => {
     const store = { incidents: {}, locks: {} };
-    await run({ receiverDown: true, officialReconnect: true, resultUnknown: true }, store);
+    await run({ receiverDown: true, officialReconnect: true, resultUnknown: true }, store, approved({ reconnect() {} }));
     const again = await run({ receiverDown: true, officialReconnect: true }, store);
     expect(again.effects.reconnect).toBe(0);
     expect(again.reason).toBe("budget_used");
@@ -86,8 +97,8 @@ describe("fleet recovery fixture", () => {
   });
 
   test("9 shared and auth faults notify without per-bot restart", async () => {
-    const auth = await run({ authExpired: true, role: "gajaegun" });
-    const shared = await run({ sharedDependency: true, role: "dinobot", cause: "slack" });
+    const auth = await run({ authExpired: true, role: "gajaegun" }, { incidents: {}, locks: {} }, approved());
+    const shared = await run({ sharedDependency: true, role: "dinobot", cause: "slack" }, { incidents: {}, locks: {} }, approved());
     expect(auth.effects.restart).toBe(0);
     expect(shared.effects.restart).toBe(0);
     expect(shared.incident.key).toBe(JSON.stringify(["shared", "shared", "shared", "shared", "slack"]));
@@ -129,7 +140,10 @@ describe("fleet recovery fixture", () => {
     expect(() => loadStore("[]")).toThrow();
     const store = { incidents: {}, locks: {} };
     expect((await evaluate(store, null, NOW)).state).toBe("UNKNOWN");
-    expect((await run({}, store)).state).toBe("HEALTHY");
+    const empty = await run({}, store);
+    expect(empty.state).toBe("UNKNOWN");
+    expect(empty.reason).toBe("missing_evidence");
+    expect((await run({ processDead: false, receiverDown: false }, store)).state).toBe("HEALTHY");
   });
 
   test("16 missing heartbeat is unsupported and notification failure is not recovery", async () => {
@@ -146,7 +160,7 @@ describe("fleet recovery fixture", () => {
     expect((await run({ processDead: true, attributed: true })).state).toBe("ESCALATED");
     expect((await run({ stage: "awaiting_reply", waitStartedAt: "2026-10-29T00:50:00.000Z" })).state).toBe("SUSPECT");
     const crashing = { incidents: Object.create(null), locks: Object.create(null), commits: [], commit(text) { this.commits.push(text); } };
-    const crashed = await run({ receiverDown: true, officialReconnect: true }, crashing, { reconnect() { throw new Error("down"); } });
+    const crashed = await run({ receiverDown: true, officialReconnect: true }, crashing, approved({ reconnect() { throw new Error("down"); } }));
     expect(crashed.reason).toBe("effect_failed");
     const saved = JSON.parse(crashing.commits[0]);
     const key = incidentKey(obs());
@@ -154,8 +168,8 @@ describe("fleet recovery fixture", () => {
     const reloaded = loadStore(JSON.stringify(saved));
     expect((await run({ receiverDown: true, officialReconnect: true }, reloaded)).effects.reconnect).toBe(0);
     const notices = { incidents: Object.create(null), locks: Object.create(null) };
-    expect((await run({ authExpired: true }, notices, { notify() {} })).effects.notify).toBe(1);
-    expect((await run({ authExpired: true }, notices, { notify() {} })).effects.notify).toBe(0);
+    expect((await run({ authExpired: true }, notices, approved({ notify() {} }))).effects.notify).toBe(1);
+    expect((await run({ authExpired: true }, notices, approved({ notify() {} }))).effects.notify).toBe(0);
     expect(() => loadStore(JSON.stringify({ incidents: [], locks: {} }))).toThrow();
     expect(incidentKey(obs({ owner: "a|b" }))).not.toBe(incidentKey(obs({ owner: "a", session: "b|s1" })));
     expect(recovered({ inputId: "a", replyInputId: "b", session: "s", replySession: "s", generation: "g", replyGeneration: "g", provider: "p", replyProvider: "p", model: null, replyModel: null, replyId: "r", threadReread: true, expectedAccount: true, inference: true })).toBe(false);
@@ -164,7 +178,7 @@ describe("fleet recovery fixture", () => {
     const failing = { incidents: Object.create(null), locks: Object.create(null) };
     let tries = 0;
     for (let i = 0; i < 3; i += 1) {
-      await run({ authExpired: true }, failing, { notify() { tries += 1; throw new Error("down"); } });
+      await run({ authExpired: true }, failing, approved({ notify() { tries += 1; throw new Error("down"); } }));
     }
     expect(tries).toBe(1);
     expect((await run({ authExpired: true }, { incidents: Object.create(null), locks: Object.create(null) })).state).toBe("ESCALATED");
@@ -174,15 +188,15 @@ describe("fleet recovery fixture", () => {
     expect(supportMatrix().find((item) => item.role === "nahee").support).toBe("unsupported");
     const dbPath = join(mkdtempSync(join(tmpdir(), "fleet-repair-")), "budget.sqlite");
     const db = openRecoveryStore(dbPath);
-    const first = await evaluateDurable(db, obs({ receiverDown: true, officialReconnect: true }), NOW, { reconnect() {} });
-    const second = await evaluateDurable(db, obs({ receiverDown: true, officialReconnect: true }), NOW, { reconnect() { throw new Error("again"); } });
+    const first = await evaluateDurable(db, obs({ receiverDown: true, officialReconnect: true }), NOW, approved({ reconnect() {} }));
+    const second = await evaluateDurable(db, obs({ receiverDown: true, officialReconnect: true }), NOW, approved({ reconnect() { throw new Error("again"); } }));
     expect(first.reserved).toBe(true);
     expect(second.reserved).toBe(false);
     expect(second.reason).toBe("attempt_reserved");
     db.close();
   });
   test("omo counterexamples keep absent adapters and shared budgets at zero extra calls", async () => {
-    const absent = await evaluate({ incidents: Object.create(null), locks: Object.create(null) }, obs({ receiverDown: true, officialReconnect: true }), NOW);
+    const absent = await evaluate({ incidents: Object.create(null), locks: Object.create(null) }, obs({ receiverDown: true, officialReconnect: true }), NOW, approved());
     expect(absent.state).toBe("ESCALATED");
     expect(absent.reason).toBe("adapter_absent");
     expect(absent.effects.reconnect).toBe(0);
@@ -190,16 +204,16 @@ describe("fleet recovery fixture", () => {
     const dir = mkdtempSync(join(tmpdir(), "omo-counter-"));
     const database = openRecoveryStore(join(dir, "budget.sqlite"));
     let calls = 0;
-    const first = await evaluateDurable(database, obs({ cause: "receiver-a", receiverDown: true, officialReconnect: true }), NOW, { reconnect() { calls += 1; } });
-    const second = await evaluateDurable(database, obs({ cause: "receiver-b", receiverDown: true, officialReconnect: true }), NOW, { reconnect() { calls += 1; } });
+    const first = await evaluateDurable(database, obs({ cause: "receiver-a", receiverDown: true, officialReconnect: true }), NOW, approved({ reconnect() { calls += 1; } }));
+    const second = await evaluateDurable(database, obs({ cause: "receiver-b", receiverDown: true, officialReconnect: true }), NOW, approved({ reconnect() { calls += 1; } }));
     expect(first.calls).toBe(1);
     expect(second.calls).toBe(0);
     expect(second.reason).toBe("attempt_reserved");
     expect(calls).toBe(1);
     const sharedDb = openRecoveryStore(join(dir, "shared.sqlite"));
     let notices = 0;
-    const dori = await evaluateDurable(sharedDb, obs({ role: "dori", sharedDependency: true, cause: "slack" }), NOW, { notify() { notices += 1; } });
-    const gajae = await evaluateDurable(sharedDb, obs({ role: "gajaegun", sharedDependency: true, cause: "slack" }), NOW, { notify() { notices += 1; } });
+    const dori = await evaluateDurable(sharedDb, obs({ role: "dori", sharedDependency: true, cause: "slack" }), NOW, approved({ notify() { notices += 1; } }));
+    const gajae = await evaluateDurable(sharedDb, obs({ role: "gajaegun", sharedDependency: true, cause: "slack" }), NOW, approved({ notify() { notices += 1; } }));
     expect(dori.calls + gajae.calls).toBe(1);
     expect(notices).toBe(1);
     database.close();
@@ -210,16 +224,16 @@ describe("fleet recovery fixture", () => {
     const rejections = [];
     const onRejection = (reason) => { rejections.push(reason); };
     process.on("unhandledRejection", onRejection);
-    const memory = await evaluate({ incidents: Object.create(null), locks: Object.create(null) }, obs({ receiverDown: true, officialReconnect: true }), NOW, {
+    const memory = await evaluate({ incidents: Object.create(null), locks: Object.create(null) }, obs({ receiverDown: true, officialReconnect: true }), NOW, approved({
       reconnect: () => Promise.reject(new Error("fixture-async-reconnect-rejected")),
-    });
+    }));
     const database = openRecoveryStore(join(mkdtempSync(join(tmpdir(), "async-reject-")), "budget.sqlite"));
-    const durable = await evaluateDurable(database, obs({ receiverDown: true, officialReconnect: true }), NOW, {
+    const durable = await evaluateDurable(database, obs({ receiverDown: true, officialReconnect: true }), NOW, approved({
       reconnect: () => Promise.reject(new Error("fixture-async-reconnect-rejected")),
-    });
-    const again = await evaluateDurable(database, obs({ receiverDown: true, officialReconnect: true }), NOW, {
+    }));
+    const again = await evaluateDurable(database, obs({ receiverDown: true, officialReconnect: true }), NOW, approved({
       reconnect: () => Promise.reject(new Error("fixture-async-reconnect-rejected")),
-    });
+    }));
     await new Promise((resolve) => setImmediate(resolve));
     process.off("unhandledRejection", onRejection);
     expect(rejections).toEqual([]);
@@ -251,7 +265,7 @@ describe("fleet recovery fixture", () => {
   });
   test("durable unknown reconnect stays escalated", async () => {
     const db = openRecoveryStore(join(mkdtempSync(join(tmpdir(), "unknown-durable-")), "budget.sqlite"));
-    const result = await evaluateDurable(db, obs({ receiverDown: true, officialReconnect: true, resultUnknown: true }), NOW, { reconnect() {} });
+    const result = await evaluateDurable(db, obs({ receiverDown: true, officialReconnect: true, resultUnknown: true }), NOW, approved({ reconnect() {} }));
     expect(result.state).toBe("ESCALATED");
     expect(result.calls).toBe(1);
     db.close();

@@ -83,7 +83,10 @@ export function classifyRole(observation, nowMs) {
   if (observation.stage === "awaiting_reply" && Number.isFinite(waitStarted) && nowMs - waitStarted >= SUSPECT_MS && nowMs - Date.parse(observation.observedAt) <= 120_000) {
     return { state: "SUSPECT", action: "none", reason: "suspect_not_fault" };
   }
-  return { state: "HEALTHY", action: "none", reason: "healthy" };
+  if (observation.processDead === false && observation.receiverDown === false) {
+    return { state: "HEALTHY", action: "none", reason: "healthy" };
+  }
+  return { state: "UNKNOWN", action: "none", reason: "missing_evidence" };
 }
 
 export function recovered(proof) {
@@ -109,6 +112,9 @@ function parentKey(observation) {
     return JSON.stringify(["shared", "shared", "shared", "shared", observation.cause]);
   }
   return incidentKey(observation);
+}
+function approved(effects) {
+  return typeof effects?.approvalToken === "string" && effects.approvalToken.length > 0;
 }
 
 function commit(store, key, incident) {
@@ -142,6 +148,9 @@ export async function evaluate(store, observation, nowMs, effects = {}) {
   }
   if (lock && store.locks?.[lock] && store.locks[lock] !== key) {
     return { state: "UNKNOWN", reason: "generation_or_lock_conflict", effects: counts, incident: existing ?? null };
+  }
+  if ((decision.action === "reconnect_once" || decision.action === "notify" || decision.action === "notify_parent") && !approved(effects)) {
+    return { state: decision.state, action: decision.action, reason: decision.reason, effects: counts, incident: existing ?? null };
   }
   const incident = existing ?? { key, state: decision.state, budgetUsed: false, notifications: 0, lastAt: nowMs, uncertain: false, effectError: null };
   incident.lastAt = nowMs;
@@ -241,6 +250,9 @@ export async function evaluateDurable(db, observation, nowMs, effects = {}) {
   if (!key || !bot || !db) return { state: "UNKNOWN", reason: "invalid_observation", reserved: false, calls: 0 };
   if (decision.action !== "reconnect_once" && decision.action !== "notify" && decision.action !== "notify_parent") {
     return { state: decision.state, reason: decision.reason, reserved: false, calls: 0 };
+  }
+  if (!approved(effects)) {
+    return { state: decision.state, action: decision.action, reason: decision.reason, reserved: false, calls: 0 };
   }
   if (!reserveScope(db, key, shared ? null : bot, shared, nowMs)) {
     return { state: "ESCALATED", reason: "attempt_reserved", reserved: false, calls: 0 };
