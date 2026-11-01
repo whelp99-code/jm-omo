@@ -320,6 +320,7 @@ describe("PR1 readonly observation", () => {
     expect(deadAttributed.reason).toBe("process_absent");
     expect(alive.state).toBe("idle_or_working");
     expect(attribution({ sessionId: "s", generation: "g", sessionMatchesProcess: false, pid: 9, pidAlive: false }).reason).toBe("process_not_attributed");
+    expect(attribution({ sessionId: "s", generation: "g", sessionMatchesProcess: false, pid: 9, pidAlive: false }).processAbsent).toBeUndefined();
   });
 
   test("future health time is not fresh and is not replaced by collection time", () => {

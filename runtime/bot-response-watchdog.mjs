@@ -89,7 +89,7 @@ export function attribution(snapshot) {
   if (snapshot.ownerSessionId && snapshot.ownerSessionId !== sessionId) return { bound: false, reason: "foreign_owner_session" };
   if (snapshot.sessionMatchesProcess !== true) return { bound: false, reason: "process_not_attributed" };
   if (snapshot.pid != null && snapshot.pidAlive == null) return { bound: false, reason: "missing_pid_alive" };
-  if (snapshot.pid != null && snapshot.pidAlive === false) return { bound: false, reason: "dead_pid", processAbsent: true };
+  if (snapshot.pid != null && snapshot.pidAlive === false && snapshot.sessionMatchesProcess === true) return { bound: false, reason: "dead_pid", processAbsent: true };
   if (snapshot.processAlive !== true) return { bound: false, reason: "process_absent", processAbsent: true };
   return { bound: true, reason: "attributed" };
 }
