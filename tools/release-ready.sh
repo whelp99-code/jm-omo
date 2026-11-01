@@ -21,7 +21,7 @@ release_ready() {
     pid=${line%% *}
     cwd=${line#* }
     case $addr in
-      127.0.0.1:*|\[::1\]:*|::1:*)
+      127.0.0.1:*|\[::1\]:*|::1:*|0.0.0.0:*|\[::\]:*|\*:*)
         loopback=1
         if [[ $cwd == *"$expected"* ]]; then
           matched=1
@@ -41,11 +41,12 @@ release_ready() {
     printf '%s\n' 'cwd_mismatch'
     return 2
   fi
-  if "$@"; then
+  local status
+  "$@" && status=0 || status=$?
+  if [[ $status -eq 0 ]]; then
     printf '%s\n' 'response_ok'
     return 0
   fi
-  local status=$?
   printf '%s\n' 'response_fail'
   return "$status"
 }

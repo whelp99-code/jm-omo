@@ -44,5 +44,28 @@ run_case cwd_mismatch "$tmp/other" abcdef12 2 cwd_mismatch
 printf '%s\n' '127.0.0.1:4382 9 /srv/releases/abcdef12' > "$tmp/ok"
 run_case normal "$tmp/ok" abcdef12 0 response_ok
 [[ $(cat "$tmp/mark") == ran ]] || { printf '%s\n' 'fail normal did not judge the response' >&2; exit 1; }
+printf '%s\n' '127.0.0.1:5999 9 /srv/releases/abcdef12' > "$tmp/fail"
+set +e
+out=$(RELEASE_READY_LISTENERS="$tmp/fail" release_ready 5999 abcdef12 false)
+code=$?
+set -e
+[[ $code == 1 && $out == response_fail ]] || {
+  printf '%s\n' "fail response_fail code=$code out=$out" >&2
+  exit 1
+}
+printf '%s\n' 'pass response_fail'
 
-printf '%s\n' 'release-ready 4 passed'
+for addr in '0.0.0.0:5999' '*:5999' '[::]:5999'; do
+  printf '%s\n' "$addr 9 /srv/releases/abcdef12" > "$tmp/wild"
+  set +e
+  out=$(RELEASE_READY_LISTENERS="$tmp/wild" PROBE_MARK="$tmp/mark" release_ready 5999 abcdef12 "$probe")
+  code=$?
+  set -e
+  [[ $code == 0 && $out == response_ok ]] || {
+    printf '%s\n' "fail wildcard $addr code=$code out=$out" >&2
+    exit 1
+  }
+done
+printf '%s\n' 'pass wildcard bind'
+
+printf '%s\n' 'release-ready 6 passed'
