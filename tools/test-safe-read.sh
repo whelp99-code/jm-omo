@@ -11,6 +11,10 @@ printf '%s\n' 'env-body' > "$tmp/.env"
 printf '%s\n' 'upper-body' > "$tmp/TOKEN"
 printf '%s\n' 'plain-body' > "$tmp/notes.txt"
 ln -s "$tmp/api-token.txt" "$tmp/notes-link"
+mkdir -p "$tmp/creds"
+printf '%s\n' 'key-body' > "$tmp/api_key.json"
+printf '%s\n' 'ed-body' > "$tmp/id_ed25519"
+printf '%s\n' 'creds-body' > "$tmp/creds/x.txt"
 record=$tmp/record.txt
 
 expect_refuse() {
@@ -34,6 +38,9 @@ expect_refuse challenge "$tmp/login-challenge.txt"
 expect_refuse dotenv "$tmp/.env"
 expect_refuse upper "$tmp/TOKEN"
 expect_refuse symlink "$tmp/notes-link"
+expect_refuse api_key "$tmp/api_key.json"
+expect_refuse id_ed25519 "$tmp/id_ed25519"
+expect_refuse creds "$tmp/creds/x.txt"
 
 out=$("$tool" "$tmp/notes.txt")
 [[ $out == plain-body ]] || { printf '%s\n' "fail plain out=$out" >&2; exit 1; }
@@ -48,4 +55,4 @@ set -e
   exit 1
 }
 printf '%s\n' 'pass exception'
-printf '%s\n' 'safe-read 7 passed'
+printf '%s\n' 'safe-read 10 passed'

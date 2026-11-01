@@ -37,8 +37,12 @@ sensitive() {
   local lower
   lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   local pattern
-  for pattern in secret token credential password otp totp challenge .env private-key id_rsa; do
+  for pattern in secret token credential password otp totp challenge .env private-key id_rsa api_key apikey api-key id_ed25519 id_ecdsa id_dsa creds secrets keychain cookie; do
     [[ $lower == *"$pattern"* ]] && return 0
+  done
+  local suffix
+  for suffix in .pem .key .p12; do
+    [[ $lower == *"$suffix" || $lower == *"$suffix/"* ]] && return 0
   done
   return 1
 }
