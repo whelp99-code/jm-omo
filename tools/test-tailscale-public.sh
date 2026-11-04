@@ -56,7 +56,7 @@ set -e
   printf '%s\n' "fail outside code=$code out=$out" >&2
   exit 1
 }
-grep -q 'funnel --https=443 /secret off' "$TS_LOG" || { printf '%s\n' 'fail outside did not off only the new path' >&2; exit 1; }
+grep -q 'funnel --https=443 --set-path=/secret off' "$TS_LOG" || { printf '%s\n' 'fail outside did not off only the new path' >&2; exit 1; }
 grep -q reset "$TS_LOG" && { printf '%s\n' 'fail outside used reset' >&2; exit 1; }
 grep -q ' off' "$TS_LOG" && grep -v '/secret off' "$TS_LOG" | grep -q ' off' && {
   printf '%s\n' 'fail outside turned off an existing path' >&2
