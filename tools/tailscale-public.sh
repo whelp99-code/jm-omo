@@ -1,6 +1,6 @@
 #!/bin/bash
 # 대상이 불명확한 tailscale funnel/serve 명령을 거부한다.
-# 실행 뒤 새로 생긴 경로만 허용 목록과 비교하고, 그 대상만 끈다.
+# 실행 뒤 새로 생긴 경로만 허용 목록과 비교하고, --set-path로 그 경로만 끈다.
 # reset은 쓰지 않는다. 시험은 TAILSCALE로 가짜 명령을 넣는다.
 set -euo pipefail
 
@@ -81,7 +81,7 @@ while read -r port path; do
     continue
   fi
   printf '%s\n' "off: $path is outside the allowlist" >&2
-  "$bin" "$mode" --https="$port" "$path" off
+  "$bin" "$mode" --https="$port" --set-path="$path" off
   turned_off=1
 done <<< "$after"
 if [[ $turned_off == 1 ]]; then
