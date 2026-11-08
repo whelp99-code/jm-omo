@@ -128,4 +128,27 @@ printf '%s\n' "$out" | grep -qx "candidate mail $mail_a" || {
   exit 1
 }
 printf '%s\n' 'pass single mail sha stays candidate'
-printf '%s\n' 'activation-registry 7 passed'
+
+read_log=$tmp/registry-reads
+: > "$read_log"
+_activation_registry_rows() {
+  printf 'x\n' >> "$read_log"
+  local n
+  n=$(wc -l < "$read_log" | tr -d '[:space:]')
+  printf '%s\t%s\t%s\n' mail "$mail_a" current
+  if [[ $n -ge 2 ]]; then
+    printf '%s\t%s\t%s\n' mail "$mail_b" current
+  fi
+}
+: > "$tmp/changing-registry.tsv"
+set +e
+out=$(activation_apply "$tmp/changing-registry.tsv")
+code=$?
+set -e
+reads=$(wc -l < "$read_log" | tr -d '[:space:]')
+[[ $reads == 1 && $code == 0 && $out == "apply mail $mail_a" ]] || {
+  printf '%s\n' "fail snapshot reads=$reads code=$code out=$out" >&2
+  exit 1
+}
+printf '%s\n' 'pass registry snapshot ignores a later sha'
+printf '%s\n' 'activation-registry 8 passed'

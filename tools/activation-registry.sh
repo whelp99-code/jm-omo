@@ -37,6 +37,29 @@ _activation_current_shas() {
   done < <(_activation_registry_rows "$registry")
 }
 
+_activation_products_from_rows() {
+  local rows=$1 product sha state
+  local -A seen=()
+  while IFS=$'\t' read -r product sha state; do
+    [[ $state == current ]] || continue
+    if [[ -z ${seen[$product]+x} ]]; then
+      seen[$product]=1
+      printf '%s\n' "$product"
+    fi
+  done <<< "$rows"
+}
+
+_activation_shas_from_rows() {
+  local rows=$1 want=$2 product sha state
+  local -A seen=()
+  while IFS=$'\t' read -r product sha state; do
+    [[ $state == current && $product == "$want" ]] || continue
+    [[ -n ${seen[$sha]+x} ]] && continue
+    seen[$sha]=1
+    printf '%s\n' "$sha"
+  done <<< "$rows"
+}
+
 _activation_field() {
   local file=$1
   [[ -f $file ]] || return 0
@@ -89,19 +112,22 @@ activation_apply() {
     printf '%s\n' 'usage: activation_apply REGISTRY' >&2
     return 2
   }
-  local product shas count stopped=0
+  local rows product shas count stopped=0
+  rows=$(_activation_registry_rows "$registry")
   while IFS= read -r product; do
-    shas=$(_activation_current_shas "$registry" "$product")
+    [[ -n $product ]] || continue
+    shas=$(_activation_shas_from_rows "$rows" "$product")
     count=$(printf '%s\n' "$shas" | grep -c .)
     if [[ $count -ne 1 ]]; then
       printf '%s\n' "conflict $product $(printf '%s\n' "$shas" | paste -sd ' ' -)"
       stopped=1
     fi
-  done < <(_activation_current_products "$registry")
+  done < <(_activation_products_from_rows "$rows")
   [[ $stopped == 0 ]] || return 2
   while IFS= read -r product; do
-    printf '%s\n' "apply $product $(_activation_current_shas "$registry" "$product")"
-  done < <(_activation_current_products "$registry")
+    [[ -n $product ]] || continue
+    printf '%s\n' "apply $product $(_activation_shas_from_rows "$rows" "$product")"
+  done < <(_activation_products_from_rows "$rows")
 }
 
 activation_candidates() {
@@ -110,9 +136,11 @@ activation_candidates() {
     printf '%s\n' 'usage: activation_candidates REGISTRY EVIDENCE' >&2
     return 2
   }
-  local product shas count reasons reason_line
+  local rows product shas count reasons reason_line
+  rows=$(_activation_registry_rows "$registry")
   while IFS= read -r product; do
-    shas=$(_activation_current_shas "$registry" "$product")
+    [[ -n $product ]] || continue
+    shas=$(_activation_shas_from_rows "$rows" "$product")
     count=$(printf '%s\n' "$shas" | grep -c .)
     if [[ $count -ne 1 ]]; then
       printf '%s\n' "excluded $product conflict $(printf '%s\n' "$shas" | paste -sd ' ' -)"
@@ -139,7 +167,7 @@ activation_candidates() {
       continue
     fi
     printf '%s\n' "candidate $product $shas"
-  done < <(_activation_current_products "$registry")
+  done < <(_activation_products_from_rows "$rows")
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
