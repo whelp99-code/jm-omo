@@ -63,4 +63,23 @@ grep -q ' off' "$TS_LOG" && grep -v '/secret off' "$TS_LOG" | grep -q ' off' && 
   exit 1
 }
 printf '%s\n' 'pass new disallowed path off only'
-printf '%s\n' 'tailscale-public 3 passed'
+
+printf '%s\n' $'https://host.ts.net:443 (Funnel on)\n|-- /health proxy https://127.0.0.1:3000' > "$TS_STATUS"
+printf '%s\n' $'https://host.ts.net:443 (Funnel on)\n|-- /health proxy https://127.0.0.1:3000' > "$TS_AFTER"
+: > "$TS_LOG"
+out=$("$wrap" --allow /health -- funnel --set-path=/health localhost:3000)
+[[ $out == public_ok ]] || { printf '%s\n' "fail set-path backend out=$out" >&2; exit 1; }
+grep -q ' off' "$TS_LOG" && { printf '%s\n' 'fail set-path backend turned a path off' >&2; exit 1; }
+printf '%s\n' 'pass set-path with backend is not a new path'
+
+printf '%s\n' $'https://host.ts.net:443 (Funnel on)\n|-- /health proxy http://127.0.0.1:443' > "$TS_STATUS"
+printf '%s\n%s\n' $'https://host.ts.net:443 (Funnel on)\n|-- /health proxy http://127.0.0.1:443' '|-- /he.lth proxy http://127.0.0.1:443' > "$TS_AFTER"
+: > "$TS_LOG"
+set +e
+out=$("$wrap" --allow /health -- funnel --bg --yes 443 /health 2>&1)
+code=$?
+set -e
+[[ $code == 2 && $out == *off:\ /he.lth* ]] || { printf '%s\n' "fail regex path code=$code out=$out" >&2; exit 1; }
+grep -q 'funnel --https=443 --set-path=/he.lth off' "$TS_LOG" || { printf '%s\n' 'fail dotted path was treated as already present' >&2; exit 1; }
+printf '%s\n' 'pass dotted path is not a regex match'
+printf '%s\n' 'tailscale-public 5 passed'

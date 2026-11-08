@@ -36,17 +36,20 @@ allowed() {
 }
 
 collect_paths() {
-  local port=443 line path
+  local port=443 line
   while IFS= read -r line; do
     [[ -n $line ]] || continue
     if [[ $line =~ ^https=([0-9]+)[[:space:]]+(/[^[:space:]]*) ]]; then
       printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
       continue
     fi
-    if [[ $line =~ https://[^[:space:]]+:([0-9]+) ]]; then
+    if [[ $line =~ ^https://[^[:space:]]+:([0-9]+) ]]; then
       port=${BASH_REMATCH[1]}
-    elif [[ $line =~ https://[^[:space:]:]+ ]]; then
+      continue
+    fi
+    if [[ $line =~ ^https://[^[:space:]:]+ ]]; then
       port=443
+      continue
     fi
     if [[ $line =~ ^\|--[[:space:]]+(/[^[:space:]]*) ]]; then
       printf '%s %s\n' "$port" "${BASH_REMATCH[1]}"
@@ -54,16 +57,56 @@ collect_paths() {
   done
 }
 
+path_already() {
+  local want=$1 line
+  while IFS= read -r line; do
+    [[ $line == "$want" ]] && return 0
+  done <<< "$before"
+  return 1
+}
+
+take_public_path() {
+  local arg=$1
+  if [[ $arg == --set-path=* ]]; then
+    printf '%s\n' "${arg#--set-path=}"
+    return 0
+  fi
+  if [[ $arg == /* ]]; then
+    printf '%s\n' "$arg"
+    return 0
+  fi
+  return 1
+}
+
 paths=()
+pending_set_path=0
 for arg in "$@"; do
-  [[ $arg == /* ]] || continue
-  paths+=("$arg")
-  if ! allowed "$arg"; then
-    printf '%s\n' "rejected: $arg is outside the allowlist" >&2
+  if [[ $pending_set_path == 1 ]]; then
+    pending_set_path=0
+    [[ $arg == /* ]] || { printf '%s\n' 'rejected: set-path requires a path' >&2; exit 2; }
+    paths+=("$arg")
+    if ! allowed "$arg"; then
+      printf '%s\n' "rejected: $arg is outside the allowlist" >&2
+      exit 2
+    fi
+    continue
+  fi
+  if [[ $arg == --set-path ]]; then
+    pending_set_path=1
+    continue
+  fi
+  if [[ $arg =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]]; then
+    continue
+  fi
+  path=$(take_public_path "$arg") || continue
+  [[ $path == /* ]] || { printf '%s\n' 'rejected: set-path requires a path' >&2; exit 2; }
+  paths+=("$path")
+  if ! allowed "$path"; then
+    printf '%s\n' "rejected: $path is outside the allowlist" >&2
     exit 2
   fi
 done
-if [[ ${#paths[@]} -eq 0 ]]; then
+if [[ $pending_set_path == 1 || ${#paths[@]} -eq 0 ]]; then
   printf '%s\n' 'rejected: funnel/serve target is only a port' >&2
   exit 2
 fi
@@ -74,7 +117,7 @@ after=$(printf '%s\n' "$("$bin" "$mode" status)" | collect_paths)
 turned_off=0
 while read -r port path; do
   [[ -n ${path:-} ]] || continue
-  if grep -qx "$port $path" <<< "$before"; then
+  if path_already "$port $path"; then
     continue
   fi
   if allowed "$path"; then
