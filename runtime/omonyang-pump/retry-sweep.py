@@ -35,12 +35,26 @@ def main():
             "ORDER BY retry_at, id",
             (now,),
         ).fetchall()
+        finished_rows = connection.execute(
+            "SELECT w.id FROM work_items w JOIN events e ON e.id = w.id "
+            "WHERE w.state IN ('waiting', 'working', 'blocked', 'delegated') "
+            "AND e.state = 'completed'"
+        ).fetchall()
+        if not args.dry_run and finished_rows:
+            connection.execute(
+                "UPDATE work_items SET state = 'done', retry_at = NULL, updated_at = ? "
+                "WHERE id IN (SELECT w.id FROM work_items w JOIN events e ON e.id = w.id "
+                "WHERE w.state IN ('waiting', 'working', 'blocked', 'delegated') "
+                "AND e.state = 'completed')",
+                (now,),
+            )
         if not args.dry_run and scheduled_rows:
             connection.execute(
                 "UPDATE work_items SET retry_at = ? "
                 "WHERE state IN ('waiting', 'working') AND retry_at IS NULL",
                 (retry_at,),
             )
+        if not args.dry_run:
             connection.commit()
     finally:
         connection.close()
@@ -49,6 +63,7 @@ def main():
     result = {
         "scheduled": len(scheduled_rows),
         "due": len(due_ids),
+        "closed": len(finished_rows),
         "dry_run": args.dry_run,
         "due_ids": due_ids,
     }
@@ -57,7 +72,7 @@ def main():
     else:
         print(
             f"RETRY_SWEEP scheduled={result['scheduled']} due={result['due']} "
-            f"dry_run={str(result['dry_run']).lower()}"
+            f"closed={result['closed']} dry_run={str(result['dry_run']).lower()}"
         )
 
 
