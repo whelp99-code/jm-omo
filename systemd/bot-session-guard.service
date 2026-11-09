@@ -1,0 +1,15 @@
+[Unit]
+Description=Recover OmO RPC sessions lost to a host restart
+
+[Service]
+Type=oneshot
+Environment=DORI_RPC_SESSIONS=rpc-5,rpc-6,rpc-7,rpc-8,rpc-9
+Environment=OMO_RPC_SESSIONS=rpc-1,rpc-2,rpc-3,rpc-4
+Environment=DORI_SESSION_CWD=/home/jm/.dori
+Environment=OMO_SESSION_CWD=/home/jm/.omo/omonyang
+Environment=SESSION_MODEL=cursor/grok-4.7-high-fast
+ExecStart=/usr/bin/python3 /home/jm/.local/lib/dori-guard/session-guard.py
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

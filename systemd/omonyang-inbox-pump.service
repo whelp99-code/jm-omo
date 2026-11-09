@@ -1,0 +1,9 @@
+[Unit]
+Description=Deliver fresh Omonyang Slack inbox items to the idle session pane
+After=omonyang-slack-listen.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/jm/.local/lib/omonyang/slack-inbox-pump.sh
+TimeoutStartSec=60
+UMask=0077

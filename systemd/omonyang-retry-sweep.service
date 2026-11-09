@@ -1,0 +1,7 @@
+[Unit]
+Description=Sweep Omonyang work_items retry_at scheduling
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/jm/.local/lib/omonyang/retry-sweep.py
+TimeoutStartSec=120

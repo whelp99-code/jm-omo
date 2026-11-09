@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Omonyang retry sweeper every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=300
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

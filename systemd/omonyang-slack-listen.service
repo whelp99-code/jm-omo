@@ -1,0 +1,15 @@
+[Unit]
+Description=Omonyang Slack listener outside the model session
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jm/.omo/omonyang
+ExecStart=/home/jm/.bun/bin/bun slack-listen.mjs
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
