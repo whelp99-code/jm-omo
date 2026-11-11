@@ -1,0 +1,11 @@
+[Unit]
+Description=Recover 오모냥 after an unexpected runtime exit
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=600
+AccuracySec=5s
+Unit=omonyang-herdr.service
+
+[Install]
+WantedBy=timers.target
