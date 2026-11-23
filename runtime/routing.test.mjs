@@ -72,10 +72,4 @@ describe("shared runtime routing configuration", () => {
     }
   });
 
-  it("mentions the configured Cursor user in review requests", async () => {
-    const source = new URL("../fleet/fleet.mjs", import.meta.url).href;
-    const result = await runRouting(["--eval", `const {buildPrLoopReviewRequest}=await import(${JSON.stringify(source)}); console.log(JSON.stringify(buildPrLoopReviewRequest("owner/repo","1","https://example.invalid","a".repeat(40))));`],
-      { FLEET_CURSOR_USER_ID: "U_TASK_OWNED" });
-    expect(JSON.parse(result.stdout).text).toContain("<@U_TASK_OWNED>");
-  });
 });

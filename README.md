@@ -5,9 +5,9 @@
 ## 구조
 | 경로 | 내용 |
 |---|---|
-| `fleet/fleet.mjs` | 냥이 장부와 지휘 도구. `init / status / report / dispatch / track / verify / tasks / watch` |
+| `fleet/fleet.mjs` | 창 분류 및 라우팅 조회. `dispatch`와 `verify`는 폐기 안내만 반환. |
 | `fleet/routes.json` | 작업 종류별 모델·스킬 기본값 (계획·설계 Astra/Fable, 구현 Sol 6.1/Grok 4.7, 검수 Astra, 보안·돈 Astra xhigh/Opus, 단순 Sonnet 5.5/Codex spark/Haiku) |
-| `fleet/VICE-CAPTAIN.md` | 부대장(나희) 대행 런북: 시작 조건, 도구, 그대로인 규칙, 인계 |
+| `fleet/VICE-CAPTAIN.md` | 폐기된 부대장 원장 런북의 기록. |
 | `runtime/` | Slack 수신(`slack-listen.mjs`)·수신함(`inbox.mjs`)·사용량 감시(`usage-watch.mjs`)·세션 상태 감시 |
 | `ops/` | 다섯 제품 상태 수집(`fp5-status.py`)·정체 감시 |
 | `bin/` | herdr 실행·인계·비밀 전달(tailnet 1회용 드롭) |
@@ -15,37 +15,20 @@
 | `plans/` | 운영 체계 계획(1단계 완료, 2단계 개선 9개) |
 | `docs/` | 세션 홈 규칙 |
 
-## 지휘 방식 (fleet)
-- **장부**: `~/.local/state/omonyang/fleet.sqlite` — 냥이(창/봇), 작업(스킬·모델·완료 조건·증거·이력), 대장 heartbeat.
-- **확인 전송**: 창이 비었는지 본 뒤 모델 전환 → 지시 입력 → 실제로 "Working"이 뜨는지 확인. 압축 실패로 지시가 사라지면 `PROMPT_LOST`.
-- **의존 작업**: `dispatch ... --after <KEY>`는 선행 작업이 `verified-done`이고 대상 창이 idle일 때만 자동 전송한다.
-- **주장 대조**: Cursor 승인과 `PR READY head=...`는 읽기 전용 Slack/GitHub 근거와 대조하며, 테스트 개수 주장은 검증 근거로 취급하지 않는다.
-- **기계 완료**: `--done 'pr:owner/repo#N;url:http://..=200;cmd:<shell>'` 전부 통과해야 `verified-done`. 냥이의 "완료" 줄은 `done-claimed`일 뿐.
-- **감시**: `fleet watch 30` — 상태 변화·완료/막힘 줄·PR READY·가재 recovery_hold/suppressed를 `FLEET_*` 이벤트로. 30초마다 `captain-heartbeat.json` 갱신.
-- **대장·부대장**: heartbeat 30분 끊김 또는 대장 한도 소진 → 나희가 같은 장부로 대행 (`fleet/VICE-CAPTAIN.md`).
+## Fleet 작업 원장 폐기
+
+2026-11-23에 작업 원장과 현황판을 폐기했다. 2026-11-10 이후 갱신되지 않았고, 냥이 14마리 중 12마리는 `unknown`, 작업 27건은 `blocked` 상태로 남아 있었다. `dispatch`와 `verify`는 기존 호출 호환을 위해 폐기 안내만 출력하고 종료한다. 작업을 보내거나 완료 처리하지 않는다.
 
 ### Fleet configuration
 
-`fleet/fleet.config.json` is loaded when `fleet.mjs` starts. Its `cats` array defines each cat's `id`, display `name`, `role`, `kind`, `pane`, and `product`; `fleet init` upserts these configured panes into the fleet database. The `slack` object holds `reviewChannel`, `cursorUserId`, and `reviewReplyAppId`. `agentMessengerCredentialPath` is the absolute path to the global agent-messenger Slack credential manager. `prLoop` holds the review thread, `enabled` and `autoMerge` kill switches (both default false), `mergePendingTimeoutMs`, `deployTimeoutMs`, a `mergeMethods` map keyed by repository with `merge`, `squash`, or `rebase` values, and an empty-by-default `deploy` map keyed by GitHub repository; each deploy entry has an `argv` array and `healthUrl`.
+`fleet/fleet.config.json`의 `cats` 배열은 창과 냥이 매핑을 정의한다. `FLEET_CAT_<ID>_PANE`으로 창을 덮어쓸 수 있다. `fleet/config.mjs`는 원장을 열지 않고 설정을 불러온다. Slack 시작 및 시간별 보고는 설정된 SDK 경로를, 개발 보고는 `FLEET_SLACK_REVIEW_CHANNEL`을 사용한다. SDK 경로는 `FLEET_AGENT_MESSENGER_CREDENTIAL_PATH`로 덮어쓸 수 있다.
 
-Draft PRs are automatically readied only when their Tests/Test Plan contains an executed summary with at least one pass and an explicit zero-failure count.
-
-Environment overrides are `FLEET_CAT_<ID>_PANE` (for example, `FLEET_CAT_CRM_PANE`), `FLEET_SLACK_REVIEW_CHANNEL`, `FLEET_CURSOR_USER_ID`, `FLEET_REVIEW_REPLY_APP_ID`, `FLEET_AGENT_MESSENGER_CREDENTIAL_PATH`, `FLEET_PR_LOOP_ENABLED`, and `FLEET_PR_LOOP_AUTO_MERGE`.
-
-Runtime consumers share the side-effect-free loader in `fleet/config.mjs`: Slack startup and hourly reports resolve the SDK beside the configured credential manager, review requests mention the configured Cursor user, and development reports use the configured review channel. The versioned credential path in JSON is an installation default, not a source-code dependency; override it after moving the SDK.
-
-`usageWatch.catIds` selects registered cats to monitor (default: `gajae`); pane overrides apply there too. The obsolete unregistered `w1:p1` target is no longer monitored. The self-policy pane follows `omonyang`, and `SELF_POLICY_ENABLED` remains disabled. `usageWatch.orcaTerminals` holds installation-specific terminal IDs; override that list with a JSON string array in `FLEET_USAGE_ORCA_TERMINALS`.
+`usageWatch.catIds`는 사용량 감시 대상을 정한다(기본값 `gajae`). `FLEET_USAGE_ORCA_TERMINALS`는 터미널 ID의 JSON 배열이다. 오모냥의 `SELF_POLICY_ENABLED`는 꺼져 있다.
 
 ```bash
-cd fleet
-bun fleet.mjs init
-bun fleet.mjs dispatch crm TASK-X /path/TASK-X.txt --type impl --skill ulw --done 'pr:whelp99-code/ai-crm-project-manager#58'
-bun fleet.mjs verify TASK-X
-bun fleet.mjs close TASK-X "owner closed stale task"
-bun fleet.mjs report
+bun fleet/fleet.mjs routes
+bun test
 ```
-
-`fleet close <KEY> <reason>` manually closes a task, records the reason, releases its pane reservation, and removes it from the cat's active task slot. Closed tasks do not block later dispatches or appear in active PR polling.
 
 ## 지켜야 할 규칙 (요약)
 - 머지 근거는 `fleet.config.json`에 지정된 Cursor 봇의 본인 글 ACCEPT/APPROVE만, head 고정 머지.
